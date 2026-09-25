@@ -141,9 +141,9 @@
         "Submit version-bound evidence and obtain independent review before final AWR completion."
       ],
       "paths": [
-        "test/",
-        "src/",
-        "public/"
+        "test",
+        "src",
+        "public"
       ],
       "depends_on": [
         "TEST-INTEGRATE"
@@ -175,7 +175,7 @@
       ],
       "paths": [
         "CONTRIBUTING.md",
-        "docs/",
+        "docs",
         "README.md"
       ],
       "depends_on": [
