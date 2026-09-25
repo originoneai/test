@@ -1,0 +1,191 @@
+{
+  "workstreams": {
+    "version": 1,
+    "definitions": [
+      {
+        "id": "00000000000000000000000011",
+        "external_key": "issue-tracker",
+        "title": "Issue tracker delivery",
+        "state": "active",
+        "authority_version": 1,
+        "goal_keys": [
+          "issue-tracker-v1"
+        ],
+        "acceptance_contracts": [
+          "specs/issue-tracker.md"
+        ]
+      }
+    ]
+  },
+  "goals": [
+    {
+      "id": "issue-tracker-v1",
+      "title": "Deliver a working issue tracker through independently reviewed team collaboration",
+      "status": "active"
+    }
+  ],
+  "work_items": [
+    {
+      "id": "TEST-API",
+      "title": "Implement issue API and durable storage",
+      "status": "planned",
+      "workstream": "issue-tracker",
+      "goals": [
+        "issue-tracker-v1: deliver the issue tracker defined in specs/issue-tracker.md"
+      ],
+      "hard_rules": [
+        "Keep personal credentials and runtime evidence outside the public repository.",
+        "Follow the published contract; use separate person identities for development and independent review.",
+        "Read live AWR state before editing; do not overwrite another contributor work."
+      ],
+      "acceptance": [
+        "Implement all API behaviors in specs/issue-tracker.md, including validation and 16 KiB limits.",
+        "Accepted changes survive a restart; concurrent updates are serialized; corrupt storage is never silently replaced.",
+        "Add API, persistence, invalid-input and concurrent-write tests using isolated temporary data directories.",
+        "Submit version-bound evidence and obtain independent review before final AWR completion."
+      ],
+      "paths": [
+        "src/api.js",
+        "src/store.js",
+        "test/api.test.js"
+      ],
+      "depends_on": [],
+      "completion_policy": "independent_review",
+      "verification_requirements": [
+        "Automated checks relevant to the change",
+        "Source SHA and reviewer-bound evidence"
+      ]
+    },
+    {
+      "id": "TEST-UI",
+      "title": "Build accessible issue board and forms",
+      "status": "planned",
+      "workstream": "issue-tracker",
+      "goals": [
+        "issue-tracker-v1: deliver the issue tracker defined in specs/issue-tracker.md"
+      ],
+      "hard_rules": [
+        "Keep personal credentials and runtime evidence outside the public repository.",
+        "Follow the published contract; use separate person identities for development and independent review.",
+        "Read live AWR state before editing; do not overwrite another contributor work."
+      ],
+      "acceptance": [
+        "Implement the specified board, create/edit forms, search and filters using explicit fixtures until integration.",
+        "Verify keyboard access, escaped text, empty/error states and 390 px / 1440 px layouts.",
+        "Keep the API adapter replaceable so integration can remove fixture mode.",
+        "Submit version-bound evidence and obtain independent review before final AWR completion."
+      ],
+      "paths": [
+        "public/index.html",
+        "public/app.js",
+        "public/style.css",
+        "test/ui.test.js"
+      ],
+      "depends_on": [],
+      "completion_policy": "independent_review",
+      "verification_requirements": [
+        "Automated checks relevant to the change",
+        "Source SHA and reviewer-bound evidence"
+      ]
+    },
+    {
+      "id": "TEST-INTEGRATE",
+      "title": "Connect issue board to the real API",
+      "status": "planned",
+      "workstream": "issue-tracker",
+      "goals": [
+        "issue-tracker-v1: deliver the issue tracker defined in specs/issue-tracker.md"
+      ],
+      "hard_rules": [
+        "Keep personal credentials and runtime evidence outside the public repository.",
+        "Follow the published contract; use separate person identities for development and independent review.",
+        "Read live AWR state before editing; do not overwrite another contributor work."
+      ],
+      "acceptance": [
+        "Replace fixtures with real GET/POST/PATCH API calls; no mock fallback in the live UI.",
+        "Create, edit, filter and change status through the browser; reload and restart preserve saved issues.",
+        "Failed requests retain form inputs, display useful errors and can be retried without false success.",
+        "Submit version-bound evidence and obtain independent review before final AWR completion."
+      ],
+      "paths": [
+        "public/app.js",
+        "test/integration.test.js"
+      ],
+      "depends_on": [
+        "TEST-API",
+        "TEST-UI"
+      ],
+      "completion_policy": "independent_review",
+      "verification_requirements": [
+        "Automated checks relevant to the change",
+        "Source SHA and reviewer-bound evidence"
+      ]
+    },
+    {
+      "id": "TEST-QA",
+      "title": "Verify and harden complete user workflows",
+      "status": "planned",
+      "workstream": "issue-tracker",
+      "goals": [
+        "issue-tracker-v1: deliver the issue tracker defined in specs/issue-tracker.md"
+      ],
+      "hard_rules": [
+        "Keep personal credentials and runtime evidence outside the public repository.",
+        "Follow the published contract; use separate person identities for development and independent review.",
+        "Read live AWR state before editing; do not overwrite another contributor work."
+      ],
+      "acceptance": [
+        "Add reproducible tests for normal operation, invalid inputs, concurrent writes, corrupted storage and recovery.",
+        "Verify escaped HTML-like issue text and responsive keyboard-accessible interactions.",
+        "Fix reusable root causes; bind regression evidence to the reviewed commit and explicitly list any unverified checks.",
+        "Submit version-bound evidence and obtain independent review before final AWR completion."
+      ],
+      "paths": [
+        "test/",
+        "src/",
+        "public/"
+      ],
+      "depends_on": [
+        "TEST-INTEGRATE"
+      ],
+      "completion_policy": "independent_review",
+      "verification_requirements": [
+        "Automated checks relevant to the change",
+        "Source SHA and reviewer-bound evidence"
+      ]
+    },
+    {
+      "id": "TEST-GUIDE",
+      "title": "Write contributor and user walkthrough",
+      "status": "planned",
+      "workstream": "issue-tracker",
+      "goals": [
+        "issue-tracker-v1: deliver the issue tracker defined in specs/issue-tracker.md"
+      ],
+      "hard_rules": [
+        "Keep personal credentials and runtime evidence outside the public repository.",
+        "Follow the published contract; use separate person identities for development and independent review.",
+        "Read live AWR state before editing; do not overwrite another contributor work."
+      ],
+      "acceptance": [
+        "Document clean setup, storage location, reset/backup procedure and representative API requests.",
+        "Explain Fork/PR workflow, AWR claim/session handoff, evidence and independent review.",
+        "Reproduce the documented walkthrough against the integrated application; keep credentials and runtime receipts private.",
+        "Submit version-bound evidence and obtain independent review before final AWR completion."
+      ],
+      "paths": [
+        "CONTRIBUTING.md",
+        "docs/",
+        "README.md"
+      ],
+      "depends_on": [
+        "TEST-INTEGRATE"
+      ],
+      "completion_policy": "independent_review",
+      "verification_requirements": [
+        "Automated checks relevant to the change",
+        "Source SHA and reviewer-bound evidence"
+      ]
+    }
+  ]
+}
