@@ -24,16 +24,16 @@ Open http://127.0.0.1:3000. Start from [the product contract](specs/issue-tracke
 3. Connect your Agent directly to the shared MCP endpoint:
    `https://beta.awr.originoneai.com/v1/projects/test/mcp`.
 
-For Codex CLI, use the terminal that will launch the Agent:
+Use any Agent client that supports remote MCP over **Streamable HTTP** with **Bearer authentication**. Add a remote server through that client's settings:
 
-```sh
-export AWR_TEAM_BEARER="$(cat /absolute/path/to/your-private-credential.token)"
-codex mcp add awr_team_test --url https://beta.awr.originoneai.com/v1/projects/test/mcp --bearer-token-env-var AWR_TEAM_BEARER
-cd /absolute/path/to/your/fork
-codex
-```
+| Setting | Value |
+| --- | --- |
+| Transport | Streamable HTTP |
+| Server URL | `https://beta.awr.originoneai.com/v1/projects/test/mcp` |
+| Authentication | Bearer token in the HTTP `Authorization` header |
+| Credential | Your personal credential from the project owner |
 
-Other clients use Streamable HTTP with bearer authentication. Configure the secret through the client's supported settings; a desktop app does not automatically inherit this terminal's environment.
+Configure the credential from its private file or through the client's supported secret settings, then reconnect and open your local checkout. These settings are client-neutral; use your client's documented configuration format. A client with only local stdio MCP needs a compatible remote-MCP integration before it can use this endpoint. AWR does not require a particular Agent or model.
 
 4. Ask your Agent to start the work, for example:
 
