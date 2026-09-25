@@ -17,23 +17,33 @@ npm start
 
 Open http://127.0.0.1:3000. Start from [the product contract](specs/issue-tracker.md) and [task definitions](specs/tasks.yaml).
 
-## Join the team trial
+## Join the team trial through your Agent
 
-1. Get a personal developer or reviewer credential from the project owner. Use one credential per person; keep it outside this repository.
-2. Open https://beta.awr.originoneai.com/ and **Join project**. Select `test`.
-3. Choose a task, read its acceptance criteria, then **Claim task**. Claims coordinate work; they do not launch an Agent.
-4. Open **Connect Agent** and configure the central MCP endpoint:
+1. Get your personal developer or reviewer credential from the project owner. Keep it outside this repository; use a separate credential for each person.
+2. Fork this repository and clone your fork for development.
+3. Connect your Agent directly to the shared MCP endpoint:
    `https://beta.awr.originoneai.com/v1/projects/test/mcp`.
-5. In the terminal that launches Codex, load your private credential file and register MCP:
+
+For Codex CLI, use the terminal that will launch the Agent:
 
 ```sh
-export AWR_TEAM_BEARER="$(cat /path/to/your-private-credential.token)"
-codex mcp add awr_team --url https://beta.awr.originoneai.com/v1/projects/test/mcp --bearer-token-env-var AWR_TEAM_BEARER
+export AWR_TEAM_BEARER="$(cat /absolute/path/to/your-private-credential.token)"
+codex mcp add awr_team_test --url https://beta.awr.originoneai.com/v1/projects/test/mcp --bearer-token-env-var AWR_TEAM_BEARER
+cd /absolute/path/to/your/fork
+codex
 ```
 
-Restart your Agent and paste the task's **Copy task handoff** text. Use the same credential in the web page and Agent. Continue the existing durable session, inspect the current claim, consume the published contract and follow fresh execution admission before editing. Reconnecting or closing the browser does not renew a lease.
+Other clients use Streamable HTTP with bearer authentication. Configure the secret through the client's supported settings; a desktop app does not automatically inherit this terminal's environment.
 
-Public repository access and AWR permissions are separate. External contributors should Fork, create a feature branch, and submit a PR to this repository. AWR developer credentials do not grant direct GitHub push access. Keep tokens, runtime databases, private ledgers and execution receipts out of commits and PR bodies.
+4. Ask your Agent to start the work, for example:
+
+> Use the connected AWR Team test project to implement the issue API. Refresh the current tasks, check existing sessions and ownership, and resume my work or claim the matching eligible task. Read its current contract, dependencies and checkpoint. Obtain execution admission before editing, keep progress and version-bound evidence in AWR, then submit a tested PR and request independent review.
+
+The Agent performs the refresh → preparation → claim → development → checkpoint → review loop through MCP. Web sign-in, browser task selection and browser claims are not required. If a request outcome is unknown, the Agent must inspect the original request before retrying; reconnecting does not renew a lease. An independent reviewer uses their own identity and reviews another person's actual work.
+
+5. Optionally open [Inspector](https://beta.awr.originoneai.com/?lang=en#team) to view the same project's task relationships, ownership and progress. Its connection instructions and task briefs are optional conveniences; copying text does not claim work.
+
+Public repository access and AWR permissions are separate. Submit feature branches as PRs to this repository; AWR developer credentials do not grant direct GitHub push access. Keep tokens, runtime databases, private ledgers and execution receipts out of commits and PR bodies. The remote AWR project is the shared task authority; do not replace it with a second local task ledger.
 
 ## Development tasks
 
