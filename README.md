@@ -15,7 +15,7 @@ npm test
 npm start
 ```
 
-Open http://127.0.0.1:3000. Start from [the product contract](specs/issue-tracker.md) and [task definitions](specs/tasks.json).
+Open http://127.0.0.1:3000. Start from [the product contract](specs/issue-tracker.md) and [task definitions](specs/tasks.yaml).
 
 ## Join the team trial
 
@@ -45,7 +45,7 @@ Public repository access and AWR permissions are separate. External contributors
 | TEST-QA | End-to-end regression coverage and defect fixes | TEST-INTEGRATE |
 | TEST-GUIDE | Contributor guide, usage walkthrough and reproducible demo | TEST-INTEGRATE |
 
-Task contracts are versioned in `specs/tasks.json`; source `planned` values describe the published initial plan, not current progress. Query AWR for live state. Each task requires independently reviewed, version-bound evidence before final completion. `TEST-API` and `TEST-UI` are suitable for parallel contributors. Cross-workstream dependency exports are not available in the current remote Beta, so these tasks deliberately share a workstream.
+Task contracts are versioned in `specs/tasks.yaml`; source `planned` values describe the published initial plan, not current progress. Query AWR for live state. Each task requires independently reviewed, version-bound evidence before final completion. `TEST-API` and `TEST-UI` are suitable for parallel contributors. Cross-workstream dependency exports are not available in the current remote Beta, so these tasks deliberately share a workstream.
 
 ## License
 
