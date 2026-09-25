@@ -1,1 +1,623 @@
-// Implement the issue board in TEST-UI; connect the real API in TEST-INTEGRATE.
+// Team issue tracker board (TEST-UI).
+//
+// DATA MODE
+// The live issue API is delivered by TEST-API. Until TEST-INTEGRATE switches
+// DATA_MODE to 'api' (and deletes the fixture section below), the board runs on
+// an explicitly marked, in-memory FIXTURE adapter. Fixture data is never mixed
+// with live data and is not a fallback: selectAdapter() returns exactly one
+// adapter for the chosen mode.
+//
+// Both adapters implement the same interface, taken from specs/issue-tracker.md:
+//   list({ status, q }) -> Promise<Issue[]>        (GET   /api/issues)
+//   create({ title, description }) -> Promise<Issue> (POST  /api/issues)
+//   update(id, patch) -> Promise<Issue>             (PATCH /api/issues/:id)
+// Failures reject with ApiError { code, message, status }.
+//
+// Rendering never uses innerHTML: every piece of issue text is assigned through
+// textContent, so HTML-like input is shown as text.
+
+export const DATA_MODE = 'fixture';
+
+export const STATUSES = ['open', 'in_progress', 'done'];
+export const STATUS_LABELS = { open: 'Open', in_progress: 'In progress', done: 'Done' };
+export const TITLE_MAX = 120;
+export const DESCRIPTION_MAX = 4000;
+
+export class ApiError extends Error {
+  constructor(code, message, status = 0) {
+    super(message);
+    this.name = 'ApiError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers (shared by the UI and both adapters)
+// ---------------------------------------------------------------------------
+
+const ALLOWED_FIELDS = ['title', 'description', 'status'];
+
+/**
+ * Validate create/edit input against the product contract.
+ * Returns { errors, value }; errors is keyed by field (or "form").
+ */
+export function validateIssueInput(input, { partial = false } = {}) {
+  const errors = {};
+  const value = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { errors: { form: 'Invalid input.' }, value };
+  }
+  for (const key of Object.keys(input)) {
+    if (!ALLOWED_FIELDS.includes(key)) errors[key] = 'Unknown field.';
+  }
+  if (!partial || 'title' in input) {
+    const title = typeof input.title === 'string' ? input.title.trim() : '';
+    if (!title) errors.title = 'Title is required.';
+    else if (title.length > TITLE_MAX) errors.title = `Title must be at most ${TITLE_MAX} characters.`;
+    else value.title = title;
+  }
+  if ('description' in input) {
+    if (typeof input.description !== 'string') errors.description = 'Description must be text.';
+    else if (input.description.length > DESCRIPTION_MAX) {
+      errors.description = `Description must be at most ${DESCRIPTION_MAX} characters.`;
+    } else value.description = input.description;
+  }
+  if ('status' in input) {
+    if (!STATUSES.includes(input.status)) errors.status = 'Choose a valid status.';
+    else value.status = input.status;
+  }
+  if (partial && Object.keys(input).length === 0) errors.form = 'Nothing to update.';
+  return { errors, value };
+}
+
+export function sortNewestFirst(issues) {
+  return [...issues].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+/** Same filtering semantics as GET /api/issues: status + case-insensitive q. */
+export function filterIssues(issues, { status = '', q = '' } = {}) {
+  const needle = String(q || '').trim().toLowerCase();
+  return sortNewestFirst(issues).filter(issue => {
+    if (status && issue.status !== status) return false;
+    if (!needle) return true;
+    return String(issue.title).toLowerCase().includes(needle)
+      || String(issue.description || '').toLowerCase().includes(needle);
+  });
+}
+
+export function groupByStatus(issues) {
+  const groups = Object.fromEntries(STATUSES.map(s => [s, []]));
+  for (const issue of issues) if (groups[issue.status]) groups[issue.status].push(issue);
+  return groups;
+}
+
+// ---------------------------------------------------------------------------
+// Live API adapter (used when DATA_MODE === 'api')
+// ---------------------------------------------------------------------------
+
+export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(...args), base = '' } = {}) {
+  async function request(method, path, body) {
+    let res;
+    try {
+      res = await fetchImpl(base + path, {
+        method,
+        headers: body === undefined ? { accept: 'application/json' } : { accept: 'application/json', 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch {
+      throw new ApiError('NETWORK_ERROR', 'Could not reach the server. Check the connection and try again.', 0);
+    }
+    let data = null;
+    try { data = await res.json(); } catch { data = null; }
+    if (!res.ok) {
+      const err = data && data.error;
+      throw new ApiError(err?.code || `HTTP_${res.status}`, err?.message || `Request failed (${res.status}).`, res.status);
+    }
+    return data;
+  }
+  return {
+    mode: 'api',
+    async list({ status = '', q = '' } = {}) {
+      const params = new URLSearchParams();
+      if (status) params.set('status', status);
+      if (q) params.set('q', q);
+      const query = params.toString();
+      const data = await request('GET', '/api/issues' + (query ? '?' + query : ''));
+      return Array.isArray(data?.items) ? data.items : [];
+    },
+    create(input) { return request('POST', '/api/issues', input); },
+    update(id, patch) { return request('PATCH', '/api/issues/' + encodeURIComponent(id), patch); },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FIXTURE adapter — temporary, in-memory, for development before integration.
+// TEST-INTEGRATE removes this section and switches DATA_MODE to 'api'.
+// ---------------------------------------------------------------------------
+
+export const FIXTURE_SCENARIOS = ['default', 'empty', 'slow', 'load-error', 'save-error', 'html'];
+
+export function fixtureIssues(scenario = 'default') {
+  if (scenario === 'empty' || scenario === 'load-error') return [];
+  const base = [
+    { id: 'fixture-0001', title: 'Board columns collapse on narrow screens', description: 'Check the 390 px layout on a phone.', status: 'open', createdAt: '2026-09-20T09:00:00.000Z', updatedAt: '2026-09-20T09:00:00.000Z' },
+    { id: 'fixture-0002', title: 'Search should match descriptions', description: 'Case-insensitive match on title or description.', status: 'in_progress', createdAt: '2026-09-21T10:30:00.000Z', updatedAt: '2026-09-22T08:15:00.000Z' },
+    { id: 'fixture-0003', title: 'Keep failed form input for retry', description: '', status: 'done', createdAt: '2026-09-19T14:45:00.000Z', updatedAt: '2026-09-23T16:20:00.000Z' },
+    { id: 'fixture-0004', title: 'Add keyboard access to the edit dialog', description: 'Escape closes it and focus returns to the card.', status: 'open', createdAt: '2026-09-22T12:00:00.000Z', updatedAt: '2026-09-22T12:00:00.000Z' },
+  ];
+  if (scenario === 'html') {
+    base.unshift({ id: 'fixture-html', title: '<img src=x onerror="alert(1)"> rendered as text', description: '<script>alert("still text")</script>', status: 'open', createdAt: '2026-09-24T00:00:00.000Z', updatedAt: '2026-09-24T00:00:00.000Z' });
+  }
+  return base;
+}
+
+function newId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return 'fixture-' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
+
+export function createFixtureAdapter({
+  issues = fixtureIssues(),
+  latencyMs = 0,
+  failures = {},
+  now = () => new Date(),
+  makeId = newId,
+} = {}) {
+  const store = new Map(issues.map(issue => [issue.id, { ...issue }]));
+  const pendingFailures = { list: 0, create: 0, update: 0, ...failures };
+  const copy = issue => ({ ...issue });
+  const wait = () => new Promise(resolve => setTimeout(resolve, latencyMs));
+  const maybeFail = op => {
+    if (pendingFailures[op] > 0) {
+      pendingFailures[op] -= 1;
+      throw new ApiError('FIXTURE_FAILURE', 'The demo data layer simulated a failed request.', 503);
+    }
+  };
+  return {
+    mode: 'fixture',
+    async list({ status = '', q = '' } = {}) {
+      await wait();
+      maybeFail('list');
+      if (status && !STATUSES.includes(status)) throw new ApiError('VALIDATION_ERROR', 'Invalid status filter.', 400);
+      return filterIssues([...store.values()], { status, q }).map(copy);
+    },
+    async create(input) {
+      await wait();
+      maybeFail('create');
+      const extra = Object.keys(input || {}).filter(k => k !== 'title' && k !== 'description');
+      if (extra.length) throw new ApiError('VALIDATION_ERROR', `Unknown field: ${extra[0]}.`, 400);
+      const { errors, value } = validateIssueInput(input);
+      const first = Object.values(errors)[0];
+      if (first) throw new ApiError('VALIDATION_ERROR', first, 400);
+      const stamp = now().toISOString();
+      const issue = { id: makeId(), title: value.title, description: value.description ?? '', status: 'open', createdAt: stamp, updatedAt: stamp };
+      store.set(issue.id, issue);
+      return copy(issue);
+    },
+    async update(id, patch) {
+      await wait();
+      maybeFail('update');
+      const current = store.get(id);
+      if (!current) throw new ApiError('NOT_FOUND', 'Issue not found.', 404);
+      const { errors, value } = validateIssueInput(patch, { partial: true });
+      const first = Object.values(errors)[0];
+      if (first) throw new ApiError('VALIDATION_ERROR', first, 400);
+      const next = { ...current, ...value, updatedAt: now().toISOString() };
+      store.set(id, next);
+      return copy(next);
+    },
+  };
+}
+
+function fixtureOptionsFor(scenario) {
+  switch (scenario) {
+    case 'empty': return { issues: fixtureIssues('empty'), latencyMs: 250 };
+    case 'slow': return { issues: fixtureIssues('default'), latencyMs: 1500 };
+    case 'load-error': return { issues: fixtureIssues('default'), latencyMs: 250, failures: { list: 1 } };
+    case 'save-error': return { issues: fixtureIssues('default'), latencyMs: 250, failures: { create: 1, update: 1 } };
+    case 'html': return { issues: fixtureIssues('html'), latencyMs: 250 };
+    default: return { issues: fixtureIssues('default'), latencyMs: 250 };
+  }
+}
+
+/** Return exactly one adapter for the mode; fixtures are never a fallback. */
+export function selectAdapter(mode = DATA_MODE, { search = '', fetchImpl } = {}) {
+  if (mode === 'api') return createHttpAdapter(fetchImpl ? { fetchImpl } : {});
+  const requested = new URLSearchParams(search).get('fixture') || 'default';
+  const scenario = FIXTURE_SCENARIOS.includes(requested) ? requested : 'default';
+  const adapter = createFixtureAdapter(fixtureOptionsFor(scenario));
+  adapter.scenario = scenario;
+  return adapter;
+}
+
+// ---------------------------------------------------------------------------
+// User interface
+// ---------------------------------------------------------------------------
+
+function h(doc, tag, props = {}, ...children) {
+  const el = doc.createElement(tag);
+  for (const [key, val] of Object.entries(props)) {
+    if (val == null || val === false) continue;
+    if (key === 'class') el.className = val;
+    else if (key === 'text') el.textContent = val;
+    else if (key.startsWith('on')) el.addEventListener(key.slice(2), val);
+    else if (key === 'hidden' || key === 'disabled') el[key] = true;
+    else el.setAttribute(key, val === true ? '' : String(val));
+  }
+  const kids = children.flat().filter(c => c != null && c !== false);
+  if (kids.length) el.append(...kids);
+  return el;
+}
+
+function statusSelect(doc, id, { includeAll = false } = {}) {
+  const select = h(doc, 'select', { id });
+  if (includeAll) select.append(h(doc, 'option', { value: '', text: 'All statuses' }));
+  for (const status of STATUSES) select.append(h(doc, 'option', { value: status, text: STATUS_LABELS[status] }));
+  return select;
+}
+
+function describe(error) {
+  if (error && typeof error.message === 'string' && error.message) return error.message;
+  return 'Something went wrong.';
+}
+
+function formatTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return String(iso ?? '');
+  return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/**
+ * Mount the board into `root`. Returns a small handle for tests and integration.
+ * options: { adapter, doc, searchDelayMs }
+ */
+export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayMs = 200 } = {}) {
+  if (!adapter) throw new Error('mountApp requires an adapter');
+  const state = { issues: [], filters: { status: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
+  const editButtons = new Map();
+  let searchTimer = null;
+
+  // --- header -------------------------------------------------------------
+  const header = h(doc, 'header', { class: 'app-header' },
+    h(doc, 'p', { class: 'eyebrow', text: 'Origin One AI · Team trial' }),
+    h(doc, 'h1', { text: 'Issue tracker' }),
+  );
+  if (adapter.mode === 'fixture') {
+    header.append(h(doc, 'p', { class: 'fixture-banner', role: 'note', 'data-role': 'fixture-banner',
+      text: 'Demo data: this board uses a temporary in-memory fixture until the issue API is integrated. Changes are lost on reload.' }));
+  }
+
+  // --- announcements --------------------------------------------------------
+  const live = h(doc, 'p', { class: 'sr-only', role: 'status', 'aria-live': 'polite', 'data-role': 'announcer' });
+  const announce = message => { live.textContent = ''; live.textContent = message; };
+
+  // --- new issue form -------------------------------------------------------
+  const newTitle = h(doc, 'input', { id: 'new-title', name: 'title', type: 'text', autocomplete: 'off', required: true, 'aria-describedby': 'new-title-hint new-title-error' });
+  const newTitleError = h(doc, 'p', { id: 'new-title-error', class: 'field-error', 'data-role': 'new-title-error', hidden: true });
+  const newDescription = h(doc, 'textarea', { id: 'new-description', name: 'description', rows: '3', 'aria-describedby': 'new-description-error' });
+  const newDescriptionError = h(doc, 'p', { id: 'new-description-error', class: 'field-error', hidden: true });
+  const createButton = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'create-submit', text: 'Create issue' });
+  const createError = h(doc, 'p', { class: 'form-error', role: 'alert', 'data-role': 'create-error', hidden: true });
+  const createForm = h(doc, 'form', { class: 'panel new-issue', 'aria-labelledby': 'new-issue-heading', novalidate: true, 'data-role': 'create-form' },
+    h(doc, 'h2', { id: 'new-issue-heading', text: 'New issue' }),
+    h(doc, 'div', { class: 'field' },
+      h(doc, 'label', { for: 'new-title', text: 'Title' }),
+      newTitle,
+      h(doc, 'p', { id: 'new-title-hint', class: 'hint', text: `Required, up to ${TITLE_MAX} characters.` }),
+      newTitleError,
+    ),
+    h(doc, 'div', { class: 'field' },
+      h(doc, 'label', { for: 'new-description', text: 'Description (optional)' }),
+      newDescription,
+      newDescriptionError,
+    ),
+    createError,
+    h(doc, 'div', { class: 'form-actions' }, createButton),
+  );
+
+  // --- toolbar ----------------------------------------------------------------
+  const searchInput = h(doc, 'input', { id: 'search', type: 'search', autocomplete: 'off', placeholder: 'Title or description', 'data-role': 'search' });
+  const filterSelect = statusSelect(doc, 'status-filter', { includeAll: true });
+  filterSelect.setAttribute('data-role', 'status-filter');
+  const toolbar = h(doc, 'section', { class: 'panel toolbar', role: 'search', 'aria-label': 'Filter issues' },
+    h(doc, 'div', { class: 'field grow' }, h(doc, 'label', { for: 'search', text: 'Search issues' }), searchInput),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'status-filter', text: 'Status' }), filterSelect),
+  );
+
+  // --- board ------------------------------------------------------------------
+  const boardStatus = h(doc, 'p', { class: 'board-status', role: 'status', 'data-role': 'board-status' });
+  const loadErrorText = h(doc, 'span', { 'data-role': 'load-error-text' });
+  const retryButton = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'retry', text: 'Retry' });
+  const loadErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'load-error', hidden: true }, loadErrorText, ' ', retryButton);
+  const actionErrorText = h(doc, 'span', { 'data-role': 'action-error-text' });
+  const dismissButton = h(doc, 'button', { type: 'button', class: 'button subtle', text: 'Dismiss' });
+  const actionErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'action-error', hidden: true }, actionErrorText, ' ', dismissButton);
+  const columns = {};
+  const board = h(doc, 'div', { class: 'board', 'data-role': 'board', 'aria-busy': 'false' });
+  for (const status of STATUSES) {
+    const headingId = `column-${status}-heading`;
+    const count = h(doc, 'span', { class: 'count', 'data-role': `count-${status}`, text: '0' });
+    const list = h(doc, 'ul', { class: 'cards', 'aria-labelledby': headingId, 'data-role': `list-${status}` });
+    const empty = h(doc, 'p', { class: 'empty', 'data-role': `empty-${status}`, hidden: true });
+    const column = h(doc, 'section', { class: `column column-${status}`, 'aria-labelledby': headingId, 'data-role': `column-${status}` },
+      h(doc, 'h2', { id: headingId }, STATUS_LABELS[status], ' ', count),
+      list,
+      empty,
+    );
+    columns[status] = { count, list, empty };
+    board.append(column);
+  }
+
+  // --- edit dialog ------------------------------------------------------------
+  const editTitle = h(doc, 'input', { id: 'edit-title', name: 'title', type: 'text', required: true, autocomplete: 'off', 'aria-describedby': 'edit-title-error' });
+  const editTitleError = h(doc, 'p', { id: 'edit-title-error', class: 'field-error', hidden: true, 'data-role': 'edit-title-error' });
+  const editDescription = h(doc, 'textarea', { id: 'edit-description', name: 'description', rows: '5', 'aria-describedby': 'edit-description-error' });
+  const editDescriptionError = h(doc, 'p', { id: 'edit-description-error', class: 'field-error', hidden: true });
+  const editStatus = statusSelect(doc, 'edit-status');
+  const editError = h(doc, 'p', { class: 'form-error', role: 'alert', hidden: true, 'data-role': 'edit-error' });
+  const editSave = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'edit-save', text: 'Save changes' });
+  const editCancel = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-cancel', text: 'Cancel' });
+  const editForm = h(doc, 'form', { novalidate: true, 'data-role': 'edit-form' },
+    h(doc, 'h2', { id: 'edit-heading', text: 'Edit issue' }),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-title', text: 'Title' }), editTitle, editTitleError),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-description', text: 'Description' }), editDescription, editDescriptionError),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-status', text: 'Status' }), editStatus),
+    editError,
+    h(doc, 'div', { class: 'form-actions' }, editCancel, editSave),
+  );
+  const dialog = h(doc, 'dialog', { class: 'edit-dialog', 'aria-labelledby': 'edit-heading', 'data-role': 'edit-dialog' }, editForm);
+  const edit = { issue: null, trigger: null, saving: false, open: false };
+
+  root.replaceChildren(
+    header,
+    live,
+    h(doc, 'div', { class: 'layout' },
+      h(doc, 'aside', { class: 'sidebar' }, createForm),
+      h(doc, 'div', { class: 'main' }, toolbar, loadErrorBox, actionErrorBox, boardStatus, board),
+    ),
+    dialog,
+  );
+
+  // --- helpers -----------------------------------------------------------------
+  function setFieldError(input, errorEl, message) {
+    errorEl.textContent = message || '';
+    errorEl.hidden = !message;
+    if (message) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
+  }
+  function showBox(box, textEl, message) {
+    textEl.textContent = message || '';
+    box.hidden = !message;
+  }
+  function filtersActive() { return Boolean(state.filters.status || state.filters.q.trim()); }
+
+  function renderCard(issue) {
+    const title = h(doc, 'h3', { class: 'card-title', 'data-role': 'card-title' });
+    title.textContent = issue.title;
+    const card = h(doc, 'article', { class: 'card', 'data-issue-id': issue.id, 'data-role': 'card' }, title);
+    if (issue.description) {
+      const desc = h(doc, 'p', { class: 'card-description', 'data-role': 'card-description' });
+      desc.textContent = issue.description;
+      card.append(desc);
+    }
+    const time = h(doc, 'time', { datetime: issue.updatedAt || issue.createdAt });
+    time.textContent = formatTime(issue.updatedAt || issue.createdAt);
+    card.append(h(doc, 'p', { class: 'meta' }, 'Updated ', time));
+
+    const selectId = `status-${issue.id}`;
+    const select = statusSelect(doc, selectId);
+    select.value = issue.status;
+    select.setAttribute('data-role', 'card-status');
+    const selectLabel = h(doc, 'label', { for: selectId, class: 'sr-only' });
+    selectLabel.textContent = `Status for ${issue.title}`;
+    select.addEventListener('change', () => moveIssue(issue, select, card));
+    const editButton = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'card-edit', text: 'Edit' });
+    editButton.setAttribute('aria-label', `Edit issue: ${issue.title}`);
+    editButton.addEventListener('click', () => openEdit(issue, editButton));
+    editButtons.set(issue.id, editButton);
+    card.append(h(doc, 'div', { class: 'card-actions' }, selectLabel, select, editButton));
+    return h(doc, 'li', {}, card);
+  }
+
+  function render() {
+    board.setAttribute('aria-busy', state.loading ? 'true' : 'false');
+    board.classList.toggle('is-loading', state.loading);
+    showBox(loadErrorBox, loadErrorText, state.loadError ? `Could not load issues: ${describe(state.loadError)}` : '');
+    const groups = groupByStatus(state.issues);
+    editButtons.clear();
+    for (const status of STATUSES) {
+      const { count, list, empty } = columns[status];
+      const items = groups[status];
+      count.textContent = String(items.length);
+      list.replaceChildren(...items.map(renderCard));
+      const label = STATUS_LABELS[status].toLowerCase();
+      empty.textContent = filtersActive() ? `No ${label} issues match these filters.` : `No ${label} issues.`;
+      empty.hidden = items.length > 0 || state.loading;
+    }
+    if (state.loading) boardStatus.textContent = 'Loading issues…';
+    else if (state.loadError) boardStatus.textContent = 'Issues could not be loaded.';
+    else if (state.issues.length === 0) boardStatus.textContent = filtersActive() ? 'No issues match your search.' : 'No issues yet. Create the first one.';
+    else boardStatus.textContent = `${state.issues.length} ${state.issues.length === 1 ? 'issue' : 'issues'} shown.`;
+    boardStatus.classList.toggle('is-loading', state.loading);
+  }
+
+  async function load() {
+    const seq = ++state.loadSeq;
+    state.loading = true;
+    render();
+    try {
+      const items = await adapter.list({ ...state.filters });
+      if (seq !== state.loadSeq) return;
+      state.issues = items;
+      state.loadError = null;
+    } catch (error) {
+      if (seq !== state.loadSeq) return;
+      state.loadError = error;
+    }
+    state.loading = false;
+    render();
+  }
+
+  // --- create ---------------------------------------------------------------------
+  let creating = false;
+  createForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (creating) return;
+    showBox(createError, createError, '');
+    const input = { title: newTitle.value, description: newDescription.value };
+    const { errors, value } = validateIssueInput(input);
+    setFieldError(newTitle, newTitleError, errors.title);
+    setFieldError(newDescription, newDescriptionError, errors.description);
+    if (errors.title || errors.description) {
+      (errors.title ? newTitle : newDescription).focus();
+      return;
+    }
+    creating = true;
+    createButton.disabled = true;
+    createButton.textContent = 'Creating…';
+    createForm.setAttribute('aria-busy', 'true');
+    try {
+      const created = await adapter.create({ title: value.title, description: value.description ?? '' });
+      newTitle.value = '';
+      newDescription.value = '';
+      announce(`Issue created: ${created.title}`);
+      await load();
+    } catch (error) {
+      showBox(createError, createError, `Could not create the issue: ${describe(error)} Your text is kept so you can try again.`);
+    } finally {
+      creating = false;
+      createButton.disabled = false;
+      createButton.textContent = 'Create issue';
+      createForm.setAttribute('aria-busy', 'false');
+    }
+  });
+
+  // --- status move -----------------------------------------------------------------
+  async function moveIssue(issue, select, card) {
+    const previous = issue.status;
+    const next = select.value;
+    if (next === previous) return;
+    select.disabled = true;
+    card.setAttribute('aria-busy', 'true');
+    showBox(actionErrorBox, actionErrorText, '');
+    try {
+      await adapter.update(issue.id, { status: next });
+      announce(`Moved “${issue.title}” to ${STATUS_LABELS[next]}.`);
+      await load();
+      editButtons.get(issue.id)?.focus();
+    } catch (error) {
+      select.value = previous;
+      select.disabled = false;
+      card.setAttribute('aria-busy', 'false');
+      showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: ${describe(error)}`);
+      select.focus();
+    }
+  }
+
+  // --- edit dialog -------------------------------------------------------------------
+  function openEdit(issue, trigger) {
+    edit.issue = issue;
+    edit.trigger = trigger;
+    editTitle.value = issue.title;
+    editDescription.value = issue.description || '';
+    editStatus.value = issue.status;
+    setFieldError(editTitle, editTitleError, '');
+    setFieldError(editDescription, editDescriptionError, '');
+    showBox(editError, editError, '');
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+    edit.open = true;
+    editTitle.focus();
+  }
+
+  function closeEdit({ restoreFocusTo } = {}) {
+    if (!edit.open) return;
+    if (typeof dialog.close === 'function') dialog.close();
+    else dialog.removeAttribute('open');
+    edit.open = false;
+    const target = restoreFocusTo || (edit.issue && editButtons.get(edit.issue.id)) || edit.trigger;
+    edit.issue = null;
+    edit.trigger = null;
+    target?.focus();
+  }
+
+  editCancel.addEventListener('click', () => { if (!edit.saving) closeEdit(); });
+  dialog.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (!edit.saving) closeEdit();
+    }
+  });
+  dialog.addEventListener('cancel', event => {
+    event.preventDefault();
+    if (!edit.saving) closeEdit();
+  });
+
+  editForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (edit.saving || !edit.issue) return;
+    const issue = edit.issue;
+    const patch = {};
+    if (editTitle.value.trim() !== issue.title) patch.title = editTitle.value;
+    if (editDescription.value !== (issue.description || '')) patch.description = editDescription.value;
+    if (editStatus.value !== issue.status) patch.status = editStatus.value;
+    showBox(editError, editError, '');
+    if (Object.keys(patch).length === 0) { closeEdit(); return; }
+    const { errors, value } = validateIssueInput(patch, { partial: true });
+    setFieldError(editTitle, editTitleError, errors.title);
+    setFieldError(editDescription, editDescriptionError, errors.description);
+    if (errors.title || errors.description) {
+      (errors.title ? editTitle : editDescription).focus();
+      return;
+    }
+    edit.saving = true;
+    editSave.disabled = true;
+    editCancel.disabled = true;
+    editSave.textContent = 'Saving…';
+    editForm.setAttribute('aria-busy', 'true');
+    try {
+      const updated = await adapter.update(issue.id, value);
+      announce(`Saved “${updated.title}”.`);
+      edit.saving = false;
+      await load();
+      closeEdit();
+    } catch (error) {
+      showBox(editError, editError, `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
+    } finally {
+      edit.saving = false;
+      editSave.disabled = false;
+      editCancel.disabled = false;
+      editSave.textContent = 'Save changes';
+      editForm.setAttribute('aria-busy', 'false');
+    }
+  });
+
+  // --- filters -------------------------------------------------------------------------
+  searchInput.addEventListener('input', () => {
+    state.filters.q = searchInput.value;
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { searchTimer = null; load(); }, searchDelayMs);
+  });
+  filterSelect.addEventListener('change', () => {
+    state.filters.status = filterSelect.value;
+    load();
+  });
+  retryButton.addEventListener('click', () => load());
+  dismissButton.addEventListener('click', () => showBox(actionErrorBox, actionErrorText, ''));
+
+  const ready = load();
+  return { state, ready, reload: load, adapter };
+}
+
+// ---------------------------------------------------------------------------
+// Browser boot (skipped when imported by Node tests)
+// ---------------------------------------------------------------------------
+
+if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+  const root = document.getElementById('app');
+  if (root) {
+    const adapter = selectAdapter(DATA_MODE, { search: window.location.search });
+    mountApp(root, { adapter, doc: document });
+  }
+}
