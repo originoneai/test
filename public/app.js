@@ -11,7 +11,10 @@
 //   list({ status, q }) -> Promise<Issue[]>        (GET   /api/issues)
 //   create({ title, description }) -> Promise<Issue> (POST  /api/issues)
 //   update(id, patch) -> Promise<Issue>             (PATCH /api/issues/:id)
-// Failures reject with ApiError { code, message, status }.
+// Failures reject with ApiError { code, message, status, outcomeUnknown }.
+// outcomeUnknown is true when no trustworthy answer came back (the connection
+// failed, or the response could not be read as the contract shape). For a save,
+// that means the server may or may not have applied it.
 //
 // Rendering never uses innerHTML: every piece of issue text is assigned through
 // textContent, so HTML-like input is shown as text.
@@ -24,11 +27,12 @@ export const TITLE_MAX = 120;
 export const DESCRIPTION_MAX = 4000;
 
 export class ApiError extends Error {
-  constructor(code, message, status = 0) {
+  constructor(code, message, status = 0, { outcomeUnknown = false } = {}) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
     this.status = status;
+    this.outcomeUnknown = outcomeUnknown;
   }
 }
 
@@ -92,11 +96,26 @@ export function groupByStatus(issues) {
   return groups;
 }
 
+const isIsoTime = value => typeof value === 'string' && value !== '' && !Number.isNaN(Date.parse(value));
+
+/** True when `value` has the issue shape from specs/issue-tracker.md. */
+export function isValidIssue(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const { id, title, description, status, createdAt, updatedAt } = value;
+  return typeof id === 'string' && id !== ''
+    && typeof title === 'string' && title.trim().length >= 1 && title.trim().length <= TITLE_MAX
+    && typeof description === 'string' && description.length <= DESCRIPTION_MAX
+    && STATUSES.includes(status)
+    && isIsoTime(createdAt) && isIsoTime(updatedAt);
+}
+
 // ---------------------------------------------------------------------------
 // Live API adapter (used when DATA_MODE === 'api')
 // ---------------------------------------------------------------------------
 
 export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(...args), base = '' } = {}) {
+  const unreadable = status => new ApiError('INVALID_RESPONSE',
+    'The server sent a response the board could not read.', status, { outcomeUnknown: true });
   async function request(method, path, body) {
     let res;
     try {
@@ -106,14 +125,26 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch {
-      throw new ApiError('NETWORK_ERROR', 'Could not reach the server. Check the connection and try again.', 0);
+      throw new ApiError('NETWORK_ERROR', 'The connection to the server failed.', 0, { outcomeUnknown: true });
     }
-    let data = null;
-    try { data = await res.json(); } catch { data = null; }
+    let data;
+    let parsed = true;
+    try { data = await res.json(); } catch { parsed = false; }
     if (!res.ok) {
-      const err = data && data.error;
-      throw new ApiError(err?.code || `HTTP_${res.status}`, err?.message || `Request failed (${res.status}).`, res.status);
+      const err = parsed && data && typeof data === 'object' ? data.error : null;
+      // A contract error body is a definite answer from the API. Anything else
+      // (for example a gateway HTML page) says nothing about what happened.
+      if (err && typeof err.code === 'string' && typeof err.message === 'string') {
+        throw new ApiError(err.code, err.message, res.status);
+      }
+      throw new ApiError(`HTTP_${res.status}`, `The server answered with an unexpected error (${res.status}).`, res.status, { outcomeUnknown: true });
     }
+    if (!parsed) throw unreadable(res.status);
+    return { data, status: res.status };
+  }
+  async function issueFrom(method, path, body, check = () => true) {
+    const { data, status } = await request(method, path, body);
+    if (!isValidIssue(data) || !check(data)) throw unreadable(status);
     return data;
   }
   return {
@@ -123,11 +154,18 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
       if (status) params.set('status', status);
       if (q) params.set('q', q);
       const query = params.toString();
-      const data = await request('GET', '/api/issues' + (query ? '?' + query : ''));
-      return Array.isArray(data?.items) ? data.items : [];
+      const { data, status: code } = await request('GET', '/api/issues' + (query ? '?' + query : ''));
+      // Only a well-formed { items: [...] } may replace the board; an empty
+      // array is a real empty list, anything malformed is an error.
+      if (!data || typeof data !== 'object' || !Array.isArray(data.items) || !data.items.every(isValidIssue)) {
+        throw unreadable(code);
+      }
+      return data.items;
     },
-    create(input) { return request('POST', '/api/issues', input); },
-    update(id, patch) { return request('PATCH', '/api/issues/' + encodeURIComponent(id), patch); },
+    create(input) { return issueFrom('POST', '/api/issues', input); },
+    update(id, patch) {
+      return issueFrom('PATCH', '/api/issues/' + encodeURIComponent(id), patch, issue => issue.id === id);
+    },
   };
 }
 
@@ -427,7 +465,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   function render() {
     board.setAttribute('aria-busy', state.loading ? 'true' : 'false');
     board.classList.toggle('is-loading', state.loading);
-    showBox(loadErrorBox, loadErrorText, state.loadError ? `Could not load issues: ${describe(state.loadError)}` : '');
+    const keptList = state.loadError && state.issues.length > 0;
+    showBox(loadErrorBox, loadErrorText, state.loadError
+      ? `Could not load issues: ${describe(state.loadError)} ${keptList ? 'The board still shows the last list that loaded.' : 'The list was not updated.'} Try again.`
+      : '');
     const groups = groupByStatus(state.issues);
     editButtons.clear();
     for (const status of STATUSES) {
@@ -437,10 +478,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       list.replaceChildren(...items.map(renderCard));
       const label = STATUS_LABELS[status].toLowerCase();
       empty.textContent = filtersActive() ? `No ${label} issues match these filters.` : `No ${label} issues.`;
-      empty.hidden = items.length > 0 || state.loading;
+      // An empty column is only claimed after a successful load.
+      empty.hidden = items.length > 0 || state.loading || Boolean(state.loadError);
     }
     if (state.loading) boardStatus.textContent = 'Loading issues…';
-    else if (state.loadError) boardStatus.textContent = 'Issues could not be loaded.';
+    else if (state.loadError) boardStatus.textContent = state.issues.length > 0 ? 'Issues could not be refreshed. Showing the last list that loaded.' : 'Issues could not be loaded.';
     else if (state.issues.length === 0) boardStatus.textContent = filtersActive() ? 'No issues match your search.' : 'No issues yet. Create the first one.';
     else boardStatus.textContent = `${state.issues.length} ${state.issues.length === 1 ? 'issue' : 'issues'} shown.`;
     boardStatus.classList.toggle('is-loading', state.loading);
@@ -497,10 +539,18 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       }
       await load();
     } catch (error) {
-      const kept = draftUnchanged()
-        ? 'Your text is kept so you can try again.'
-        : `“${value.title}” was not saved. Your newer draft was left unchanged.`;
-      showBox(createError, createError, `Could not create the issue: ${describe(error)} ${kept}`);
+      const unchanged = draftUnchanged();
+      if (error?.outcomeUnknown) {
+        // The request may have reached the server; never say it was not saved.
+        const kept = unchanged ? 'Your text is kept.' : 'Your newer draft was left unchanged.';
+        showBox(createError, createError, `Could not confirm whether “${value.title}” was saved: ${describe(error)} ${kept} Check the board for it before creating it again.`);
+        await load();
+      } else {
+        const kept = unchanged
+          ? 'Your text is kept so you can try again.'
+          : `“${value.title}” was not saved. Your newer draft was left unchanged.`;
+        showBox(createError, createError, `Could not create the issue: ${describe(error)} ${kept}`);
+      }
     } finally {
       creating = false;
       createButton.disabled = false;
@@ -526,8 +576,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       select.value = previous;
       select.disabled = false;
       card.setAttribute('aria-busy', 'false');
-      showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: ${describe(error)}`);
-      select.focus();
+      if (error?.outcomeUnknown) {
+        showBox(actionErrorBox, actionErrorText, `Could not confirm whether “${issue.title}” moved to ${STATUS_LABELS[next]}: ${describe(error)} Check the board before trying again.`);
+        await load();
+        (editButtons.get(issue.id) ?? select).focus();
+      } else {
+        showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: ${describe(error)}`);
+        select.focus();
+      }
     }
   }
 
@@ -599,7 +655,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       await load();
       closeEdit();
     } catch (error) {
-      showBox(editError, editError, `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
+      showBox(editError, editError, error?.outcomeUnknown
+        ? `Could not confirm whether your changes were saved: ${describe(error)} Your changes are kept here. Reload the board to check before saving again.`
+        : `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
     } finally {
       edit.saving = false;
       editSave.disabled = false;

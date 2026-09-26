@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 import {
   DATA_MODE, STATUSES, TITLE_MAX, DESCRIPTION_MAX, ApiError,
   validateIssueInput, filterIssues, groupByStatus,
-  createFixtureAdapter, createHttpAdapter, selectAdapter, fixtureIssues, mountApp,
+  createFixtureAdapter, createHttpAdapter, selectAdapter, fixtureIssues, mountApp, isValidIssue,
 } from '../public/app.js';
 
 // ---------------------------------------------------------------------------
@@ -150,26 +150,85 @@ test('fixture adapter mirrors the API contract and returns copies', async () => 
   assert.deepEqual(await failing.list(), []);
 });
 
+const T0 = '2026-09-25T00:00:00.000Z';
+const liveIssue = (id, extra = {}) => ({ id, title: `Issue ${id}`, description: '', status: 'open', createdAt: T0, updatedAt: T0, ...extra });
+// A fake fetch Response: a JSON body, or raw text that json() cannot parse.
+const jsonResponse = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+const textResponse = (status, text) => ({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(text) });
+const GATEWAY_HTML = '<!doctype html><html><body><h1>502 Bad Gateway</h1><p>Temporary proxy page</p></body></html>';
+
 test('HTTP adapter uses the contract endpoints and surfaces error bodies', async () => {
   const requests = [];
-  const respond = (status, body) => ({ ok: status < 400, status, json: async () => body });
   const fetchImpl = async (url, init) => {
     requests.push({ url, method: init.method, body: init.body, type: init.headers['content-type'] });
-    if (url.startsWith('/api/issues?')) return respond(200, { items: [{ id: '1' }] });
-    if (init.method === 'POST') return respond(201, { id: '2', ...JSON.parse(init.body) });
-    if (url === '/api/issues/a%2Fb') return respond(404, { error: { code: 'NOT_FOUND', message: 'Issue not found.' } });
-    return respond(500, null);
+    if (url.startsWith('/api/issues?')) return jsonResponse(200, { items: [liveIssue('1')] });
+    if (init.method === 'POST') return jsonResponse(201, liveIssue('2', JSON.parse(init.body)));
+    if (url === '/api/issues/a%2Fb') return jsonResponse(404, { error: { code: 'NOT_FOUND', message: 'Issue not found.' } });
+    if (url === '/api/issues/ok') return jsonResponse(200, liveIssue('ok', { status: 'done' }));
+    return jsonResponse(500, null);
   };
   const api = createHttpAdapter({ fetchImpl });
   assert.equal(api.mode, 'api');
-  assert.deepEqual(await api.list({ status: 'open', q: 'a b' }), [{ id: '1' }]);
+  assert.deepEqual(await api.list({ status: 'open', q: 'a b' }), [liveIssue('1')]);
   assert.equal(requests[0].url, '/api/issues?status=open&q=a+b');
   assert.equal((await api.create({ title: 'T' })).title, 'T');
   assert.equal(requests[1].type, 'application/json');
-  await assert.rejects(api.update('a/b', { status: 'done' }), e => e.code === 'NOT_FOUND' && e.status === 404 && e.message === 'Issue not found.');
-  await assert.rejects(api.update('x', { status: 'done' }), e => e.code === 'HTTP_500');
+  assert.equal((await api.update('ok', { status: 'done' })).status, 'done');
+  await assert.rejects(api.update('a/b', { status: 'done' }),
+    e => e.code === 'NOT_FOUND' && e.status === 404 && e.message === 'Issue not found.' && e.outcomeUnknown === false);
+  await assert.rejects(api.update('x', { status: 'done' }), e => e.code === 'HTTP_500' && e.outcomeUnknown === true);
   const offline = createHttpAdapter({ fetchImpl: async () => { throw new TypeError('fetch failed'); } });
-  await assert.rejects(offline.list(), e => e.code === 'NETWORK_ERROR');
+  await assert.rejects(offline.list(), e => e.code === 'NETWORK_ERROR' && e.outcomeUnknown === true);
+  await assert.rejects(offline.create({ title: 'T' }), e => e.code === 'NETWORK_ERROR' && e.outcomeUnknown === true);
+});
+
+test('isValidIssue accepts only the contract issue shape', () => {
+  assert.equal(isValidIssue(liveIssue('a')), true);
+  assert.equal(isValidIssue(liveIssue('a', { description: 'text', status: 'in_progress' })), true);
+  for (const bad of [null, [], 'x', { id: '1' }, liveIssue(''), liveIssue('a', { title: '  ' }),
+    liveIssue('a', { title: 'x'.repeat(TITLE_MAX + 1) }), liveIssue('a', { description: null }),
+    liveIssue('a', { description: 'd'.repeat(DESCRIPTION_MAX + 1) }), liveIssue('a', { status: 'blocked' }),
+    liveIssue('a', { createdAt: 'yesterday' }), liveIssue('a', { updatedAt: undefined })]) {
+    assert.equal(isValidIssue(bad), false, JSON.stringify(bad));
+  }
+});
+
+// Regression: a 200 response that is not the { items: [...] } shape (for example a
+// temporary gateway HTML page) used to become an empty list, which looked like
+// every issue had been deleted.
+test('HTTP list rejects malformed 200 responses instead of returning an empty list', async () => {
+  const cases = {
+    'gateway HTML page': () => textResponse(200, GATEWAY_HTML),
+    'empty body': () => textResponse(200, ''),
+    'JSON null': () => jsonResponse(200, null),
+    'bare array': () => jsonResponse(200, [liveIssue('1')]),
+    'missing items': () => jsonResponse(200, { issues: [liveIssue('1')] }),
+    'items is not an array': () => jsonResponse(200, { items: {} }),
+    'invalid entry': () => jsonResponse(200, { items: [liveIssue('1'), { id: '2', title: 'no status' }] }),
+    'gateway 502 HTML': () => textResponse(502, GATEWAY_HTML),
+  };
+  for (const [name, respond] of Object.entries(cases)) {
+    const api = createHttpAdapter({ fetchImpl: async () => respond() });
+    await assert.rejects(api.list(), e => e instanceof ApiError && e.outcomeUnknown === true && /INVALID_RESPONSE|HTTP_502/.test(e.code), name);
+  }
+  const empty = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, { items: [] }) });
+  assert.deepEqual(await empty.list(), [], 'a well-formed empty list is still an empty list');
+});
+
+test('HTTP create/update reject success responses that are not a valid issue', async () => {
+  const bodies = {
+    'gateway HTML page': () => textResponse(200, GATEWAY_HTML),
+    'empty object': () => jsonResponse(201, {}),
+    'wrong status value': () => jsonResponse(201, liveIssue('n', { status: 'saved' })),
+    'missing timestamps': () => jsonResponse(201, { id: 'n', title: 'T', description: '', status: 'open' }),
+  };
+  for (const [name, respond] of Object.entries(bodies)) {
+    const api = createHttpAdapter({ fetchImpl: async () => respond() });
+    await assert.rejects(api.create({ title: 'T' }), e => e.code === 'INVALID_RESPONSE' && e.outcomeUnknown === true, `create: ${name}`);
+    await assert.rejects(api.update('n', { status: 'done' }), e => e.code === 'INVALID_RESPONSE' && e.outcomeUnknown === true, `update: ${name}`);
+  }
+  const otherIssue = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, liveIssue('someone-else')) });
+  await assert.rejects(otherIssue.update('n', { status: 'done' }), e => e.code === 'INVALID_RESPONSE', 'update must return the issue that was changed');
 });
 
 test('fixture mode is explicit and replaceable; no silent fallback', () => {
@@ -275,8 +334,8 @@ test('create form validates, shows pending state and only reports success after 
   assert.deepEqual(cardTitles(root, 'open'), ['Write tests']);
 });
 
-// Regression for review round 1 (01M3CHMZKZ2ZXSPM83GPKTH8V0): on a slow save the
-// user typed the next draft while waiting, and the first save's success cleared it.
+// Regression: on a slow save the user typed the next draft while waiting, and the
+// first save's success cleared it.
 // The adapter's create promise is released by hand, so the order is fixed:
 // submit, then type a new draft, then the first save resolves.
 test('a draft typed while the previous create is saving is kept when that save succeeds', async () => {
@@ -516,4 +575,138 @@ test('page shell is responsive, labelled and blue/white themed', async () => {
   assert.match(css, /repeat\(3, minmax\(0, 1fr\)\)/);
   assert.match(css, /--blue-600: #2563eb/);
   assert.match(css, /:focus-visible/);
+});
+
+// ---------------------------------------------------------------------------
+// Live-mode regressions: malformed responses through the real HTTP adapter
+// ---------------------------------------------------------------------------
+// A scripted fetch: each call takes the next response for its method.
+function scriptedFetch(script) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, method: init.method, body: init.body });
+    const queue = script[init.method];
+    const next = queue.length > 1 ? queue.shift() : queue[0];
+    return next(url, init);
+  };
+  return { fetchImpl, calls };
+}
+
+test('a malformed list response shows a recoverable error, not an empty board, and Retry recovers', async () => {
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => textResponse(200, GATEWAY_HTML), () => jsonResponse(200, { items: [liveIssue('1', { title: 'Real issue' })] })],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  assert.equal(byRole(root, 'load-error').hidden, false);
+  assert.match(byRole(root, 'load-error-text').textContent, /Could not load issues: The server sent a response the board could not read\. The list was not updated\. Try again\./);
+  assert.equal(byRole(root, 'board-status').textContent, 'Issues could not be loaded.');
+  for (const status of STATUSES) assert.equal(byRole(root, `empty-${status}`).hidden, true, `no "No ${status} issues" claim`);
+  byRole(root, 'retry').dispatch('click');
+  await flush();
+  assert.equal(byRole(root, 'load-error').hidden, true);
+  assert.deepEqual(cardTitles(root, 'open'), ['Real issue']);
+});
+
+test('a malformed refresh keeps the last loaded list on screen', async () => {
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [liveIssue('1', { title: 'Loaded first' })] }), () => jsonResponse(200, { items: [{ id: 'broken' }] })],
+  });
+  const { root, app } = await mount(createHttpAdapter({ fetchImpl }));
+  assert.deepEqual(cardTitles(root, 'open'), ['Loaded first']);
+  await app.reload();
+  assert.equal(byRole(root, 'load-error').hidden, false);
+  assert.match(byRole(root, 'load-error-text').textContent, /The board still shows the last list that loaded\./);
+  assert.equal(byRole(root, 'board-status').textContent, 'Issues could not be refreshed. Showing the last list that loaded.');
+  assert.deepEqual(cardTitles(root, 'open'), ['Loaded first']);
+});
+
+test('a well-formed empty list still shows the normal empty state', async () => {
+  const { fetchImpl } = scriptedFetch({ GET: [() => jsonResponse(200, { items: [] })] });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  assert.equal(byRole(root, 'load-error').hidden, true);
+  assert.equal(byRole(root, 'board-status').textContent, 'No issues yet. Create the first one.');
+  for (const status of STATUSES) assert.equal(byRole(root, `empty-${status}`).hidden, false);
+});
+
+test('an invalid create response is not reported as saved and keeps the input for retry', async () => {
+  const saved = liveIssue('n1', { title: 'Keep me', description: 'and me' });
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved] })],
+    POST: [() => textResponse(200, GATEWAY_HTML), () => jsonResponse(201, saved)],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const title = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-title');
+  const description = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-description');
+  title.value = 'Keep me';
+  description.value = 'and me';
+  byRole(root, 'create-form').dispatch('submit');
+  await flush(6);
+  const error = byRole(root, 'create-error');
+  assert.equal(error.hidden, false);
+  assert.match(error.textContent, /Could not confirm whether “Keep me” was saved: The server sent a response the board could not read\. Your text is kept\. Check the board for it before creating it again\./);
+  assert.doesNotMatch(error.textContent, /was not saved/, 'an unknown outcome is never stated as not saved');
+  assert.doesNotMatch(byRole(root, 'announcer').textContent, /Issue created/);
+  assert.equal(title.value, 'Keep me');
+  assert.equal(description.value, 'and me');
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'the board is reloaded so the user can check');
+
+  byRole(root, 'create-form').dispatch('submit');
+  await flush(6);
+  assert.equal(error.hidden, true);
+  assert.match(byRole(root, 'announcer').textContent, /Issue created: Keep me/);
+  assert.equal(title.value, '');
+  assert.deepEqual(cardTitles(root, 'open'), ['Keep me']);
+});
+
+test('a dropped connection during create says the result could not be confirmed', async () => {
+  let posts = 0;
+  const fetchImpl = async (url, init) => {
+    if (init.method === 'POST') { posts += 1; throw new TypeError('network connection was lost'); }
+    return jsonResponse(200, { items: [] });
+  };
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const title = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-title');
+  title.value = 'Maybe saved';
+  byRole(root, 'create-form').dispatch('submit');
+  await flush(6);
+  assert.equal(posts, 1);
+  assert.match(byRole(root, 'create-error').textContent, /Could not confirm whether “Maybe saved” was saved: The connection to the server failed\./);
+  assert.doesNotMatch(byRole(root, 'create-error').textContent, /was not saved/);
+  assert.equal(title.value, 'Maybe saved');
+});
+
+test('an invalid edit response keeps the dialog open and says the result could not be confirmed', async () => {
+  const original = liveIssue('e1', { title: 'Original title' });
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] })],
+    PATCH: [() => jsonResponse(200, { ok: true })],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const dialog = byRole(root, 'edit-dialog');
+  const editTitle = [...walk(root)].find(n => n.getAttribute?.('id') === 'edit-title');
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  editTitle.value = 'Edited title';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(6);
+  assert.equal(dialog.hasAttribute('open'), true);
+  assert.equal(editTitle.value, 'Edited title');
+  assert.match(byRole(root, 'edit-error').textContent, /Could not confirm whether your changes were saved: The server sent a response the board could not read\. Your changes are kept here\./);
+  assert.doesNotMatch(byRole(root, 'announcer').textContent, /Saved/);
+});
+
+test('an invalid status-change response is not shown as moved and the board is reloaded', async () => {
+  const original = liveIssue('s1', { title: 'Move me' });
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] })],
+    PATCH: [() => textResponse(200, GATEWAY_HTML)],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(6);
+  assert.match(byRole(root, 'action-error-text').textContent, /Could not confirm whether “Move me” moved to Done/);
+  assert.doesNotMatch(byRole(root, 'announcer').textContent, /Moved/);
+  assert.deepEqual(cardTitles(root, 'open'), ['Move me']);
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2);
 });
