@@ -905,3 +905,142 @@ test('edits typed while the check runs are kept even if the earlier save turns o
     'The board was checked and shows the changes you saved to “Second”. Your newer edits are still here and have not been saved.');
   assert.equal(byRole(root, 'edit-check').hidden, true);
 });
+
+// ---------------------------------------------------------------------------
+// Edits typed while a successful save is still pending (review round 4)
+// ---------------------------------------------------------------------------
+const T1 = '2026-09-25T01:00:00.000Z';
+const T2 = '2026-09-25T02:00:00.000Z';
+
+test('text typed while a successful edit save is pending survives the reply and the refresh, and only the rest is sent next', async () => {
+  const original = liveIssue('r1', { title: 'Draft release notes' });
+  const saved = { ...original, title: 'Publish the release notes', updatedAt: T1 };
+  const final = { ...saved, description: 'Also explain the migration and rollback', updatedAt: T2 };
+  const patch = deferred();
+  const refresh = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => refresh.promise, () => jsonResponse(200, { items: [final] })],
+    PATCH: [() => patch.promise, () => jsonResponse(200, final)],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  const dialog = byRole(root, 'edit-dialog');
+  const notice = byRole(root, 'edit-notice');
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'Publish the release notes';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  assert.equal(byRole(root, 'edit-save').disabled, true);
+  assert.equal(byRole(root, 'edit-cancel').disabled, true, 'the dialog cannot be dismissed while saving');
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.getAttribute('role'), 'status');
+  assert.equal(notice.textContent, 'Saving your changes… You can keep editing; anything you change now stays here.');
+
+  // The user keeps typing before the PATCH reply arrives.
+  byId(root, 'edit-description').value = 'Also explain the migration';
+  patch.resolve(jsonResponse(200, saved));
+  await flush(6);
+  assert.equal(dialog.hasAttribute('open'), true, 'the dialog stays open during the refresh');
+  assert.equal(byId(root, 'edit-description').value, 'Also explain the migration');
+  assert.equal(byRole(root, 'edit-save').textContent, 'Refreshing…');
+  assert.equal(byRole(root, 'edit-save').disabled, true);
+  assert.equal(notice.textContent, 'Saved “Publish the release notes”. Refreshing the board… Anything you change now stays here.');
+
+  // More typing while the list refresh is still pending.
+  byId(root, 'edit-description').value = 'Also explain the migration and rollback';
+  refresh.resolve(jsonResponse(200, { items: [saved] }));
+  await flush(6);
+  assert.equal(dialog.hasAttribute('open'), true, 'newer edits keep the dialog open');
+  assert.equal(byId(root, 'edit-title').value, 'Publish the release notes');
+  assert.equal(byId(root, 'edit-description').value, 'Also explain the migration and rollback');
+  assert.equal(notice.textContent, 'Saved “Publish the release notes”. Your newer edits are still here and have not been saved. Choose Save changes to save them.');
+  assert.equal(byRole(root, 'edit-save').disabled, false);
+  assert.equal(byRole(root, 'edit-save').textContent, 'Save changes');
+  assert.equal(byRole(root, 'edit-error').hidden, true, 'a confirmed save is not shown as an error');
+  assert.deepEqual(cardTitles(root, 'open'), ['Publish the release notes'], 'the board shows the saved title');
+  assert.equal(doc.activeElement, byId(root, 'edit-title'), 'focus is not pulled out of the field being edited');
+
+  // Saving again sends only what differs from the confirmed baseline.
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ title: 'Publish the release notes' }, { description: 'Also explain the migration and rollback' }]);
+  assert.equal(dialog.hasAttribute('open'), false, 'with nothing left unsaved the dialog closes');
+  assert.equal(byRole(root, 'announcer').textContent, 'Saved “Publish the release notes”.');
+  assert.equal(notice.hidden, true);
+});
+
+test('an edit made only while the board refreshes after a save is kept for an explicit save', async () => {
+  const original = liveIssue('r2', { title: 'Refresh race' });
+  const saved = { ...original, description: 'First pass', updatedAt: T1 };
+  const refresh = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => refresh.promise, () => jsonResponse(200, { items: [{ ...saved, status: 'done' }] })],
+    PATCH: [() => jsonResponse(200, saved), () => jsonResponse(200, { ...saved, status: 'done', updatedAt: T2 })],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-description').value = 'First pass';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(6);
+  byId(root, 'edit-status').value = 'done';
+  doc.activeElement = null;
+  refresh.resolve(jsonResponse(200, { items: [saved] }));
+  await flush(6);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
+  assert.equal(byId(root, 'edit-status').value, 'done');
+  assert.equal(byId(root, 'edit-description').value, 'First pass');
+  assert.match(byRole(root, 'edit-notice').textContent, /Your newer edits are still here and have not been saved\./);
+  assert.equal(doc.activeElement, byRole(root, 'edit-save'), 'with no field focused, focus moves to Save changes');
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ description: 'First pass' }, { status: 'done' }]);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+});
+
+test('edits typed during a save and then reverted still close the dialog normally', async () => {
+  const original = liveIssue('r3', { title: 'Revert' });
+  const saved = { ...original, title: 'Reverted back', updatedAt: T1 };
+  const patch = deferred();
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [saved] })],
+    PATCH: [() => patch.promise],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'Reverted back';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  byId(root, 'edit-description').value = 'temporary';
+  byId(root, 'edit-description').value = '';
+  patch.resolve(jsonResponse(200, saved));
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+  assert.equal(byRole(root, 'announcer').textContent, 'Saved “Reverted back”.');
+});
+
+test('text typed during a save whose outcome is unknown is kept, and the unknown-outcome path is unchanged', async () => {
+  const original = liveIssue('r4', { title: 'Unknown' });
+  const patch = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [original] })],
+    PATCH: [() => patch.promise],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'Unknown sent';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  byId(root, 'edit-description').value = 'Typed while pending';
+  patch.reject(new TypeError('network connection was lost'));
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
+  assert.equal(byId(root, 'edit-title').value, 'Unknown sent');
+  assert.equal(byId(root, 'edit-description').value, 'Typed while pending');
+  assert.equal(byRole(root, 'edit-error').textContent,
+    'Could not confirm whether your changes were saved: The connection to the server failed. The board was checked again and does not show these changes. Your changes are kept here. Choose Save changes to send them again, or Check again to look once more.');
+  assert.equal(byRole(root, 'edit-check').hidden, false);
+  assert.equal(byRole(root, 'edit-notice').hidden, true, 'no saved notice for an unknown outcome');
+  assert.equal(doc.activeElement, byRole(root, 'edit-save'));
+  assert.equal(calls.filter(c => c.method === 'PATCH').length, 1);
+});

@@ -436,11 +436,15 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // Shown only after a save whose outcome is unknown: asks the API for the
   // current issue again without leaving the dialog or losing the draft.
   const editCheck = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-check', text: 'Check again', hidden: true });
+  // Progress and follow-up notice for an edit save. The fields stay editable
+  // while a save is in flight; anything typed meanwhile is kept, never closed away.
+  const editNotice = h(doc, 'p', { class: 'form-pending', role: 'status', 'aria-live': 'polite', 'data-role': 'edit-notice', hidden: true });
   const editForm = h(doc, 'form', { novalidate: true, 'data-role': 'edit-form' },
     h(doc, 'h2', { id: 'edit-heading', text: 'Edit issue' }),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-title', text: 'Title' }), editTitle, editTitleError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-description', text: 'Description' }), editDescription, editDescriptionError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-status', text: 'Status' }), editStatus),
+    editNotice,
     editError,
     h(doc, 'div', { class: 'form-actions' }, editCancel, editCheck, editSave),
   );
@@ -636,6 +640,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     setFieldError(editTitle, editTitleError, '');
     setFieldError(editDescription, editDescriptionError, '');
     showBox(editError, editError, '');
+    showBox(editNotice, editNotice, '');
     edit.unconfirmed = null;
     editCheck.hidden = true;
     if (typeof dialog.showModal === 'function') dialog.showModal();
@@ -654,6 +659,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     edit.trigger = null;
     edit.unconfirmed = null;
     editCheck.hidden = true;
+    showBox(editNotice, editNotice, '');
     target?.focus();
   }
 
@@ -671,6 +677,15 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
 
   const readEditForm = () => ({ title: editTitle.value, description: editDescription.value, status: editStatus.value });
   const sameForm = (a, b) => a.title === b.title && a.description === b.description && a.status === b.status;
+  // The fields of `form` that differ from the saved `issue` (title compared trimmed, per contract).
+  function changesFrom(form, issue) {
+    const patch = {};
+    if (form.title.trim() !== issue.title) patch.title = form.title;
+    if (form.description !== (issue.description || '')) patch.description = form.description;
+    if (form.status !== issue.status) patch.status = form.status;
+    return patch;
+  }
+  const editFields = [editTitle, editDescription, editStatus];
 
   function setEditBusy(busy, label) {
     edit.saving = busy;
@@ -739,11 +754,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     if (edit.saving || !edit.issue) return;
     const issue = edit.issue;
     const form = readEditForm();
-    const patch = {};
-    if (form.title.trim() !== issue.title) patch.title = form.title;
-    if (form.description !== (issue.description || '')) patch.description = form.description;
-    if (form.status !== issue.status) patch.status = form.status;
+    const patch = changesFrom(form, issue);
     showBox(editError, editError, '');
+    showBox(editNotice, editNotice, '');
     if (Object.keys(patch).length === 0) { closeEdit(); return; }
     const { errors, value } = validateIssueInput(patch, { partial: true });
     setFieldError(editTitle, editTitleError, errors.title);
@@ -755,15 +768,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     edit.unconfirmed = null;
     editCheck.hidden = true;
     setEditBusy(true, 'Saving…');
+    showBox(editNotice, editNotice, 'Saving your changes… You can keep editing; anything you change now stays here.');
+    let updated;
     try {
       // Only a reply for this issue that shows every submitted field counts as saved.
-      const updated = confirmSaved(await adapter.update(issue.id, value), value, { id: issue.id });
-      announce(`Saved “${updated.title}”.`);
-      setEditBusy(false);
-      await load();
-      closeEdit();
+      updated = confirmSaved(await adapter.update(issue.id, value), value, { id: issue.id });
     } catch (error) {
       setEditBusy(false);
+      showBox(editNotice, editNotice, '');
       if (error?.outcomeUnknown) {
         edit.unconfirmed = { id: issue.id, submitted: value, form, reason: describe(error) };
         editCheck.hidden = false;
@@ -771,7 +783,26 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       } else {
         showBox(editError, editError, `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
       }
+      return;
     }
+    // The confirmed reply is the new saved baseline; later saves send only what
+    // differs from it. The dialog stays busy (fields still editable) until the
+    // board behind it has been refreshed.
+    edit.issue = updated;
+    setEditBusy(true, 'Refreshing…');
+    showBox(editNotice, editNotice, `Saved “${updated.title}”. Refreshing the board… Anything you change now stays here.`);
+    await load();
+    setEditBusy(false);
+    if (!edit.open || edit.issue !== updated) return;
+    const current = readEditForm();
+    if (sameForm(current, form) || Object.keys(changesFrom(current, updated)).length === 0) {
+      announce(`Saved “${updated.title}”.`);
+      closeEdit();
+      return;
+    }
+    // Text typed while the save or the refresh was running is kept for an explicit save.
+    showBox(editNotice, editNotice, `Saved “${updated.title}”. Your newer edits are still here and have not been saved. Choose Save changes to save them.`);
+    if (!editFields.includes(doc.activeElement)) editSave.focus();
   });
 
   // --- filters -------------------------------------------------------------------------
