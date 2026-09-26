@@ -259,7 +259,10 @@ test('create form validates, shows pending state and only reports success after 
   assert.deepEqual(calls[0], { title: 'Write tests', description: 'For the board' });
   const button = byRole(root, 'create-submit');
   assert.equal(button.disabled, true);
-  assert.equal(button.textContent, 'Creating…');
+  assert.equal(button.textContent, 'Saving…');
+  assert.equal(byRole(root, 'create-pending').hidden, false);
+  assert.match(byRole(root, 'create-pending').textContent, /Saving “Write tests”… You can keep typing your next issue; it will not be cleared\./);
+  assert.equal(byRole(root, 'create-pending').getAttribute('aria-live'), 'polite');
   assert.equal(byRole(root, 'announcer').textContent, '', 'no success before the adapter confirms');
   assert.equal(title.getAttribute('aria-invalid'), null);
 
@@ -268,7 +271,100 @@ test('create form validates, shows pending state and only reports success after 
   assert.equal(button.disabled, false);
   assert.equal(title.value, '');
   assert.match(byRole(root, 'announcer').textContent, /Issue created: Write tests/);
+  assert.equal(byRole(root, 'create-pending').hidden, true);
   assert.deepEqual(cardTitles(root, 'open'), ['Write tests']);
+});
+
+// Regression for review round 1 (01M3CHMZKZ2ZXSPM83GPKTH8V0): on a slow save the
+// user typed the next draft while waiting, and the first save's success cleared it.
+// The adapter's create promise is released by hand, so the order is fixed:
+// submit, then type a new draft, then the first save resolves.
+test('a draft typed while the previous create is saving is kept when that save succeeds', async () => {
+  const inner = createFixtureAdapter({ issues: [] });
+  const gate = deferred();
+  const calls = [];
+  const order = [];
+  const adapter = {
+    mode: 'fixture', list: inner.list, update: inner.update,
+    create: async input => { calls.push(input); order.push('create-sent'); await gate.promise; order.push('create-resolved'); return inner.create(input); },
+  };
+  const { root } = await mount(adapter);
+  const form = byRole(root, 'create-form');
+  const button = byRole(root, 'create-submit');
+  const title = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-title');
+  const description = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-description');
+
+  title.value = 'First issue';
+  description.value = 'First description';
+  form.dispatch('submit');
+  assert.equal(calls.length, 1);
+  assert.equal(button.disabled, true, 'the create button is disabled while saving');
+  assert.equal(byRole(root, 'create-pending').hidden, false, 'a visible saving notice is shown');
+
+  // The user starts the next draft while the first request is still in flight.
+  title.value = 'Second draft';
+  description.value = 'Typed while the first issue was saving';
+  order.push('draft-typed');
+  form.dispatch('submit');
+  assert.equal(calls.length, 1, 'a second submit during the save does not send another request');
+
+  gate.resolve();
+  await flush();
+  assert.deepEqual(order, ['create-sent', 'draft-typed', 'create-resolved']);
+  assert.equal(title.value, 'Second draft', 'the new title draft is kept');
+  assert.equal(description.value, 'Typed while the first issue was saving', 'the new description draft is kept');
+  assert.deepEqual(cardTitles(root, 'open'), ['First issue'], 'the first issue appears exactly once');
+  assert.match(byRole(root, 'announcer').textContent, /Issue created: First issue\. Your new draft was kept\./);
+  assert.equal(button.disabled, false);
+  assert.equal(byRole(root, 'create-pending').hidden, true);
+
+  // The kept draft is a normal draft: submitting it creates the second issue and clears the form.
+  form.dispatch('submit');
+  await flush();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], { title: 'Second draft', description: 'Typed while the first issue was saving' });
+  assert.deepEqual(cardTitles(root, 'open'), ['Second draft', 'First issue']);
+  assert.equal(title.value, '');
+  assert.equal(description.value, '');
+});
+
+test('changing only one field during a slow save keeps the whole draft', async () => {
+  const inner = createFixtureAdapter({ issues: [] });
+  const gate = deferred();
+  const adapter = { mode: 'fixture', list: inner.list, update: inner.update, create: async input => { await gate.promise; return inner.create(input); } };
+  const { root } = await mount(adapter);
+  const title = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-title');
+  const description = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-description');
+  title.value = 'Same title';
+  description.value = 'Old description';
+  byRole(root, 'create-form').dispatch('submit');
+  description.value = 'Old description, extended while saving';
+  gate.resolve();
+  await flush();
+  assert.equal(title.value, 'Same title');
+  assert.equal(description.value, 'Old description, extended while saving');
+  assert.deepEqual(cardTitles(root, 'open'), ['Same title']);
+});
+
+test('a failed slow create never overwrites a draft typed while it was saving', async () => {
+  const inner = createFixtureAdapter({ issues: [] });
+  const gate = deferred();
+  const adapter = { mode: 'fixture', list: inner.list, update: inner.update, create: async () => { await gate.promise; throw new ApiError('HTTP_503', 'Service unavailable.', 503); } };
+  const { root } = await mount(adapter);
+  const title = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-title');
+  const description = [...walk(root)].find(n => n.getAttribute?.('id') === 'new-description');
+  title.value = 'Will fail';
+  description.value = 'first';
+  byRole(root, 'create-form').dispatch('submit');
+  title.value = 'Newer draft';
+  description.value = 'typed while waiting';
+  gate.resolve();
+  await flush();
+  assert.equal(title.value, 'Newer draft');
+  assert.equal(description.value, 'typed while waiting');
+  assert.equal(byRole(root, 'create-error').hidden, false);
+  assert.match(byRole(root, 'create-error').textContent, /“Will fail” was not saved\. Your newer draft was left unchanged\./);
+  assert.deepEqual(cardTitles(root, 'open'), []);
 });
 
 test('failed create keeps the typed input and can be retried', async () => {

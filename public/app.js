@@ -299,6 +299,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const newDescriptionError = h(doc, 'p', { id: 'new-description-error', class: 'field-error', hidden: true });
   const createButton = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'create-submit', text: 'Create issue' });
   const createError = h(doc, 'p', { class: 'form-error', role: 'alert', 'data-role': 'create-error', hidden: true });
+  // Visible while a create request is in flight. The fields stay editable so the
+  // user can start the next draft; the notice says that draft will be kept.
+  const createPending = h(doc, 'p', { class: 'form-pending', role: 'status', 'aria-live': 'polite', 'data-role': 'create-pending', hidden: true });
   const createForm = h(doc, 'form', { class: 'panel new-issue', 'aria-labelledby': 'new-issue-heading', novalidate: true, 'data-role': 'create-form' },
     h(doc, 'h2', { id: 'new-issue-heading', text: 'New issue' }),
     h(doc, 'div', { class: 'field' },
@@ -313,6 +316,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       newDescriptionError,
     ),
     createError,
+    createPending,
     h(doc, 'div', { class: 'form-actions' }, createButton),
   );
 
@@ -465,35 +469,47 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     event.preventDefault();
     if (creating) return;
     showBox(createError, createError, '');
-    const input = { title: newTitle.value, description: newDescription.value };
-    const { errors, value } = validateIssueInput(input);
+    // Snapshot exactly what was submitted. The fields stay editable while the
+    // request is in flight, so on success we only clear the form if the user has
+    // not started a new draft in the meantime; a changed draft is never cleared.
+    const submitted = { title: newTitle.value, description: newDescription.value };
+    const { errors, value } = validateIssueInput(submitted);
     setFieldError(newTitle, newTitleError, errors.title);
     setFieldError(newDescription, newDescriptionError, errors.description);
     if (errors.title || errors.description) {
       (errors.title ? newTitle : newDescription).focus();
       return;
     }
+    const draftUnchanged = () => newTitle.value === submitted.title && newDescription.value === submitted.description;
     creating = true;
     createButton.disabled = true;
-    createButton.textContent = 'Creating…';
+    createButton.textContent = 'Saving…';
     createForm.setAttribute('aria-busy', 'true');
+    showBox(createPending, createPending, `Saving “${value.title}”… You can keep typing your next issue; it will not be cleared.`);
     try {
       const created = await adapter.create({ title: value.title, description: value.description ?? '' });
-      newTitle.value = '';
-      newDescription.value = '';
-      announce(`Issue created: ${created.title}`);
+      if (draftUnchanged()) {
+        newTitle.value = '';
+        newDescription.value = '';
+        announce(`Issue created: ${created.title}`);
+      } else {
+        announce(`Issue created: ${created.title}. Your new draft was kept.`);
+      }
       await load();
     } catch (error) {
-      showBox(createError, createError, `Could not create the issue: ${describe(error)} Your text is kept so you can try again.`);
+      const kept = draftUnchanged()
+        ? 'Your text is kept so you can try again.'
+        : `“${value.title}” was not saved. Your newer draft was left unchanged.`;
+      showBox(createError, createError, `Could not create the issue: ${describe(error)} ${kept}`);
     } finally {
       creating = false;
       createButton.disabled = false;
       createButton.textContent = 'Create issue';
       createForm.setAttribute('aria-busy', 'false');
+      showBox(createPending, createPending, '');
     }
   });
 
-  // --- status move -----------------------------------------------------------------
   async function moveIssue(issue, select, card) {
     const previous = issue.status;
     const next = select.value;

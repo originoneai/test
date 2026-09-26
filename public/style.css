@@ -86,6 +86,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 [aria-invalid="true"] { border-color: var(--danger) !important; }
 .field-error, .form-error { margin: 0; color: var(--danger); font-size: 0.875rem; font-weight: 600; }
 .form-error { padding: 8px 10px; border-radius: 8px; background: var(--danger-bg); margin-bottom: 12px; }
+.form-pending { margin: 0 0 12px; padding: 8px 10px; border-radius: 8px; background: var(--blue-100); color: var(--blue-900); font-size: 0.875rem; }
+.form-pending[hidden] { display: none; }
 .form-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 
 /* Buttons */
