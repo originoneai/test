@@ -7,6 +7,7 @@ import {
   DATA_MODE, STATUSES, TITLE_MAX, DESCRIPTION_MAX, ApiError,
   validateIssueInput, filterIssues, groupByStatus,
   createFixtureAdapter, createHttpAdapter, selectAdapter, fixtureIssues, mountApp, isValidIssue,
+  matchesSubmitted, confirmSaved, expectedCreate, UNCONFIRMED_MESSAGE,
 } from '../public/app.js';
 
 // ---------------------------------------------------------------------------
@@ -228,7 +229,7 @@ test('HTTP create/update reject success responses that are not a valid issue', a
     await assert.rejects(api.update('n', { status: 'done' }), e => e.code === 'INVALID_RESPONSE' && e.outcomeUnknown === true, `update: ${name}`);
   }
   const otherIssue = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, liveIssue('someone-else')) });
-  await assert.rejects(otherIssue.update('n', { status: 'done' }), e => e.code === 'INVALID_RESPONSE', 'update must return the issue that was changed');
+  await assert.rejects(otherIssue.update('n', { status: 'done' }), e => e.code === 'UNCONFIRMED_RESULT' && e.outcomeUnknown === true, 'update must return the issue that was changed');
 });
 
 test('fixture mode is explicit and replaceable; no silent fallback', () => {
@@ -690,8 +691,10 @@ test('an invalid edit response keeps the dialog open and says the result could n
   await flush(6);
   assert.equal(dialog.hasAttribute('open'), true);
   assert.equal(editTitle.value, 'Edited title');
-  assert.match(byRole(root, 'edit-error').textContent, /Could not confirm whether your changes were saved: The server sent a response the board could not read\. Your changes are kept here\./);
+  assert.match(byRole(root, 'edit-error').textContent, /Could not confirm whether your changes were saved: The server sent a response the board could not read\. The board was checked again and does not show these changes\. Your changes are kept here\./);
+  assert.doesNotMatch(byRole(root, 'edit-error').textContent, /[Rr]eload/, 'never asks for a page reload, which would lose the draft');
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Saved/);
+  assert.equal(byRole(root, 'edit-check').hidden, false);
 });
 
 test('an invalid status-change response is not shown as moved and the board is reloaded', async () => {
@@ -709,4 +712,196 @@ test('an invalid status-change response is not shown as moved and the board is r
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Moved/);
   assert.deepEqual(cardTitles(root, 'open'), ['Move me']);
   assert.equal(calls.filter(c => c.method === 'GET').length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// A save counts only when the reply shows what this user submitted
+// ---------------------------------------------------------------------------
+const byId = (root, id) => [...walk(root)].find(n => n.getAttribute?.('id') === id);
+
+test('save confirmation compares the submitted fields, with the title trimmed per contract', () => {
+  const issue = liveIssue('c1', { title: 'Padded', description: '  keep spaces ', status: 'in_progress' });
+  assert.equal(matchesSubmitted(issue, { title: '  Padded  ' }), true, 'the contract stores titles trimmed');
+  assert.equal(matchesSubmitted(issue, { description: '  keep spaces ' }), true);
+  assert.equal(matchesSubmitted(issue, { description: 'keep spaces' }), false, 'descriptions are not trimmed by the contract');
+  assert.equal(matchesSubmitted(issue, { status: 'in_progress' }), true);
+  assert.equal(matchesSubmitted(issue, { status: 'done' }), false, 'a stale status is not a confirmed move');
+  assert.equal(matchesSubmitted(issue, { title: 'Other' }), false);
+  assert.deepEqual(expectedCreate({ title: ' New ' }), { title: 'New', description: '', status: 'open' });
+  assert.equal(confirmSaved(issue, { status: 'in_progress' }, { id: 'c1' }), issue);
+  assert.throws(() => confirmSaved(issue, { status: 'in_progress' }, { id: 'c2' }),
+    e => e.code === 'UNCONFIRMED_RESULT' && e.outcomeUnknown === true && e.message === UNCONFIRMED_MESSAGE);
+  assert.throws(() => confirmSaved(issue, { status: 'done' }, { id: 'c1' }), e => e.code === 'UNCONFIRMED_RESULT');
+});
+
+test('HTTP create/update reject well-formed replies that do not show the submitted values', async () => {
+  const reply = issue => createHttpAdapter({ fetchImpl: async () => jsonResponse(200, issue) });
+  await assert.rejects(reply(liveIssue('n', { title: 'Someone else' })).create({ title: 'Mine' }),
+    e => e.code === 'UNCONFIRMED_RESULT' && e.outcomeUnknown === true, 'different title');
+  await assert.rejects(reply(liveIssue('n', { title: 'Mine', description: 'other' })).create({ title: 'Mine', description: 'mine' }),
+    e => e.code === 'UNCONFIRMED_RESULT', 'different description');
+  await assert.rejects(reply(liveIssue('n', { title: 'Mine', status: 'done' })).create({ title: 'Mine' }),
+    e => e.code === 'UNCONFIRMED_RESULT', 'a new issue must be open');
+  assert.equal((await reply(liveIssue('n', { title: 'Mine' })).create({ title: '  Mine  ' })).title, 'Mine', 'trimmed title is confirmed');
+  await assert.rejects(reply(liveIssue('n', { status: 'open' })).update('n', { status: 'done' }),
+    e => e.code === 'UNCONFIRMED_RESULT' && e.outcomeUnknown === true, 'same issue, old status');
+  await assert.rejects(reply(liveIssue('n', { title: 'Old' })).update('n', { title: 'New' }), e => e.code === 'UNCONFIRMED_RESULT');
+  assert.equal((await reply(liveIssue('n', { title: 'New' })).update('n', { title: ' New ' })).title, 'New');
+});
+
+test('a status reply that still shows the old status is not announced as moved', async () => {
+  const original = liveIssue('s2', { title: 'Stale move' });
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] })],
+    PATCH: [() => jsonResponse(200, original)],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(6);
+  assert.equal(byRole(root, 'action-error-text').textContent,
+    `Could not confirm whether “Stale move” moved to Done: ${UNCONFIRMED_MESSAGE} Check the board before trying again.`);
+  assert.doesNotMatch(byRole(root, 'announcer').textContent, /Moved/);
+  assert.deepEqual(cardTitles(root, 'open'), ['Stale move']);
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'the board is reloaded to show the real status');
+});
+
+test('a create reply for different content keeps the draft and is not announced', async () => {
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [] })],
+    POST: [() => jsonResponse(201, liveIssue('x1', { title: 'Somebody else’s issue' }))],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  byId(root, 'new-title').value = 'My issue';
+  byId(root, 'new-description').value = 'My text';
+  byRole(root, 'create-form').dispatch('submit');
+  await flush(6);
+  assert.equal(byRole(root, 'create-error').textContent,
+    `Could not confirm whether “My issue” was saved: ${UNCONFIRMED_MESSAGE} Your text is kept. Check the board for it before creating it again.`);
+  assert.equal(byId(root, 'new-title').value, 'My issue');
+  assert.equal(byId(root, 'new-description').value, 'My text');
+  assert.doesNotMatch(byRole(root, 'announcer').textContent, /Issue created/);
+});
+
+test('a create reply with the contract-trimmed title counts as saved', async () => {
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [] })],
+    POST: [(url, init) => jsonResponse(201, liveIssue('t1', { title: JSON.parse(init.body).title.trim() }))],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  byId(root, 'new-title').value = '   Padded title   ';
+  byRole(root, 'create-form').dispatch('submit');
+  await flush(6);
+  assert.equal(byRole(root, 'create-error').hidden, true);
+  assert.match(byRole(root, 'announcer').textContent, /Issue created: Padded title/);
+  assert.equal(byId(root, 'new-title').value, '');
+  assert.equal(JSON.parse(calls.find(c => c.method === 'POST').body).title, 'Padded title');
+});
+
+test('an unconfirmed edit re-queries the board in the app, keeps the draft and can be sent again', async () => {
+  const original = liveIssue('e2', { title: 'Before' });
+  const edited = liveIssue('e2', { title: 'After', description: 'Draft description', updatedAt: '2026-09-25T01:00:00.000Z' });
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [original] }),
+      () => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [edited] })],
+    PATCH: [() => jsonResponse(200, liveIssue('e2', { title: 'Something else' })), () => jsonResponse(200, edited)],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  const dialog = byRole(root, 'edit-dialog');
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'After';
+  byId(root, 'edit-description').value = 'Draft description';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  assert.equal(dialog.hasAttribute('open'), true, 'the dialog stays open');
+  assert.equal(byId(root, 'edit-title').value, 'After');
+  assert.equal(byId(root, 'edit-description').value, 'Draft description');
+  assert.equal(byRole(root, 'edit-error').textContent,
+    `Could not confirm whether your changes were saved: ${UNCONFIRMED_MESSAGE} The board was checked again and does not show these changes. Your changes are kept here. Choose Save changes to send them again, or Check again to look once more.`);
+  assert.equal(byRole(root, 'edit-check').hidden, false);
+  assert.equal(doc.activeElement, byRole(root, 'edit-save'));
+  const gets = calls.filter(c => c.method === 'GET').map(c => c.url);
+  assert.equal(gets[1], '/api/issues', 'the check asks for all issues, not a page reload');
+  assert.doesNotMatch(byRole(root, 'announcer').textContent, /Saved/);
+
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches[1], { title: 'After', description: 'Draft description' }, 'the retry sends the kept draft');
+  assert.equal(dialog.hasAttribute('open'), false);
+  assert.match(byRole(root, 'announcer').textContent, /Saved “After”\./);
+});
+
+test('an unconfirmed edit that the board shows as applied is confirmed, even when filters would hide it', async () => {
+  const original = liveIssue('e3', { title: 'Filtered' });
+  const moved = { ...original, status: 'done', updatedAt: '2026-09-25T01:00:00.000Z' };
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [original] }),
+      () => jsonResponse(200, { items: [moved] }), () => jsonResponse(200, { items: [] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const filter = byRole(root, 'status-filter');
+  filter.value = 'open';
+  filter.dispatch('change');
+  await flush();
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-status').value = 'done';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const gets = calls.filter(c => c.method === 'GET').map(c => c.url);
+  assert.equal(gets[2], '/api/issues', 'the check ignores the active filter');
+  assert.equal(gets[3], '/api/issues?status=open', 'then the filtered board is refreshed');
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+  assert.equal(byRole(root, 'announcer').textContent, 'Saved “Filtered”. The board was checked and shows your changes.');
+  assert.equal(calls.filter(c => c.method === 'PATCH').length, 1, 'nothing is sent twice');
+});
+
+test('when the check also fails, the draft stays and Check again tries once more', async () => {
+  const original = liveIssue('e4', { title: 'Offline' });
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => textResponse(502, GATEWAY_HTML), () => textResponse(502, GATEWAY_HTML),
+      () => jsonResponse(200, { items: [original] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'Offline edit';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  assert.equal(byRole(root, 'edit-error').textContent,
+    'Could not confirm whether your changes were saved: The connection to the server failed. The board could not be checked either: The server answered with an unexpected error (502). Your changes are kept here. Choose Check again, or Save changes to send them again.');
+  assert.equal(doc.activeElement, byRole(root, 'edit-check'));
+  assert.equal(byId(root, 'edit-title').value, 'Offline edit');
+
+  byRole(root, 'edit-check').dispatch('click');
+  await flush(8);
+  assert.match(byRole(root, 'edit-error').textContent, /The board was checked again and does not show these changes\. Your changes are kept here\./);
+  assert.equal(byId(root, 'edit-title').value, 'Offline edit');
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
+  assert.equal(calls.filter(c => c.method === 'PATCH').length, 1, 'checking never re-sends the change');
+});
+
+test('edits typed while the check runs are kept even if the earlier save turns out applied', async () => {
+  const original = liveIssue('e5', { title: 'First' });
+  const check = deferred();
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => check.promise, () => jsonResponse(200, { items: [original] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'Second';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  assert.equal(byRole(root, 'edit-cancel').disabled, true, 'the dialog cannot be dismissed while checking');
+  byId(root, 'edit-title').value = 'Third';
+  check.resolve(jsonResponse(200, { items: [{ ...original, title: 'Second' }] }));
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
+  assert.equal(byId(root, 'edit-title').value, 'Third');
+  assert.equal(byRole(root, 'edit-error').textContent,
+    'The board was checked and shows the changes you saved to “Second”. Your newer edits are still here and have not been saved.');
+  assert.equal(byRole(root, 'edit-check').hidden, true);
 });

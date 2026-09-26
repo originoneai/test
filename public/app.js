@@ -13,8 +13,9 @@
 //   update(id, patch) -> Promise<Issue>             (PATCH /api/issues/:id)
 // Failures reject with ApiError { code, message, status, outcomeUnknown }.
 // outcomeUnknown is true when no trustworthy answer came back (the connection
-// failed, or the response could not be read as the contract shape). For a save,
-// that means the server may or may not have applied it.
+// failed, the response could not be read as the contract shape, or a save
+// response did not show the submitted values). For a save, that means the server
+// may or may not have applied it.
 //
 // Rendering never uses innerHTML: every piece of issue text is assigned through
 // textContent, so HTML-like input is shown as text.
@@ -109,6 +110,38 @@ export function isValidIssue(value) {
     && isIsoTime(createdAt) && isIsoTime(updatedAt);
 }
 
+/**
+ * True when a returned issue shows every submitted field. The contract stores
+ * titles trimmed, so a title is compared after trimming; description and status
+ * must match exactly.
+ */
+export function matchesSubmitted(issue, submitted) {
+  if (!isValidIssue(issue) || !submitted || typeof submitted !== 'object') return false;
+  if ('title' in submitted && issue.title !== String(submitted.title).trim()) return false;
+  if ('description' in submitted && issue.description !== submitted.description) return false;
+  if ('status' in submitted && issue.status !== submitted.status) return false;
+  return true;
+}
+
+export const UNCONFIRMED_MESSAGE = 'The server’s reply does not show the values that were submitted.';
+
+/**
+ * Return `issue` only if it confirms this save: the expected id (for an edit)
+ * and every submitted field. Otherwise reject as an unknown outcome, because the
+ * server answered but did not show that it stored what the user sent.
+ */
+export function confirmSaved(issue, submitted, { id, status = 0 } = {}) {
+  if (!isValidIssue(issue) || (id !== undefined && issue.id !== id) || !matchesSubmitted(issue, submitted)) {
+    throw new ApiError('UNCONFIRMED_RESULT', UNCONFIRMED_MESSAGE, status, { outcomeUnknown: true });
+  }
+  return issue;
+}
+
+/** The fields a created issue must show: the submitted text and the defaults. */
+export function expectedCreate(input) {
+  return { title: String(input.title).trim(), description: input.description ?? '', status: 'open' };
+}
+
 // ---------------------------------------------------------------------------
 // Live API adapter (used when DATA_MODE === 'api')
 // ---------------------------------------------------------------------------
@@ -142,10 +175,10 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
     if (!parsed) throw unreadable(res.status);
     return { data, status: res.status };
   }
-  async function issueFrom(method, path, body, check = () => true) {
+  async function issueFrom(method, path, body, { id, expected }) {
     const { data, status } = await request(method, path, body);
-    if (!isValidIssue(data) || !check(data)) throw unreadable(status);
-    return data;
+    if (!isValidIssue(data)) throw unreadable(status);
+    return confirmSaved(data, expected, { id, status });
   }
   return {
     mode: 'api',
@@ -162,9 +195,9 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
       }
       return data.items;
     },
-    create(input) { return issueFrom('POST', '/api/issues', input); },
+    create(input) { return issueFrom('POST', '/api/issues', input, { expected: expectedCreate(input) }); },
     update(id, patch) {
-      return issueFrom('PATCH', '/api/issues/' + encodeURIComponent(id), patch, issue => issue.id === id);
+      return issueFrom('PATCH', '/api/issues/' + encodeURIComponent(id), patch, { id, expected: patch });
     },
   };
 }
@@ -400,16 +433,20 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const editError = h(doc, 'p', { class: 'form-error', role: 'alert', hidden: true, 'data-role': 'edit-error' });
   const editSave = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'edit-save', text: 'Save changes' });
   const editCancel = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-cancel', text: 'Cancel' });
+  // Shown only after a save whose outcome is unknown: asks the API for the
+  // current issue again without leaving the dialog or losing the draft.
+  const editCheck = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-check', text: 'Check again', hidden: true });
   const editForm = h(doc, 'form', { novalidate: true, 'data-role': 'edit-form' },
     h(doc, 'h2', { id: 'edit-heading', text: 'Edit issue' }),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-title', text: 'Title' }), editTitle, editTitleError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-description', text: 'Description' }), editDescription, editDescriptionError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-status', text: 'Status' }), editStatus),
     editError,
-    h(doc, 'div', { class: 'form-actions' }, editCancel, editSave),
+    h(doc, 'div', { class: 'form-actions' }, editCancel, editCheck, editSave),
   );
   const dialog = h(doc, 'dialog', { class: 'edit-dialog', 'aria-labelledby': 'edit-heading', 'data-role': 'edit-dialog' }, editForm);
-  const edit = { issue: null, trigger: null, saving: false, open: false };
+  // unconfirmed: { id, submitted, form, reason } after a save with an unknown outcome.
+  const edit = { issue: null, trigger: null, saving: false, open: false, unconfirmed: null };
 
   root.replaceChildren(
     header,
@@ -529,7 +566,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     createForm.setAttribute('aria-busy', 'true');
     showBox(createPending, createPending, `Saving “${value.title}”… You can keep typing your next issue; it will not be cleared.`);
     try {
-      const created = await adapter.create({ title: value.title, description: value.description ?? '' });
+      const input = { title: value.title, description: value.description ?? '' };
+      // Only a reply that shows what was submitted counts as saved.
+      const created = confirmSaved(await adapter.create(input), expectedCreate(input));
       if (draftUnchanged()) {
         newTitle.value = '';
         newDescription.value = '';
@@ -568,7 +607,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     card.setAttribute('aria-busy', 'true');
     showBox(actionErrorBox, actionErrorText, '');
     try {
-      await adapter.update(issue.id, { status: next });
+      confirmSaved(await adapter.update(issue.id, { status: next }), { status: next }, { id: issue.id });
       announce(`Moved “${issue.title}” to ${STATUS_LABELS[next]}.`);
       await load();
       editButtons.get(issue.id)?.focus();
@@ -597,6 +636,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     setFieldError(editTitle, editTitleError, '');
     setFieldError(editDescription, editDescriptionError, '');
     showBox(editError, editError, '');
+    edit.unconfirmed = null;
+    editCheck.hidden = true;
     if (typeof dialog.showModal === 'function') dialog.showModal();
     else dialog.setAttribute('open', '');
     edit.open = true;
@@ -611,6 +652,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     const target = restoreFocusTo || (edit.issue && editButtons.get(edit.issue.id)) || edit.trigger;
     edit.issue = null;
     edit.trigger = null;
+    edit.unconfirmed = null;
+    editCheck.hidden = true;
     target?.focus();
   }
 
@@ -626,14 +669,80 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     if (!edit.saving) closeEdit();
   });
 
+  const readEditForm = () => ({ title: editTitle.value, description: editDescription.value, status: editStatus.value });
+  const sameForm = (a, b) => a.title === b.title && a.description === b.description && a.status === b.status;
+
+  function setEditBusy(busy, label) {
+    edit.saving = busy;
+    editSave.disabled = busy;
+    editCancel.disabled = busy;
+    editCheck.disabled = busy;
+    editSave.textContent = busy && label ? label : 'Save changes';
+    editForm.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+
+  // After a save with an unknown outcome, ask the API for the issue again (all
+  // statuses, no search, so filters cannot hide it) and tell the user what the
+  // server now shows. The dialog and the draft stay as they are unless the
+  // server shows every submitted change and the draft was not edited since.
+  async function checkEdit() {
+    const pending = edit.unconfirmed;
+    if (!pending || edit.saving) return;
+    setEditBusy(true, 'Checking…');
+    showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} Checking the board again…`);
+    let latest = null;
+    let checkError = null;
+    try {
+      const items = await adapter.list({});
+      latest = items.find(item => item.id === pending.id) ?? null;
+    } catch (error) {
+      checkError = error;
+    }
+    // Refresh the board behind the dialog too, so it matches what was checked.
+    await load();
+    setEditBusy(false);
+    if (edit.unconfirmed !== pending || !edit.open) return;
+    const kept = 'Your changes are kept here.';
+    if (checkError) {
+      showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board could not be checked either: ${describe(checkError)} ${kept} Choose Check again, or Save changes to send them again.`);
+      editCheck.focus();
+      return;
+    }
+    if (!latest) {
+      showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board was checked again, but this issue was not found. ${kept} Choose Check again, or Cancel to close.`);
+      editCheck.focus();
+      return;
+    }
+    // Later saves are compared against what the server shows now.
+    edit.issue = latest;
+    if (matchesSubmitted(latest, pending.submitted)) {
+      edit.unconfirmed = null;
+      editCheck.hidden = true;
+      if (sameForm(readEditForm(), pending.form)) {
+        showBox(editError, editError, '');
+        announce(`Saved “${latest.title}”. The board was checked and shows your changes.`);
+        closeEdit();
+      } else {
+        showBox(editError, editError, `The board was checked and shows the changes you saved to “${latest.title}”. Your newer edits are still here and have not been saved.`);
+        editSave.focus();
+      }
+      return;
+    }
+    showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board was checked again and does not show these changes. ${kept} Choose Save changes to send them again, or Check again to look once more.`);
+    editSave.focus();
+  }
+
+  editCheck.addEventListener('click', () => checkEdit());
+
   editForm.addEventListener('submit', async event => {
     event.preventDefault();
     if (edit.saving || !edit.issue) return;
     const issue = edit.issue;
+    const form = readEditForm();
     const patch = {};
-    if (editTitle.value.trim() !== issue.title) patch.title = editTitle.value;
-    if (editDescription.value !== (issue.description || '')) patch.description = editDescription.value;
-    if (editStatus.value !== issue.status) patch.status = editStatus.value;
+    if (form.title.trim() !== issue.title) patch.title = form.title;
+    if (form.description !== (issue.description || '')) patch.description = form.description;
+    if (form.status !== issue.status) patch.status = form.status;
     showBox(editError, editError, '');
     if (Object.keys(patch).length === 0) { closeEdit(); return; }
     const { errors, value } = validateIssueInput(patch, { partial: true });
@@ -643,27 +752,25 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       (errors.title ? editTitle : editDescription).focus();
       return;
     }
-    edit.saving = true;
-    editSave.disabled = true;
-    editCancel.disabled = true;
-    editSave.textContent = 'Saving…';
-    editForm.setAttribute('aria-busy', 'true');
+    edit.unconfirmed = null;
+    editCheck.hidden = true;
+    setEditBusy(true, 'Saving…');
     try {
-      const updated = await adapter.update(issue.id, value);
+      // Only a reply for this issue that shows every submitted field counts as saved.
+      const updated = confirmSaved(await adapter.update(issue.id, value), value, { id: issue.id });
       announce(`Saved “${updated.title}”.`);
-      edit.saving = false;
+      setEditBusy(false);
       await load();
       closeEdit();
     } catch (error) {
-      showBox(editError, editError, error?.outcomeUnknown
-        ? `Could not confirm whether your changes were saved: ${describe(error)} Your changes are kept here. Reload the board to check before saving again.`
-        : `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
-    } finally {
-      edit.saving = false;
-      editSave.disabled = false;
-      editCancel.disabled = false;
-      editSave.textContent = 'Save changes';
-      editForm.setAttribute('aria-busy', 'false');
+      setEditBusy(false);
+      if (error?.outcomeUnknown) {
+        edit.unconfirmed = { id: issue.id, submitted: value, form, reason: describe(error) };
+        editCheck.hidden = false;
+        await checkEdit();
+      } else {
+        showBox(editError, editError, `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
+      }
     }
   });
 
