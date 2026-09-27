@@ -1,26 +1,24 @@
-// Team issue tracker board (TEST-UI).
+// Team issue tracker board (NATIVE-UI).
 //
-// DATA MODE
-// The live issue API is delivered by TEST-API. Until TEST-INTEGRATE switches
-// DATA_MODE to 'api' (and deletes the fixture section below), the board runs on
-// an explicitly marked, in-memory FIXTURE adapter. Fixture data is never mixed
-// with live data and is not a fallback: selectAdapter() returns exactly one
-// adapter for the chosen mode.
+// DATA
+// The board reads and changes issues only through the live issue API served by
+// src/server.js (docs/api.md). There is no demo or fixture data in the page and
+// no offline fallback: if the API cannot be reached, the board says so.
 //
-// Both adapters implement the same interface, taken from specs/issue-tracker.md:
-//   list({ status, q }) -> Promise<Issue[]>        (GET   /api/issues)
+// The adapter interface follows docs/api.md:
+//   list({ status, q }) -> Promise<Issue[]>          (GET   /api/issues)
 //   create({ title, description }) -> Promise<Issue> (POST  /api/issues)
-//   update(id, patch) -> Promise<Issue>             (PATCH /api/issues/:id)
+//   update(id, patch) -> Promise<Issue>              (PATCH /api/issues/:id)
 // Failures reject with ApiError { code, message, status, outcomeUnknown }.
 // outcomeUnknown is true when no trustworthy answer came back (the connection
 // failed, the response could not be read as the contract shape, or a save
 // response did not show the submitted values). For a save, that means the server
-// may or may not have applied it.
+// may or may not have applied it. The board then keeps the user's draft, asks
+// the server for its current values and leaves the next step to the user; it
+// never re-sends a change on its own.
 //
 // Rendering never uses innerHTML: every piece of issue text is assigned through
 // textContent, so HTML-like input is shown as text.
-
-export const DATA_MODE = 'fixture';
 
 export const STATUSES = ['open', 'in_progress', 'done'];
 export const STATUS_LABELS = { open: 'Open', in_progress: 'In progress', done: 'Done' };
@@ -76,21 +74,6 @@ export function validateIssueInput(input, { partial = false } = {}) {
   return { errors, value };
 }
 
-export function sortNewestFirst(issues) {
-  return [...issues].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-}
-
-/** Same filtering semantics as GET /api/issues: status + case-insensitive q. */
-export function filterIssues(issues, { status = '', q = '' } = {}) {
-  const needle = String(q || '').trim().toLowerCase();
-  return sortNewestFirst(issues).filter(issue => {
-    if (status && issue.status !== status) return false;
-    if (!needle) return true;
-    return String(issue.title).toLowerCase().includes(needle)
-      || String(issue.description || '').toLowerCase().includes(needle);
-  });
-}
-
 export function groupByStatus(issues) {
   const groups = Object.fromEntries(STATUSES.map(s => [s, []]));
   for (const issue of issues) if (groups[issue.status]) groups[issue.status].push(issue);
@@ -143,7 +126,7 @@ export function expectedCreate(input) {
 }
 
 // ---------------------------------------------------------------------------
-// Live API adapter (used when DATA_MODE === 'api')
+// Live API adapter
 // ---------------------------------------------------------------------------
 
 export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(...args), base = '' } = {}) {
@@ -203,106 +186,6 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
 }
 
 // ---------------------------------------------------------------------------
-// FIXTURE adapter — temporary, in-memory, for development before integration.
-// TEST-INTEGRATE removes this section and switches DATA_MODE to 'api'.
-// ---------------------------------------------------------------------------
-
-export const FIXTURE_SCENARIOS = ['default', 'empty', 'slow', 'load-error', 'save-error', 'html'];
-
-export function fixtureIssues(scenario = 'default') {
-  if (scenario === 'empty' || scenario === 'load-error') return [];
-  const base = [
-    { id: 'fixture-0001', title: 'Board columns collapse on narrow screens', description: 'Check the 390 px layout on a phone.', status: 'open', createdAt: '2026-09-20T09:00:00.000Z', updatedAt: '2026-09-20T09:00:00.000Z' },
-    { id: 'fixture-0002', title: 'Search should match descriptions', description: 'Case-insensitive match on title or description.', status: 'in_progress', createdAt: '2026-09-21T10:30:00.000Z', updatedAt: '2026-09-22T08:15:00.000Z' },
-    { id: 'fixture-0003', title: 'Keep failed form input for retry', description: '', status: 'done', createdAt: '2026-09-19T14:45:00.000Z', updatedAt: '2026-09-23T16:20:00.000Z' },
-    { id: 'fixture-0004', title: 'Add keyboard access to the edit dialog', description: 'Escape closes it and focus returns to the card.', status: 'open', createdAt: '2026-09-22T12:00:00.000Z', updatedAt: '2026-09-22T12:00:00.000Z' },
-  ];
-  if (scenario === 'html') {
-    base.unshift({ id: 'fixture-html', title: '<img src=x onerror="alert(1)"> rendered as text', description: '<script>alert("still text")</script>', status: 'open', createdAt: '2026-09-24T00:00:00.000Z', updatedAt: '2026-09-24T00:00:00.000Z' });
-  }
-  return base;
-}
-
-function newId() {
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  return 'fixture-' + Math.random().toString(16).slice(2) + Date.now().toString(16);
-}
-
-export function createFixtureAdapter({
-  issues = fixtureIssues(),
-  latencyMs = 0,
-  failures = {},
-  now = () => new Date(),
-  makeId = newId,
-} = {}) {
-  const store = new Map(issues.map(issue => [issue.id, { ...issue }]));
-  const pendingFailures = { list: 0, create: 0, update: 0, ...failures };
-  const copy = issue => ({ ...issue });
-  const wait = () => new Promise(resolve => setTimeout(resolve, latencyMs));
-  const maybeFail = op => {
-    if (pendingFailures[op] > 0) {
-      pendingFailures[op] -= 1;
-      throw new ApiError('FIXTURE_FAILURE', 'The demo data layer simulated a failed request.', 503);
-    }
-  };
-  return {
-    mode: 'fixture',
-    async list({ status = '', q = '' } = {}) {
-      await wait();
-      maybeFail('list');
-      if (status && !STATUSES.includes(status)) throw new ApiError('VALIDATION_ERROR', 'Invalid status filter.', 400);
-      return filterIssues([...store.values()], { status, q }).map(copy);
-    },
-    async create(input) {
-      await wait();
-      maybeFail('create');
-      const extra = Object.keys(input || {}).filter(k => k !== 'title' && k !== 'description');
-      if (extra.length) throw new ApiError('VALIDATION_ERROR', `Unknown field: ${extra[0]}.`, 400);
-      const { errors, value } = validateIssueInput(input);
-      const first = Object.values(errors)[0];
-      if (first) throw new ApiError('VALIDATION_ERROR', first, 400);
-      const stamp = now().toISOString();
-      const issue = { id: makeId(), title: value.title, description: value.description ?? '', status: 'open', createdAt: stamp, updatedAt: stamp };
-      store.set(issue.id, issue);
-      return copy(issue);
-    },
-    async update(id, patch) {
-      await wait();
-      maybeFail('update');
-      const current = store.get(id);
-      if (!current) throw new ApiError('NOT_FOUND', 'Issue not found.', 404);
-      const { errors, value } = validateIssueInput(patch, { partial: true });
-      const first = Object.values(errors)[0];
-      if (first) throw new ApiError('VALIDATION_ERROR', first, 400);
-      const next = { ...current, ...value, updatedAt: now().toISOString() };
-      store.set(id, next);
-      return copy(next);
-    },
-  };
-}
-
-function fixtureOptionsFor(scenario) {
-  switch (scenario) {
-    case 'empty': return { issues: fixtureIssues('empty'), latencyMs: 250 };
-    case 'slow': return { issues: fixtureIssues('default'), latencyMs: 1500 };
-    case 'load-error': return { issues: fixtureIssues('default'), latencyMs: 250, failures: { list: 1 } };
-    case 'save-error': return { issues: fixtureIssues('default'), latencyMs: 250, failures: { create: 1, update: 1 } };
-    case 'html': return { issues: fixtureIssues('html'), latencyMs: 250 };
-    default: return { issues: fixtureIssues('default'), latencyMs: 250 };
-  }
-}
-
-/** Return exactly one adapter for the mode; fixtures are never a fallback. */
-export function selectAdapter(mode = DATA_MODE, { search = '', fetchImpl } = {}) {
-  if (mode === 'api') return createHttpAdapter(fetchImpl ? { fetchImpl } : {});
-  const requested = new URLSearchParams(search).get('fixture') || 'default';
-  const scenario = FIXTURE_SCENARIOS.includes(requested) ? requested : 'default';
-  const adapter = createFixtureAdapter(fixtureOptionsFor(scenario));
-  adapter.scenario = scenario;
-  return adapter;
-}
-
-// ---------------------------------------------------------------------------
 // User interface
 // ---------------------------------------------------------------------------
 
@@ -354,10 +237,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     h(doc, 'p', { class: 'eyebrow', text: 'Origin One AI · Team trial' }),
     h(doc, 'h1', { text: 'Issue tracker' }),
   );
-  if (adapter.mode === 'fixture') {
-    header.append(h(doc, 'p', { class: 'fixture-banner', role: 'note', 'data-role': 'fixture-banner',
-      text: 'Demo data: this board uses a temporary in-memory fixture until the issue API is integrated. Changes are lost on reload.' }));
-  }
+  header.append(h(doc, 'p', { class: 'data-source', 'data-role': 'data-source',
+    text: 'Live data from this server. Saved changes are kept after a reload or restart and are visible to everyone using this board.' }));
 
   // --- announcements --------------------------------------------------------
   const live = h(doc, 'p', { class: 'sr-only', role: 'status', 'aria-live': 'polite', 'data-role': 'announcer' });
@@ -395,9 +276,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const searchInput = h(doc, 'input', { id: 'search', type: 'search', autocomplete: 'off', placeholder: 'Title or description', 'data-role': 'search' });
   const filterSelect = statusSelect(doc, 'status-filter', { includeAll: true });
   filterSelect.setAttribute('data-role', 'status-filter');
+  // Asks the server for the current list, for example to see a teammate's changes.
+  const refreshButton = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'refresh', text: 'Refresh' });
   const toolbar = h(doc, 'section', { class: 'panel toolbar', role: 'search', 'aria-label': 'Filter issues' },
     h(doc, 'div', { class: 'field grow' }, h(doc, 'label', { for: 'search', text: 'Search issues' }), searchInput),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'status-filter', text: 'Status' }), filterSelect),
+    h(doc, 'div', { class: 'field toolbar-action' }, refreshButton),
   );
 
   // --- board ------------------------------------------------------------------
@@ -436,6 +320,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // Shown only after a save whose outcome is unknown: asks the API for the
   // current issue again without leaving the dialog or losing the draft.
   const editCheck = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-check', text: 'Check again', hidden: true });
+  // After an unconfirmed save: what the server shows now, next to the draft.
+  const editCompare = h(doc, 'p', { class: 'form-compare', 'data-role': 'edit-compare', hidden: true });
+  const editAdopt = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-adopt', text: 'Use server values', hidden: true });
   // Progress and follow-up notice for an edit save. The fields stay editable
   // while a save is in flight; anything typed meanwhile is kept, never closed away.
   const editNotice = h(doc, 'p', { class: 'form-pending', role: 'status', 'aria-live': 'polite', 'data-role': 'edit-notice', hidden: true });
@@ -446,11 +333,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-status', text: 'Status' }), editStatus),
     editNotice,
     editError,
-    h(doc, 'div', { class: 'form-actions' }, editCancel, editCheck, editSave),
+    editCompare,
+    h(doc, 'div', { class: 'form-actions' }, editCancel, editCheck, editAdopt, editSave),
   );
   const dialog = h(doc, 'dialog', { class: 'edit-dialog', 'aria-labelledby': 'edit-heading', 'data-role': 'edit-dialog' }, editForm);
   // unconfirmed: { id, submitted, form, reason } after a save with an unknown outcome.
-  const edit = { issue: null, trigger: null, saving: false, open: false, unconfirmed: null };
+  const edit = { issue: null, trigger: null, saving: false, open: false, unconfirmed: null, serverIssue: null };
 
   root.replaceChildren(
     header,
@@ -527,6 +415,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     else if (state.issues.length === 0) boardStatus.textContent = filtersActive() ? 'No issues match your search.' : 'No issues yet. Create the first one.';
     else boardStatus.textContent = `${state.issues.length} ${state.issues.length === 1 ? 'issue' : 'issues'} shown.`;
     boardStatus.classList.toggle('is-loading', state.loading);
+    refreshButton.disabled = state.loading;
+    refreshButton.textContent = state.loading ? 'Refreshing…' : 'Refresh';
   }
 
   async function load() {
@@ -544,6 +434,20 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     }
     state.loading = false;
     render();
+  }
+
+  // Issues on the server with exactly this (trimmed) title and description.
+  async function findMatchingIssues(input) {
+    try {
+      const items = await adapter.list({ q: input.title });
+      return { matches: items.filter(item => item.title === input.title && item.description === input.description) };
+    } catch (error) {
+      return { matches: [], error };
+    }
+  }
+  const quoteText = text => (text ? `“${text}”` : '(empty)');
+  function issueSummary(issue) {
+    return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}, description ${quoteText(issue.description)}`;
   }
 
   // --- create ---------------------------------------------------------------------
@@ -584,9 +488,18 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     } catch (error) {
       const unchanged = draftUnchanged();
       if (error?.outcomeUnknown) {
-        // The request may have reached the server; never say it was not saved.
+        // The request may have reached the server; never say it was not saved,
+        // and never create it again automatically (docs/api.md: a blind re-post
+        // can duplicate). Look for a matching issue and let the user decide.
         const kept = unchanged ? 'Your text is kept.' : 'Your newer draft was left unchanged.';
-        showBox(createError, createError, `Could not confirm whether “${value.title}” was saved: ${describe(error)} ${kept} Check the board for it before creating it again.`);
+        const input = { title: value.title, description: value.description ?? '' };
+        showBox(createPending, createPending, `Checking the server for “${value.title}”…`);
+        const found = await findMatchingIssues(input);
+        let check;
+        if (found.error) check = `The server could not be checked for it either: ${describe(found.error)} Look for it on the board before creating it again.`;
+        else if (found.matches.length > 0) check = `The server now has ${found.matches.length === 1 ? 'an issue' : `${found.matches.length} issues`} with this title and description, so it was probably saved. Creating it again would add a duplicate.`;
+        else check = 'The server has no issue with this title and description right now. You can create it again.';
+        showBox(createError, createError, `Could not confirm whether “${value.title}” was saved: ${describe(error)} ${check} ${kept}`);
         await load();
       } else {
         const kept = unchanged
@@ -620,9 +533,21 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       select.disabled = false;
       card.setAttribute('aria-busy', 'false');
       if (error?.outcomeUnknown) {
-        showBox(actionErrorBox, actionErrorText, `Could not confirm whether “${issue.title}” moved to ${STATUS_LABELS[next]}: ${describe(error)} Check the board before trying again.`);
+        // Ask the server what it shows now (all statuses, so filters cannot hide it).
+        let now = null;
+        let checkError = null;
+        try { now = (await adapter.list({})).find(item => item.id === issue.id) ?? null; } catch (e) { checkError = e; }
+        let seen;
+        if (checkError) seen = `The server could not be checked either: ${describe(checkError)} Check the board before trying again.`;
+        else if (!now) seen = 'The server no longer shows this issue.';
+        else if (now.status === next) seen = `The server now shows it in ${STATUS_LABELS[next]}, so nothing more needs sending.`;
+        else seen = `The server now shows it in ${STATUS_LABELS[now.status]}. Choose ${STATUS_LABELS[next]} again if you still want to move it.`;
+        showBox(actionErrorBox, actionErrorText, `Could not confirm whether “${issue.title}” moved to ${STATUS_LABELS[next]}: ${describe(error)} ${seen}`);
         await load();
         (editButtons.get(issue.id) ?? select).focus();
+      } else if (error?.code === 'NOT_FOUND') {
+        showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: the server no longer has this issue. The board was refreshed.`);
+        await load();
       } else {
         showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: ${describe(error)}`);
         select.focus();
@@ -643,6 +568,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     showBox(editNotice, editNotice, '');
     edit.unconfirmed = null;
     editCheck.hidden = true;
+    hideCompare();
     if (typeof dialog.showModal === 'function') dialog.showModal();
     else dialog.setAttribute('open', '');
     edit.open = true;
@@ -659,6 +585,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     edit.trigger = null;
     edit.unconfirmed = null;
     editCheck.hidden = true;
+    hideCompare();
     showBox(editNotice, editNotice, '');
     target?.focus();
   }
@@ -675,6 +602,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     if (!edit.saving) closeEdit();
   });
 
+  function hideCompare() {
+    showBox(editCompare, editCompare, '');
+    editAdopt.hidden = true;
+    edit.serverIssue = null;
+  }
   const readEditForm = () => ({ title: editTitle.value, description: editDescription.value, status: editStatus.value });
   const sameForm = (a, b) => a.title === b.title && a.description === b.description && a.status === b.status;
   // The fields of `form` that differ from the saved `issue` (title compared trimmed, per contract).
@@ -692,6 +624,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editSave.disabled = busy;
     editCancel.disabled = busy;
     editCheck.disabled = busy;
+    editAdopt.disabled = busy;
     editSave.textContent = busy && label ? label : 'Save changes';
     editForm.setAttribute('aria-busy', busy ? 'true' : 'false');
   }
@@ -718,6 +651,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     setEditBusy(false);
     if (edit.unconfirmed !== pending || !edit.open) return;
     const kept = 'Your changes are kept here.';
+    hideCompare();
     if (checkError) {
       showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board could not be checked either: ${describe(checkError)} ${kept} Choose Check again, or Save changes to send them again.`);
       editCheck.focus();
@@ -735,7 +669,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       editCheck.hidden = true;
       if (sameForm(readEditForm(), pending.form)) {
         showBox(editError, editError, '');
-        announce(`Saved “${latest.title}”. The board was checked and shows your changes.`);
+        announce(`The server now shows your changes to “${latest.title}”, so nothing more needs sending.`);
         closeEdit();
       } else {
         showBox(editError, editError, `The board was checked and shows the changes you saved to “${latest.title}”. Your newer edits are still here and have not been saved.`);
@@ -743,11 +677,36 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       }
       return;
     }
-    showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board was checked again and does not show these changes. ${kept} Choose Save changes to send them again, or Check again to look once more.`);
+    // The server shows something else. Say whether it still has the values from
+    // before this save, or different ones (possibly a teammate's change).
+    const base = pending.base;
+    const unchangedOnServer = latest.title === base.title && (latest.description || '') === (base.description || '') && latest.status === base.status;
+    const seen = unchangedOnServer
+      ? 'The server still shows the values from before this save, so the save may not have been applied.'
+      : 'The server now shows different values, which may include a teammate’s change.';
+    showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} ${seen} ${kept} Choose Save changes to send your version again (it replaces what the server shows), Use server values to drop your draft, or Check again.`);
+    edit.serverIssue = latest;
+    showBox(editCompare, editCompare, `Server now shows: ${issueSummary(latest)}.`);
+    editAdopt.hidden = false;
     editSave.focus();
   }
 
   editCheck.addEventListener('click', () => checkEdit());
+  // Replace the draft with what the server showed at the last check.
+  editAdopt.addEventListener('click', () => {
+    const latest = edit.serverIssue;
+    if (!latest || edit.saving) return;
+    edit.issue = latest;
+    edit.unconfirmed = null;
+    editTitle.value = latest.title;
+    editDescription.value = latest.description || '';
+    editStatus.value = latest.status;
+    editCheck.hidden = true;
+    hideCompare();
+    showBox(editError, editError, '');
+    showBox(editNotice, editNotice, 'The form now shows the server’s values. Your draft was dropped.');
+    editTitle.focus();
+  });
 
   editForm.addEventListener('submit', async event => {
     event.preventDefault();
@@ -767,6 +726,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     }
     edit.unconfirmed = null;
     editCheck.hidden = true;
+    hideCompare();
     setEditBusy(true, 'Saving…');
     showBox(editNotice, editNotice, 'Saving your changes… You can keep editing; anything you change now stays here.');
     let updated;
@@ -777,9 +737,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       setEditBusy(false);
       showBox(editNotice, editNotice, '');
       if (error?.outcomeUnknown) {
-        edit.unconfirmed = { id: issue.id, submitted: value, form, reason: describe(error) };
+        edit.unconfirmed = { id: issue.id, submitted: value, form, base: issue, reason: describe(error) };
         editCheck.hidden = false;
         await checkEdit();
+      } else if (error?.code === 'NOT_FOUND') {
+        showBox(editError, editError, `Could not save: the server no longer has this issue. Your changes are kept here so you can copy them. The board was refreshed.`);
+        await load();
       } else {
         showBox(editError, editError, `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
       }
@@ -816,6 +779,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     load();
   });
   retryButton.addEventListener('click', () => load());
+  refreshButton.addEventListener('click', async () => {
+    await load();
+    if (!state.loadError) announce(`Board refreshed. ${boardStatus.textContent}`);
+  });
   dismissButton.addEventListener('click', () => showBox(actionErrorBox, actionErrorText, ''));
 
   const ready = load();
@@ -829,7 +796,6 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
 if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   const root = document.getElementById('app');
   if (root) {
-    const adapter = selectAdapter(DATA_MODE, { search: window.location.search });
-    mountApp(root, { adapter, doc: document });
+    mountApp(root, { adapter: createHttpAdapter(), doc: document });
   }
 }

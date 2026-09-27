@@ -50,11 +50,12 @@ body {
 .app-header { padding: 8px 4px 16px; }
 .eyebrow { margin: 0; color: var(--blue-700); font-size: 0.875rem; font-weight: 600; letter-spacing: 0.02em; }
 .app-header h1 { margin: 2px 0 8px; color: var(--blue-900); font-size: 1.75rem; line-height: 1.2; }
-.fixture-banner {
-  margin: 0; padding: 8px 12px;
-  border: 1px dashed var(--blue-500); border-radius: 8px;
-  background: var(--white); color: var(--blue-900); font-size: 0.9rem;
+.data-source { margin: 0; color: var(--blue-900); font-size: 0.875rem; }
+.form-compare {
+  margin: 0 0 12px; padding: 8px 10px; border-left: 3px solid var(--blue-500);
+  background: var(--blue-100); color: var(--blue-900); font-size: 0.875rem; overflow-wrap: anywhere;
 }
+.form-compare[hidden] { display: none; }
 
 /* Layout */
 .layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
@@ -169,7 +170,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 /* Tablet and up */
 @media (min-width: 720px) {
   .app { padding: 24px; }
-  .toolbar { grid-template-columns: minmax(0, 1fr) 220px; align-items: end; }
+  .toolbar { grid-template-columns: minmax(0, 1fr) 220px auto; align-items: end; }
 }
 
 /* Desktop */
