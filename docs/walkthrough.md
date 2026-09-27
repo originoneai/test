@@ -4,13 +4,16 @@ Everything a new contributor needs to go from a clean checkout to everyday
 use, including backup, reset and recovery. Verification limits:
 
 - **Server behavior** (API contract, persistence, restart, data lifecycle)
-  is covered by automated HTTP tests, including the documented backup and
-  restore shell blocks, which `test/integration.test.js` executes verbatim.
+  is covered by automated HTTP tests; the documented backup, restore and
+  reset shell blocks are additionally executed verbatim by a targeted
+  regression in `test/integration.test.js`.
 - **Board behavior** is covered by automated fake-DOM tests, some driving
   the real server through the board's own HTTP adapter.
-- **Browser checks** have exercised the board and the lifecycle steps for
-  real, but they were Agent-operated and do not establish
-  independent-human acceptance.
+- **Browser and terminal checks** are separate from both: board interactions
+  (create, edit, search, filter) were exercised in real browser sessions,
+  while the lifecycle steps (stop, restart, backup, reset, restore) were
+  terminal commands with the page observed before and after. All were
+  Agent-operated and do not establish independent-human acceptance.
 
 ## 1. Clean setup
 
@@ -24,6 +27,14 @@ npm test
 
 `npm test` runs five suites: API, storage, scaffold, UI, integration. A clean
 checkout must pass all of them before you change anything.
+
+**Shell requirements.** The shell snippets in this document assume a POSIX
+shell (`sh`/`bash`) with the common utilities `cp`, `mv`, `mktemp`, `rm`,
+`rmdir`, `wc`, `ls` and `mkdir` (`mktemp` is a common utility, not a POSIX
+standard one). The snippets have not been verified on native Windows
+(CMD/PowerShell) or Git Bash. `npm test` runs on Node and covers the same
+behavior semantically on the platforms it is run on; the literal snippets are
+executed by the test suite only where a POSIX shell is available.
 
 ## 2. Start the tracker
 
@@ -86,9 +97,10 @@ Four behaviors worth knowing before they surprise you:
   the board (section 6's reset is the deliberate exception).
 - Changing the status select on a card **saves immediately**. If the server
   explicitly refuses the change, the card returns to its previous status and
-  the board says why. If the outcome is instead unknown, the board looks the
-  issue up and may end up showing the new status — correctly — because the
-  server did apply it.
+  the board says why. If the outcome is instead unknown, the board asks the
+  server what it currently has and shows those observed values — which may
+  match the status you picked, or not; the board reports what is, without
+  claiming which write produced it.
 
 **When a save goes wrong, two different things can happen** — the board's
 message tells you which:
@@ -197,21 +209,49 @@ the previous or the new complete snapshot, never a torn file — but the copy
 may be one accepted write behind. With a custom `DATA_DIR`, substitute your
 own data path; keep backups under the ignored `.local/` tree either way.
 
+A successful copy and a non-empty file do not validate JSON or storage
+schema. Restore only a backup known to have served valid data. The
+`replaced-*` files preserve the previous state for investigation; they may
+be corrupt or empty and are not known-good restore sources.
+
 ## 6. Reset to empty
 
 ```sh
-# stop the server (Ctrl-C), then archive the data directory under a unique,
-# ignored destination; the fresh start runs only after the move succeeded:
-mkdir -p .local/issue-backups \
-  && ARCHIVE="$(mktemp -d .local/issue-backups/data-old-XXXXXX)" \
-  && mv .data "$ARCHIVE/data" \
-  && echo "data archived at: $ARCHIVE/data" \
-  && npm start
-# → {"items":[]}: a fresh tracker; .data/ is recreated on first write
+# stop the server (Ctrl-C), then run:
+(
+  if [ ! -d .data ]; then
+    echo "Nothing to reset: .data does not exist (already fresh)."
+  else
+    ARCHIVE=""
+    if mkdir -p .local/issue-backups \
+       && ARCHIVE="$(mktemp -d .local/issue-backups/data-old-XXXXXX)" \
+       && mv .data "$ARCHIVE/data"; then
+      echo "data archived at: $ARCHIVE/data"
+    else
+      [ -n "$ARCHIVE" ] && rmdir "$ARCHIVE" 2>/dev/null
+      echo "Reset failed: .data was left in place — nothing was archived." >&2
+      exit 1
+    fi
+  fi
+  npm start
+)
 ```
 
-Deleting `.data/` outright also works; the archive keeps a recoverable copy
-under the ignored backup tree.
+After the start, from the **second** terminal (leave `npm start` running in
+the first):
+
+```sh
+curl -sS http://127.0.0.1:3000/api/issues
+# {"items":[]}
+```
+
+A fresh tracker: `.data/` itself is created when the server first reads it;
+`issues.json` appears only after the first accepted write. An absent `.data`
+is handled explicitly by the block above (nothing to reset, fresh start
+anyway), and a failed move leaves `.data` exactly where it was, removes the
+empty archive directory it had created (`rmdir` only touches an empty dir)
+and exits nonzero. Deleting `.data/` outright also works; the archive keeps
+a recoverable copy under the ignored backup tree.
 
 ## 7. Recovery: corrupt or damaged store
 
@@ -240,6 +280,20 @@ start the server only on success:
     echo "Refusing: '$SRC' is empty or missing; pick a non-empty backup." >&2
     exit 1
   fi
+  if [ ! -f .data/issues.json ]; then
+    echo "No existing store to archive."
+  else
+    REPLACED=""
+    if mkdir -p .local/issue-backups \
+       && REPLACED="$(mktemp .local/issue-backups/replaced-XXXXXX)" \
+       && cp .data/issues.json "$REPLACED"; then
+      echo "Replaced-store archive: $REPLACED ($(wc -c < "$REPLACED") bytes)"
+    else
+      [ -n "$REPLACED" ] && rm -f "$REPLACED"
+      echo "Archiving the current store failed; refusing to replace it." >&2
+      exit 1
+    fi
+  fi
   RESTORE_TMP=""
   if mkdir -p .data \
      && RESTORE_TMP="$(mktemp .data/restore-XXXXXX)" \
@@ -255,10 +309,15 @@ start the server only on success:
 )
 ```
 
-The block runs in a subshell so a refusal or a failed copy/move returns a
-**nonzero shell status** (scripts can rely on it) without closing an
-interactive shell. `RESTORE_TMP` starts empty, so the cleanup branch can only
-remove the temp file this attempt created — never a real file. A reset
+The block runs in a subshell so every failure path (missing/empty source,
+failed archival, failed copy/move) returns a **nonzero shell status** without
+closing an interactive shell. Before the store is replaced, its current bytes
+are preserved in a unique `replaced-*` archive — the exact bytes being
+replaced, whatever they are (a normal store, a corrupt one, or even an empty
+file), so you can always see and recover what was there — and if that
+archival cannot be completed, the restore **fails closed**: nothing is
+replaced, nothing is started. `REPLACED` and `RESTORE_TMP` each start empty,
+so cleanup can only remove the temp file its own attempt created. A reset
 archive from section 6 holds the whole data directory; restore from it the
 same way with
 `SRC=".local/issue-backups/data-old-XXXXXX/data/issues.json"`.

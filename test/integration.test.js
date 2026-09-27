@@ -1,11 +1,12 @@
 // Integration regression for the contributor walkthrough (docs/walkthrough.md).
-// Unlike the in-process suites, these tests run the REAL server as a child
-// process (node src/server.js) from clean, isolated data directories and
-// mirror the documented journey exactly: clean setup → start → everyday use →
-// restart persistence → backup → corrupt-store refusal → restore → reset.
-// The unit suites (api/storage/ui) cover field-level behavior; this file
-// covers the lifecycle a contributor actually performs. Each test owns one
-// unique temp root and removes only that root.
+// Two kinds of coverage live here: HTTP-level tests exercise the documented
+// journeys and data lifecycle SEMANTICALLY (same operations and outcomes,
+// not literal shell), while the documented backup/restore/reset shell blocks
+// are extracted from the walkthrough and executed VERBATIM (npm start is
+// stubbed through PATH so the blocks run unmodified). The unit suites
+// (api/storage/ui) cover field-level behavior; this file covers the
+// lifecycle a contributor actually performs. Each test owns one unique temp
+// root and removes only that root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -402,8 +403,9 @@ test('documented restore block: verified source, atomic replace, start only on s
     }
   }
 
-  // Success: the documented source name is byte-copied into place and only
-  // then is npm started; no temp file is left behind.
+  // Success: the documented source name is byte-copied into place, the store
+  // it replaces is preserved in a unique replaced-* archive, and only then
+  // is npm started; no temp file is left behind.
   await withRestoreRoot(async (root, runBlock, store, dataFiles, started) => {
     await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
     await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
@@ -413,12 +415,15 @@ test('documented restore block: verified source, atomic replace, start only on s
     assert.equal(done.status, 0);
     assert.equal(await store(), backupBytes, 'store now equals the backup byte-for-byte');
     assert.match(done.stdout, /Restored from:/);
+    const [archive] = (await readdir(join(root, '.local', 'issue-backups'))).filter((n) => n.startsWith('replaced-'));
+    assert.ok(archive, 'a replaced-* archive was created');
+    assert.equal(await readFile(join(root, '.local', 'issue-backups', archive), 'utf8'), otherBytes, 'archive holds the exact bytes that were replaced');
     assert.match(await started(), /start/, 'npm start ran exactly on success');
     assert.deepEqual(await dataFiles(), ['issues.json'], 'no restore temp file remains');
   });
 
   // Refusal: an empty source is rejected with a nonzero status, the store is
-  // untouched, no start.
+  // untouched, no archive, no start.
   await withRestoreRoot(async (root, runBlock, store, _files, started) => {
     await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
     await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), '', 'utf8');
@@ -428,23 +433,157 @@ test('documented restore block: verified source, atomic replace, start only on s
     assert.notEqual(refused.status, 0, 'refusal returns a nonzero shell status');
     assert.match(refused.stderr, /Refusing: .*empty or missing/);
     assert.equal(await store(), otherBytes, 'refusal leaves the store untouched');
+    assert.deepEqual((await issueBackups(root)).filter((n) => n.startsWith('replaced-')), [], 'no replaced-* archive on refusal');
     assert.equal(await started(), null, 'no start after refusal');
   });
 
-  // Failed copy (shimmed partial write): nonzero status, the existing store
-  // is preserved byte-for-byte (never truncated), the temp file is cleaned,
-  // npm never starts.
-  await withRestoreRoot(async (root, runBlock, store, dataFiles, started, baseEnv) => {
+  // Fail-closed archival (first cp fails via shim): the store is never
+  // replaced, no replaced-* debris, no start, nonzero status.
+  await withRestoreRoot(async (root, runBlock, store, _dataFiles, started, baseEnv) => {
     await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
     await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
     await makeFailingCpShim(join(root, 'cpshim'));
     await mkdir(join(root, '.data'));
     await writeFile(join(root, '.data', 'issues.json'), otherBytes, 'utf8');
     const failed = runBlock({ ...baseEnv, PATH: join(root, 'cpshim') + ':' + baseEnv.PATH });
-    assert.notEqual(failed.status, 0, 'a failed restore returns a nonzero shell status');
-    assert.match(failed.stderr, /Restore failed; the existing store was left untouched/);
-    assert.equal(await store(), otherBytes, 'a failed restore never truncates the live store');
-    assert.deepEqual(await dataFiles(), ['issues.json'], 'failed attempt leaves no temp file');
+    assert.notEqual(failed.status, 0, 'failed archival exits nonzero');
+    assert.match(failed.stderr, /Archiving the current store failed; refusing to replace it/);
+    assert.equal(await store(), otherBytes, 'fail-closed: the store was not replaced');
+    assert.deepEqual((await issueBackups(root)).filter((n) => n.startsWith('replaced-')), [], 'no half-made replaced-* archive remains');
+    assert.equal(await started(), null, 'no start after failed archival');
+  });
+
+  // Corrupt CURRENT store replaced by a known-good backup: the corrupt
+  // bytes survive byte-for-byte inside the replaced-* archive.
+  await withRestoreRoot(async (root, runBlock, store, _dataFiles, started) => {
+    const corrupt = '{"issues": [{"id": "x"';
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), corrupt, 'utf8');
+    const done = runBlock();
+    assert.equal(done.status, 0);
+    assert.equal(await store(), backupBytes, 'store now equals the good backup');
+    const [archive] = (await issueBackups(root)).filter((n) => n.startsWith('replaced-'));
+    assert.ok(archive, 'replaced-* archive exists');
+    assert.equal(await readFile(join(root, '.local', 'issue-backups', archive), 'utf8'), corrupt, 'the exact corrupt bytes that were replaced are archived');
+    assert.match(await started(), /start/);
+  });
+
+  // Empty CURRENT store replaced by a known-good backup: exactly one
+  // replaced-* archive exists, holding the zero bytes that were replaced.
+  await withRestoreRoot(async (root, runBlock, store, _dataFiles, started) => {
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), '', 'utf8');
+    const done = runBlock();
+    assert.equal(done.status, 0);
+    assert.equal(await store(), backupBytes, 'store now equals the good backup');
+    const replaced = (await issueBackups(root)).filter((n) => n.startsWith('replaced-'));
+    assert.equal(replaced.length, 1, 'exactly one replaced-* archive');
+    assert.equal(await readFile(join(root, '.local', 'issue-backups', replaced[0], ), 'utf8'), '', 'the archived bytes are the zero bytes that were replaced');
+    assert.match(await started(), /start/);
+  });
+
+  // Selective second-cp failure (archival succeeds, the restore copy fails):
+  // original store AND its archive survive, temp cleaned, nonzero, no start.
+  await withRestoreRoot(async (root, runBlock, store, dataFiles, started, baseEnv) => {
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
+    const cpShim = join(root, 'cp2shim');
+    await mkdir(cpShim);
+    await writeFile(join(cpShim, 'cp'), '#!/bin/sh\nn=$(cat "$SHIM_COUNT" 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > "$SHIM_COUNT"\nif [ "$n" -ge 2 ]; then printf abc > "$2"; exit 1; fi\nexec /bin/cp "$@"\n', { mode: 0o755 });
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), otherBytes, 'utf8');
+    const failed = runBlock({ ...baseEnv, PATH: cpShim + ':' + baseEnv.PATH, SHIM_COUNT: join(root, 'cp-count') });
+    assert.notEqual(failed.status, 0, 'restore-copy failure exits nonzero');
+    assert.equal(await store(), otherBytes, 'original store untouched');
+    const [archive] = (await issueBackups(root)).filter((n) => n.startsWith('replaced-'));
+    assert.ok(archive, 'successful archival is preserved');
+    assert.equal(await readFile(join(root, '.local', 'issue-backups', archive), 'utf8'), otherBytes, 'archive holds the original bytes');
+    assert.deepEqual(await dataFiles(), ['issues.json'], 'restore temp cleaned');
+    assert.equal(await started(), null, 'no start after failure');
+  });
+
+  // Final mv failure (archival and restore copy succeed): original store AND
+  // archive preserved, temp cleaned, nonzero, no start.
+  await withRestoreRoot(async (root, runBlock, store, dataFiles, started, baseEnv) => {
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
+    const mvShim = join(root, 'mvshim');
+    await mkdir(mvShim);
+    await writeFile(join(mvShim, 'mv'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), otherBytes, 'utf8');
+    const failed = runBlock({ ...baseEnv, PATH: mvShim + ':' + baseEnv.PATH });
+    assert.notEqual(failed.status, 0, 'mv failure exits nonzero');
+    assert.equal(await store(), otherBytes, 'original store untouched');
+    const [archive] = (await issueBackups(root)).filter((n) => n.startsWith('replaced-'));
+    assert.ok(archive, 'successful archival is preserved');
+    assert.equal(await readFile(join(root, '.local', 'issue-backups', archive), 'utf8'), otherBytes, 'archive holds the original bytes');
+    assert.deepEqual(await dataFiles(), ['issues.json'], 'restore temp cleaned');
+    assert.equal(await started(), null, 'no start after failure');
+  });
+});
+
+test('documented reset block: absent source, clean archive, no debris on failure', async () => {
+  const block = documentedShellBlock('## 6. Reset', '## 7.', 'data-old');
+  const dataBytes = JSON.stringify({ issues: [{ id: '33333333-3333-4333-8333-333333333333', title: 'Before reset', description: '', status: 'open', createdAt: '2026-09-26T00:00:00.000Z', updatedAt: '2026-09-26T00:00:00.000Z' }] }, null, 2) + '\n';
+
+  async function withResetRoot(run) {
+    const root = await mkdtemp(join(tmpdir(), 'doc-reset-'));
+    const shimDir = join(root, 'shim');
+    await mkdir(shimDir);
+    await writeFile(join(shimDir, 'npm'), '#!/bin/sh\necho "start $@" >> "$RECORD_NPM"\n', { mode: 0o755 });
+    const baseEnv = { ...process.env, PATH: shimDir + ':' + (process.env.PATH || ''), RECORD_NPM: join(root, 'npm-start.log') };
+    const runBlock = (env = baseEnv) => spawnSync('sh', ['-c', block], { cwd: root, encoding: 'utf8', env });
+    const store = () => readFile(join(root, '.data', 'issues.json'), 'utf8').catch(() => null);
+    const started = () => readFile(join(root, 'npm-start.log'), 'utf8').catch(() => null);
+    const archives = () => issueBackups(root);
+    try {
+      await run(root, runBlock, store, started, archives, baseEnv);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  // Absent .data: stated explicitly, fresh start still runs, nothing archived.
+  await withResetRoot(async (_root, runBlock, store, started, archives) => {
+    const absent = runBlock();
+    assert.equal(absent.status, 0);
+    assert.match(absent.stdout, /Nothing to reset: \.data does not exist/);
+    assert.equal(await store(), null);
+    assert.deepEqual(await archives(), [], 'no archive created for absent data');
+    assert.match(await started(), /start/, 'fresh start runs anyway');
+  });
+
+  // Success: data moved intact into a unique archive, fresh start runs.
+  await withResetRoot(async (root, runBlock, store, started, archives) => {
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), dataBytes, 'utf8');
+    const done = runBlock();
+    assert.equal(done.status, 0);
+    assert.match(done.stdout, /data archived at:/);
+    assert.equal(await store(), null, 'live .data is gone after the move');
+    const [archive] = await archives();
+    assert.match(archive, /^data-old-/, 'unique archive directory');
+    assert.equal(await readFile(join(root, '.local', 'issue-backups', archive, 'data', 'issues.json'), 'utf8'), dataBytes, 'archived bytes intact');
+    assert.match(await started(), /start/);
+  });
+
+  // Failed move (shimmed mv): nonzero, .data left in place, no empty debris.
+  await withResetRoot(async (root, runBlock, store, started, archives, baseEnv) => {
+    const mvShim = join(root, 'mvshim');
+    await mkdir(mvShim);
+    await writeFile(join(mvShim, 'mv'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), dataBytes, 'utf8');
+    const failed = runBlock({ ...baseEnv, PATH: mvShim + ':' + baseEnv.PATH });
+    assert.notEqual(failed.status, 0, 'failed move exits nonzero');
+    assert.match(failed.stderr, /Reset failed: \.data was left in place/);
+    assert.equal(await store(), dataBytes, '.data untouched after failed move');
+    assert.deepEqual(await archives(), [], 'no empty archive debris remains');
     assert.equal(await started(), null, 'no start after failure');
   });
 });
