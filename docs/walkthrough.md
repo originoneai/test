@@ -1,17 +1,16 @@
 # Issue tracker walkthrough
 
 Everything a new contributor needs to go from a clean checkout to everyday
-use, including backup, reset and recovery. What is verified how, plainly:
+use, including backup, reset and recovery. Verification limits:
 
-- **Automated UI behavior** runs against a fake DOM (`test/ui.test.js`),
-  including some cases that drive the real server through the board's own
-  HTTP adapter.
-- **Process behavior and persistence** are tested over HTTP: the journeys and
-  data lifecycle in this document are mirrored step by step by
-  `test/integration.test.js`, alongside the API and storage suites.
-- **The actual browser walkthrough is separate**: it has been exercised so far
-  only with Agent-operated Chrome (the UI round's automated browser run); no
-  independent human browser verification is claimed in this repository.
+- **Server behavior** (API contract, persistence, restart, data lifecycle)
+  is covered by automated HTTP tests, including the documented backup and
+  restore shell blocks, which `test/integration.test.js` executes verbatim.
+- **Board behavior** is covered by automated fake-DOM tests, some driving
+  the real server through the board's own HTTP adapter.
+- **Browser checks** have exercised the board and the lifecycle steps for
+  real, but they were Agent-operated and do not establish
+  independent-human acceptance.
 
 ## 1. Clean setup
 
@@ -41,7 +40,9 @@ to the network). Two environment variables matter:
 | `PORT` | `3000` | TCP port to listen on |
 | `DATA_DIR` | `.data/` | Directory holding the durable store file `issues.json` |
 
-Sanity check in a second terminal:
+Sanity check in a **second** terminal — leave `npm start` running in the
+first; the comment lines below show what that second terminal's `curl`
+prints, not output of `npm start` itself:
 
 ```sh
 curl -sS http://127.0.0.1:3000/healthz
@@ -50,11 +51,13 @@ curl -sS http://127.0.0.1:3000/api/issues
 # {"items":[]}
 ```
 
-A fresh `DATA_DIR` is created automatically on first use; an empty list is the
-correct starting state. A relative `DATA_DIR` resolves from the directory
-where you start the server: the examples in this document assume the default
-`.data` at the repository root, so substitute your own path when you set a
-custom one.
+On a fresh checkout the data **directory** is created when the server first
+reads it, while the `issues.json` **file** appears only after your first
+accepted write — an empty list with no file on disk yet is the correct
+starting state. A relative `DATA_DIR` resolves from the directory where you
+start the server: the examples in this document assume the default `.data`
+at the repository root, so substitute your own path when you set a custom
+one.
 
 ## 3. Everyday use (board)
 
@@ -81,8 +84,29 @@ Four behaviors worth knowing before they surprise you:
   teammate's change reaches your screen.
 - There is **no delete** for an individual issue; finished issues stay on
   the board (section 6's reset is the deliberate exception).
-- Changing the status select on a card **saves immediately**; if that save
-  fails the card snaps back and the board says what happened.
+- Changing the status select on a card **saves immediately**. If the server
+  explicitly refuses the change, the card returns to its previous status and
+  the board says why. If the outcome is instead unknown, the board looks the
+  issue up and may end up showing the new status — correctly — because the
+  server did apply it.
+
+**When a save goes wrong, two different things can happen** — the board's
+message tells you which:
+
+- The server **refused the change** (a definite error answer: a validation
+  problem, an unknown issue id, or storage being unavailable). Nothing was
+  changed on the server. Your text stays in the form; fix what the message
+  names and save again.
+- The outcome is **unknown** (the connection dropped, or the answer could
+  not be read). The server may or may not have applied the change. The board
+  keeps your draft, asks the server what it currently has, and in the edit
+  dialog offers up to three choices:
+  - **Check again** — read the server once more without resending anything;
+    your draft stays as it is.
+  - **Save changes** — send the edited fields again as a fresh, explicit
+    save, after comparing what the server showed.
+  - **Use server values** — drop the draft and adopt the last checked
+    server values.
 
 The same actions over HTTP look like this (full contract in
 [api.md](api.md)). Put the id from the create response into a shell variable
@@ -133,20 +157,45 @@ order). **Stop the server first** (Ctrl-C), then copy it — this is the only
 moment when the file is guaranteed not to change under you:
 
 ```sh
-mkdir -p .local/issue-backups \
-  && BACKUP="$(mktemp .local/issue-backups/issues-XXXXXX)" \
-  && cp .data/issues.json "$BACKUP" \
-  && echo "backup written: $BACKUP"   # note this path; restore uses it
+if [ ! -s .data/issues.json ]; then
+  echo "Nothing to back up: .data/issues.json is missing or empty (fresh or reset state)."
+else
+  (
+    BACKUP=""
+    if mkdir -p .local/issue-backups \
+       && BACKUP="$(mktemp .local/issue-backups/issues-XXXXXX)" \
+       && cp .data/issues.json "$BACKUP"; then
+      echo "Backup written: $BACKUP ($(wc -c < "$BACKUP") bytes) — note this path for a restore."
+    else
+      [ -n "$BACKUP" ] && rm -f "$BACKUP"
+      echo "Backup failed; no backup file was kept." >&2
+      exit 1
+    fi
+  )
+fi
 ```
 
-`mktemp` creates a unique destination, so a new backup can never collide with
-or overwrite an earlier one — that is why the template ends in `X`s. Backups
-and reset archives live under `.local/issue-backups/`, which normal Git
-staging ignores (the whole `.local/` tree is in `.gitignore`). If you must
-copy while the server runs, the atomic write means you always get either the
-previous or the new complete snapshot, never a torn file — but the copy may
-be one accepted write behind. With a custom `DATA_DIR`, substitute your own
-data path; keep backups under the ignored `.local/` tree either way.
+Three properties of this block matter:
+
+- **No data, no fake backup.** A fresh or just-reset installation has no
+  `issues.json` yet, and a zero-byte one is never valid either; `-s` rejects
+  both, the block says so plainly and creates nothing. A zero-byte `issues-*`
+  file must never appear in the backup directory, because restoring one would
+  produce a corrupt store.
+- **A failed copy leaves nothing behind.** If `cp` fails for any reason, the
+  `mktemp` placeholder created for this attempt is removed and the block
+  exits nonzero. `BACKUP` starts empty inside a subshell, so cleanup can only
+  ever touch this attempt's temp file, never an earlier real backup.
+- **Successful backups are unique and verifiable.** `mktemp` (template
+  ending in `X`s) guarantees a fresh name, and the echo reports the exact
+  path and byte count — a real backup is never 0 bytes.
+
+Backups and reset archives live under `.local/issue-backups/`, which normal
+Git staging ignores (the whole `.local/` tree is in `.gitignore`). If you
+must copy while the server runs, the atomic write means you always get either
+the previous or the new complete snapshot, never a torn file — but the copy
+may be one accepted write behind. With a custom `DATA_DIR`, substitute your
+own data path; keep backups under the ignored `.local/` tree either way.
 
 ## 6. Reset to empty
 
@@ -178,14 +227,41 @@ curl -sS http://127.0.0.1:3000/api/issues
 The HTTP error body is intentionally generic; the corruption detail (file
 path and the first problem found) is printed to the server log on stderr.
 **The server never rewrites the file it refuses.** To recover, stop the
-server (Ctrl-C), pick a known-good copy and restore it — use the actual file
-name you see, quoted:
+server (Ctrl-C) and restore a backup you saw succeed — verify the source is
+non-empty, copy into a fresh temp file first and move it into place only
+after the copy succeeded (so a failed copy cannot truncate your store), and
+start the server only on success:
 
 ```sh
-ls .local/issue-backups
-cp ".local/issue-backups/issues-a1B2c3" .data/issues.json   # the path echoed at backup time (or picked from ls)
-npm start
+(
+  ls -l .local/issue-backups     # choose a NON-EMPTY issues-* file (size > 0)
+  SRC=".local/issue-backups/issues-a1B2c3"   # the path echoed when the backup was made
+  if [ ! -s "$SRC" ]; then
+    echo "Refusing: '$SRC' is empty or missing; pick a non-empty backup." >&2
+    exit 1
+  fi
+  RESTORE_TMP=""
+  if mkdir -p .data \
+     && RESTORE_TMP="$(mktemp .data/restore-XXXXXX)" \
+     && cp "$SRC" "$RESTORE_TMP" \
+     && mv "$RESTORE_TMP" .data/issues.json; then
+    echo "Restored from: $SRC"
+    npm start                  # start only after a successful restore
+  else
+    [ -n "$RESTORE_TMP" ] && rm -f "$RESTORE_TMP"
+    echo "Restore failed; the existing store was left untouched — do not start yet." >&2
+    exit 1
+  fi
+)
 ```
+
+The block runs in a subshell so a refusal or a failed copy/move returns a
+**nonzero shell status** (scripts can rely on it) without closing an
+interactive shell. `RESTORE_TMP` starts empty, so the cleanup branch can only
+remove the temp file this attempt created — never a real file. A reset
+archive from section 6 holds the whole data directory; restore from it the
+same way with
+`SRC=".local/issue-backups/data-old-XXXXXX/data/issues.json"`.
 
 Or, if you would rather start empty, use the reset procedure in section 6.
 
@@ -196,6 +272,8 @@ Or, if you would rather start empty, use the reset procedure in section 6.
 - How to contribute (humans and agents), review gates and evidence rules:
   [CONTRIBUTING.md](../CONTRIBUTING.md).
 - The HTTP journey and data lifecycle of this document, as executable
-  regression: `node --test test/integration.test.js`. Automated UI behavior
-  lives in `test/ui.test.js` (fake DOM, some real-server adapter cases); the
-  browser walkthrough itself is a separate, human-facing activity.
+  semantic regression (`node --test test/integration.test.js`; the backup and
+  restore shell blocks themselves are executed verbatim by a targeted test).
+  Automated UI behavior lives in `test/ui.test.js` (fake DOM, some
+  real-server adapter cases); the browser walkthrough itself is a separate
+  activity, Agent-operated so far and not independent human verification.

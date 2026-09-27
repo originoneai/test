@@ -137,12 +137,12 @@ Recover by refresh-and-compare with the decision left to the user:
    for an already-existing matching issue and let the user decide whether to
    create again; a blind re-post can duplicate.
 
-The board's edit dialog already carries a "Check again" recovery path; this
-document defines what the integrated UI must provide after an unconfirmed
-save: keep the draft open, re-query the server, show the observed values next
-to the draft, and leave the re-send / adopt / drop decision with the user.
-Whether the current UI matches this exactly is for TEST-UI to implement and
-verify against this contract — the server side does not assert it.
+The board's edit dialog carries a "Check again" recovery path, and this is
+what it must do after an unconfirmed save: keep the draft open, re-query the
+server, show the observed values next to the draft, and leave the
+re-send / adopt / drop decision with the user. The shipped board implements
+exactly this; the recovery behavior is covered by the fake-DOM suite and the
+real-server UI tests. Independent human acceptance is not claimed here.
 
 **Concurrent edits.** Writes are serialized in-process; there is no locking or
 versioning. Patches to different fields merge cleanly (last value per field).
@@ -191,6 +191,9 @@ exclusively — there is no fixture mode and no offline fallback:
 - After an unconfirmed save the board keeps the user's draft, re-queries the
   server and leaves the re-send / adopt / drop decision with the user, as the
   failure semantics above require. It never re-sends a change on its own.
+  This flow is implemented in the shipped board and covered by its fake-DOM
+  suite and real-server UI tests; independent human acceptance is not
+  claimed here.
 - A human-facing tour of these flows (including restart, backup and reset)
   lives in [walkthrough.md](walkthrough.md).
 

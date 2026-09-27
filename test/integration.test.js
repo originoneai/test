@@ -8,8 +8,9 @@
 // unique temp root and removes only that root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { cp, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -265,5 +266,185 @@ test('data lifecycle: backup, corrupt store refused untouched, restore, reset', 
     } finally {
       await four.stop();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The documented shell blocks, executed verbatim. The backup (§5) and
+// restore (§7) blocks are extracted from docs/walkthrough.md and run exactly
+// as printed, so the snippets cannot drift from tested behavior. These
+// regressions exist because the review round found the exact defect family
+// they cover: a zero-byte "backup" left behind when there is nothing to back
+// up or the copy fails, and a restore that could truncate the live store.
+// Deterministic copy failures are injected through a PATH shim (partial
+// write, then nonzero exit), so every case runs for any user, root included.
+// ---------------------------------------------------------------------------
+
+function documentedShellBlock(sectionStart, sectionEnd, needle) {
+  const doc = readFileSync(join(repoRoot, 'docs/walkthrough.md'), 'utf8');
+  const section = doc.slice(doc.indexOf(sectionStart), doc.indexOf(sectionEnd));
+  const blocks = [...section.matchAll(/```sh\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const block = blocks.find((candidate) => candidate.includes(needle));
+  assert.ok(block, `documented shell block containing ${needle} found between ${sectionStart} and ${sectionEnd}`);
+  return block;
+}
+
+// A `cp` stand-in that partially writes the destination and then fails, so
+// the documented cleanup paths are exercised deterministically on any UID.
+async function makeFailingCpShim(dir) {
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'cp'), '#!/bin/sh\nprintf abc > "$2"\nexit 1\n', { mode: 0o755 });
+}
+
+const issueBackups = (cwd) =>
+  readdir(join(cwd, '.local', 'issue-backups')).catch(() => []);
+
+test('documented backup block: no fake backup on missing/empty data, unique success, clean failure', async () => {
+  const block = documentedShellBlock('## 5. Backup', '## 6.', 'mktemp');
+  const run = (cwd, env = process.env) => spawnSync('sh', ['-c', block], { cwd, encoding: 'utf8', env });
+  const validStore = JSON.stringify({ issues: [{ id: '11111111-1111-4111-8111-111111111111', title: 'Kept', description: '', status: 'open', createdAt: '2026-09-27T00:00:00.000Z', updatedAt: '2026-09-27T00:00:00.000Z' }] }, null, 2) + '\n';
+
+  // Missing store file (fresh checkout or after a reset): message only, nothing created.
+  const missingRoot = await mkdtemp(join(tmpdir(), 'doc-backup-missing-'));
+  try {
+    const missing = run(missingRoot);
+    assert.equal(missing.status, 0);
+    assert.match(missing.stdout, /Nothing to back up: .*missing or empty/);
+    assert.deepEqual(await issueBackups(missingRoot), [], 'no backup file appears without data');
+  } finally {
+    await rm(missingRoot, { recursive: true, force: true });
+  }
+
+  // Empty store file: equally refused, no zero-byte placeholder.
+  const emptyRoot = await mkdtemp(join(tmpdir(), 'doc-backup-empty-'));
+  try {
+    await mkdir(join(emptyRoot, '.data'));
+    await writeFile(join(emptyRoot, '.data', 'issues.json'), '', 'utf8');
+    const empty = run(emptyRoot);
+    assert.equal(empty.status, 0);
+    assert.match(empty.stdout, /Nothing to back up/);
+    assert.deepEqual(await issueBackups(emptyRoot), [], 'an empty store produces no backup file');
+  } finally {
+    await rm(emptyRoot, { recursive: true, force: true });
+  }
+
+  // Success: exactly one non-empty, byte-identical backup; path reported.
+  const goodRoot = await mkdtemp(join(tmpdir(), 'doc-backup-good-'));
+  try {
+    await mkdir(join(goodRoot, '.data'));
+    await writeFile(join(goodRoot, '.data', 'issues.json'), validStore, 'utf8');
+    const good = run(goodRoot);
+    assert.equal(good.status, 0);
+    assert.match(good.stdout, /Backup written: .*\(\s*\d+ bytes\)/);
+    const [name] = await issueBackups(goodRoot);
+    assert.match(name, /^issues-/, 'unique mktemp name');
+    const backup = await readFile(join(goodRoot, '.local', 'issue-backups', name), 'utf8');
+    assert.equal(backup, validStore, 'backup is byte-identical');
+    assert.notEqual(backup.length, 0);
+  } finally {
+    await rm(goodRoot, { recursive: true, force: true });
+  }
+
+  // Failed copy (shimmed partial write): nonzero status, no placeholder kept.
+  const failRoot = await mkdtemp(join(tmpdir(), 'doc-backup-fail-'));
+  try {
+    await mkdir(join(failRoot, '.data'));
+    await writeFile(join(failRoot, '.data', 'issues.json'), validStore, 'utf8');
+    await makeFailingCpShim(join(failRoot, 'shim'));
+    const failed = run(failRoot, { ...process.env, PATH: join(failRoot, 'shim') + ':' + (process.env.PATH || '') });
+    assert.notEqual(failed.status, 0, 'a failed backup exits nonzero');
+    assert.match(failed.stdout + failed.stderr, /Backup failed; no backup file was kept/);
+    assert.deepEqual(await issueBackups(failRoot), [], 'no half-made backup remains');
+  } finally {
+    await rm(failRoot, { recursive: true, force: true });
+  }
+
+  // Inherited BACKUP variable with mkdir failing before assignment: the
+  // cleanup branch must remove only this attempt's temp file — never the
+  // earlier real backup the inherited variable points at.
+  const staleRoot = await mkdtemp(join(tmpdir(), 'doc-backup-stale-'));
+  try {
+    await mkdir(join(staleRoot, '.data'));
+    await writeFile(join(staleRoot, '.data', 'issues.json'), validStore, 'utf8');
+    const earlierBackup = join(staleRoot, 'earlier-issues-real');
+    await writeFile(earlierBackup, validStore, 'utf8');
+    await writeFile(join(staleRoot, '.local'), 'not a directory', 'utf8'); // makes mkdir -p fail
+    const stale = run(staleRoot, { ...process.env, BACKUP: earlierBackup });
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.stdout + stale.stderr, /Backup failed; no backup file was kept/);
+    assert.equal(await readFile(earlierBackup, 'utf8'), validStore, 'an inherited BACKUP value is never deleted by cleanup');
+  } finally {
+    await rm(staleRoot, { recursive: true, force: true });
+  }
+});
+
+test('documented restore block: verified source, atomic replace, start only on success', async () => {
+  const block = documentedShellBlock('## 7. Recovery', '## Where to go next', 'RESTORE_TMP');
+  const backupBytes = JSON.stringify({ issues: [{ id: '22222222-2222-4222-8222-222222222222', title: 'From backup', description: '', status: 'done', createdAt: '2026-09-26T00:00:00.000Z', updatedAt: '2026-09-26T00:00:00.000Z' }] }, null, 2) + '\n';
+  const otherBytes = JSON.stringify({ issues: [] }, null, 2) + '\n';
+
+  // `npm start` on the success path is neutralized with a PATH shim that
+  // records the invocation, so the block runs verbatim without a server.
+  async function withRestoreRoot(run) {
+    const root = await mkdtemp(join(tmpdir(), 'doc-restore-'));
+    const shimDir = join(root, 'shim');
+    await mkdir(shimDir);
+    await writeFile(join(shimDir, 'npm'), '#!/bin/sh\necho "start $@" >> "$RECORD_NPM"\n', { mode: 0o755 });
+    const baseEnv = { ...process.env, PATH: shimDir + ':' + (process.env.PATH || ''), RECORD_NPM: join(root, 'npm-start.log') };
+    const runBlock = (env = baseEnv) => spawnSync('sh', ['-c', block], { cwd: root, encoding: 'utf8', env });
+    const store = () => readFile(join(root, '.data', 'issues.json'), 'utf8').catch(() => null);
+    const dataFiles = () => readdir(join(root, '.data')).catch(() => []);
+    const started = () => readFile(join(root, 'npm-start.log'), 'utf8').catch(() => null);
+    try {
+      await run(root, runBlock, store, dataFiles, started, baseEnv);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  // Success: the documented source name is byte-copied into place and only
+  // then is npm started; no temp file is left behind.
+  await withRestoreRoot(async (root, runBlock, store, dataFiles, started) => {
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), otherBytes, 'utf8');
+    const done = runBlock();
+    assert.equal(done.status, 0);
+    assert.equal(await store(), backupBytes, 'store now equals the backup byte-for-byte');
+    assert.match(done.stdout, /Restored from:/);
+    assert.match(await started(), /start/, 'npm start ran exactly on success');
+    assert.deepEqual(await dataFiles(), ['issues.json'], 'no restore temp file remains');
+  });
+
+  // Refusal: an empty source is rejected with a nonzero status, the store is
+  // untouched, no start.
+  await withRestoreRoot(async (root, runBlock, store, _files, started) => {
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), '', 'utf8');
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), otherBytes, 'utf8');
+    const refused = runBlock();
+    assert.notEqual(refused.status, 0, 'refusal returns a nonzero shell status');
+    assert.match(refused.stderr, /Refusing: .*empty or missing/);
+    assert.equal(await store(), otherBytes, 'refusal leaves the store untouched');
+    assert.equal(await started(), null, 'no start after refusal');
+  });
+
+  // Failed copy (shimmed partial write): nonzero status, the existing store
+  // is preserved byte-for-byte (never truncated), the temp file is cleaned,
+  // npm never starts.
+  await withRestoreRoot(async (root, runBlock, store, dataFiles, started, baseEnv) => {
+    await mkdir(join(root, '.local', 'issue-backups'), { recursive: true });
+    await writeFile(join(root, '.local', 'issue-backups', 'issues-a1B2c3'), backupBytes, 'utf8');
+    await makeFailingCpShim(join(root, 'cpshim'));
+    await mkdir(join(root, '.data'));
+    await writeFile(join(root, '.data', 'issues.json'), otherBytes, 'utf8');
+    const failed = runBlock({ ...baseEnv, PATH: join(root, 'cpshim') + ':' + baseEnv.PATH });
+    assert.notEqual(failed.status, 0, 'a failed restore returns a nonzero shell status');
+    assert.match(failed.stderr, /Restore failed; the existing store was left untouched/);
+    assert.equal(await store(), otherBytes, 'a failed restore never truncates the live store');
+    assert.deepEqual(await dataFiles(), ['issues.json'], 'failed attempt leaves no temp file');
+    assert.equal(await started(), null, 'no start after failure');
   });
 });

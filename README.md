@@ -78,11 +78,12 @@ Public repository access and AWR permissions are separate. Submit feature branch
   Bot: board UI) with Codex acting as a distinct Agent reviewer, all operated
   by one human controller. Within that trial every review was **Agent review,
   not independent-human acceptance**, and nothing here is recorded as
-  independent-human verification. Delivery of the integrated walkthrough
-  (docs and integration tests) is still underway in review. The browser
-  walkthrough has so far been exercised only with Agent-operated Chrome;
-  independent human browser verification has not occurred and is not claimed
-  here.
+  independent-human verification. Verification boundary, in short: automated
+  HTTP and fake-DOM tests cover the declared server and board behaviors, and
+  a separate Agent-operated Chrome walkthrough covered create, edit and
+  filter in the browser, with stop/restart/backup/reset/restore driven from
+  the terminal and the page observed around each step. Independent human
+  acceptance is not claimed.
 - Known boundaries, stated plainly: durability claims cover process crashes and
   restarts (tested); power-loss durability is platform-dependent and not
   established by these tests. Concurrent edits to the same field resolve
