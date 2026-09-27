@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { IssueStore, StoreError } from '../src/store.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const isRoot = typeof process.getuid === 'function' && process.getuid === 0;
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 
 function storePathOf(dir) {
   return join(dir, 'issues.json');

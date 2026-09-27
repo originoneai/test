@@ -154,9 +154,11 @@ mechanism.
 
 **Corrupt store fails visibly.** If `issues.json` is not exactly the expected
 shape, every API call answers `500 STORAGE_ERROR` and the file is left
-untouched — the server never rewrites a store it cannot trust. Recovery is
-manual: stop the server, back up `DATA_DIR/issues.json`, fix or remove it,
-restart. The error text names the file and the first problem found.
+untouched — the server never rewrites a store it cannot trust. The HTTP error
+body is intentionally generic; the corruption detail — the store path and the
+first problem found — goes to the server logs (stderr), so check there when
+diagnosing. Recovery is manual: stop the server, back up `DATA_DIR/issues.json`,
+fix or remove it, restart.
 
 ## Storage format and durability
 
