@@ -31,13 +31,15 @@ checkout must pass all of them before you change anything.
 **Shell and tooling requirements.** Running the application needs only
 Node.js 20 or newer — no npm dependencies (that statement is about npm
 packages, not about your operating system's tools). The **full `npm test`
-suite**, however, invokes a POSIX `sh` unconditionally, with no automatic
-fallback or skip: running it requires a POSIX shell and the utilities
-`cp`, `mv`, `mktemp`, `rm`, `rmdir`, `wc`, `ls` and `mkdir` (`mktemp` is a
-common utility, not a POSIX standard one). The walkthrough's command
-examples additionally use `curl`. Native Windows (CMD/PowerShell) and Git
-Bash have not been verified for either the shell snippets or the full test
-suite.
+suite**, however, needs a POSIX shell both on `PATH` and as an executable
+`/bin/sh` (its generated helper scripts carry `#!/bin/sh` shebangs), with no
+automatic fallback or skip: running it requires `sh`, `cat`, `cp` (one test
+shim looks it up as `/bin/cp`), `mv`, `mktemp`, `rm`, `rmdir`, `wc`, `ls`
+and `mkdir` (`mktemp` is a common utility, not a POSIX standard one;
+`/bin/cp` and `/bin/sh` are prerequisites of the current test harness, not
+of the application). The walkthrough's command examples additionally use
+`curl`. Native Windows (CMD/PowerShell) and Git Bash have not been verified
+for either the shell snippets or the full test suite.
 
 ## 2. Start the tracker
 

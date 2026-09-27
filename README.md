@@ -13,6 +13,13 @@ A small, dependency-free issue tracker for one team: a durable JSON-backed API, 
 
 Requires Node.js 20 or newer; no third-party dependencies.
 
+> **Note on `npm test`:** running the application needs only Node.js 20+ and
+> zero npm dependencies, but the full test suite additionally requires a
+> POSIX shell (both `sh` on `PATH` and an executable `/bin/sh`) plus common
+> shell utilities — see the
+> [shell and tooling requirements](docs/walkthrough.md#1-clean-setup) in the
+> walkthrough before running it.
+
 ```sh
 git clone https://github.com/originoneai/test.git
 cd test
