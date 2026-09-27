@@ -23,6 +23,9 @@ function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
+    // Board data is cooperative and changes often; a stale cached list after
+    // someone else's mutation would be silently wrong, so never store it.
+    'cache-control': 'no-store',
     'content-length': Buffer.byteLength(body),
   });
   res.end(body);

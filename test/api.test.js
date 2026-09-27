@@ -9,6 +9,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server.js';
 import { resetApiStore } from '../src/api.js';
+// The board's real client code (read-only import: TEST-UI owns public/app.js).
+// Driving the live server through this adapter is the integration regression.
+import { ApiError, createHttpAdapter, matchesSubmitted } from '../public/app.js';
 
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -24,6 +27,7 @@ function bootTracker(dataDir) {
       const base = 'http://127.0.0.1:' + server.address().port;
       const tracker = {
         dataDir,
+        base,
         storePath: join(dataDir, 'issues.json'),
         async request(path, options = {}) {
           const response = await fetch(base + path, options);
@@ -643,6 +647,131 @@ test('parallel creates and updates are serialized without lost writes', async ()
     assert.equal(storedFinal.issues.length, 30);
     const files = await readdir(tracker.dataDir);
     assert.deepEqual(files, ['issues.json'], 'no temp files left behind');
+  });
+});
+
+test('API responses always carry cache-control: no-store', async () => {
+  await withTracker(async (tracker) => {
+    const list = await tracker.list();
+    assert.equal(list.headers.get('cache-control'), 'no-store');
+    const created = await tracker.postIssue('Cache header');
+    assert.equal(created.headers.get('cache-control'), 'no-store');
+    const validationError = await tracker.list('?status=bogus');
+    assert.equal(validationError.headers.get('cache-control'), 'no-store');
+    const notFound = await tracker.patchIssue('00000000-0000-4000-8000-000000000000', { title: 'x' });
+    assert.equal(notFound.headers.get('cache-control'), 'no-store');
+  });
+});
+
+test('the frontend http adapter drives the live server as designed', async () => {
+  await withTracker(async (tracker) => {
+    // This is public/app.js's own adapter, pointed at the real server: the
+    // board's request building, error parsing and save confirmation all run.
+    const adapter = createHttpAdapter({ base: tracker.base });
+    assert.deepEqual(await adapter.list({}), []);
+
+    const created = await adapter.create({ title: '  Adapter issue  ', description: 'from the real client' });
+    assert.equal(created.title, 'Adapter issue', 'adapter expects the trimmed echo');
+    assert.equal(created.status, 'open');
+
+    const updated = await adapter.update(created.id, { status: 'in_progress', description: 'changed' });
+    assert.equal(updated.status, 'in_progress');
+    assert.equal(updated.description, 'changed');
+
+    const filtered = await adapter.list({ status: 'in_progress', q: 'adapter' });
+    assert.deepEqual(filtered.map((issue) => issue.id), [created.id]);
+
+    await assert.rejects(
+      adapter.update(created.id, { status: 'bogus' }),
+      (err) => err instanceof ApiError && err.code === 'VALIDATION_ERROR' && err.status === 400 && err.outcomeUnknown === false,
+      'a contract violation is a definite answer, not an unknown outcome',
+    );
+    await assert.rejects(
+      adapter.update('00000000-0000-4000-8000-000000000000', { title: 'Nope' }),
+      (err) => err instanceof ApiError && err.code === 'NOT_FOUND' && err.status === 404 && err.outcomeUnknown === false,
+    );
+  });
+});
+
+test('the frontend adapter sees accepted changes survive a real restart', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'issue-api-'));
+  try {
+    const first = await bootTracker(dataDir);
+    let before;
+    try {
+      const adapterOne = createHttpAdapter({ base: first.base });
+      const created = await adapterOne.create({ title: 'Persisted via adapter', description: 'restart me' });
+      await adapterOne.update(created.id, { status: 'done' });
+      before = await adapterOne.list({});
+    } finally {
+      await first.stop();
+    }
+
+    const second = await bootTracker(dataDir);
+    try {
+      const adapterTwo = createHttpAdapter({ base: second.base });
+      const after = await adapterTwo.list({});
+      assert.deepEqual(after, before, 'the new server instance serves the durable file');
+      const appended = await adapterTwo.create({ title: 'Post-restart' });
+      assert.equal(appended.title, 'Post-restart');
+      assert.equal((await adapterTwo.list({})).length, before.length + 1);
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('unknown-outcome saves are recovered by refresh-and-compare, never blind retries', async () => {
+  await withTracker(async (tracker) => {
+    const client = () => createHttpAdapter({ base: tracker.base });
+    const current = async (id) => (await client().list({})).find((item) => item.id === id);
+    // The request fully reaches the real server; the reply is dropped, which
+    // is exactly the "outcome unknown" situation after a timeout.
+    const dropAfterSend = (...args) =>
+      globalThis.fetch(...args).then((res) => {
+        if (res.body && typeof res.body.cancel === 'function') res.body.cancel();
+        throw new TypeError('simulated connection drop after the request was sent');
+      });
+    const dropping = () => createHttpAdapter({ base: tracker.base, fetchImpl: dropAfterSend });
+
+    // Interleaving 1: the dropped save did land. Refresh-and-compare sees the
+    // server showing the submitted values — a matching current state, which
+    // means nothing further needs sending (not proof of what caused it).
+    const landed = await client().create({ title: 'Dropped but applied', description: 'v0' });
+    await assert.rejects(
+      dropping().update(landed.id, { description: 'Alice edit' }),
+      (err) => err instanceof ApiError && err.outcomeUnknown === true,
+    );
+    const seenAfterDrop = await current(landed.id);
+    assert.equal(matchesSubmitted(seenAfterDrop, { description: 'Alice edit' }), true);
+    assert.equal(seenAfterDrop.description, 'Alice edit');
+
+    // Interleaving 2: the dropped save races a teammate edit on the same field.
+    // The server then shows a third value; the comparison detects the conflict,
+    // the recovery itself performs no write, and only an explicit user-chosen
+    // save may overwrite (last writer wins).
+    const contested = await client().create({ title: 'Contested field', description: 'v0' });
+    await assert.rejects(
+      dropping().update(contested.id, { description: 'Alice draft' }),
+      (err) => err instanceof ApiError && err.outcomeUnknown === true,
+    );
+    await client().update(contested.id, { description: 'Bob edit' }); // teammate commits after the drop
+
+    const duringRecovery = await current(contested.id);
+    assert.equal(duringRecovery.description, 'Bob edit');
+    assert.equal(matchesSubmitted(duringRecovery, { description: 'Alice draft' }), false, 'the draft did not stick');
+    assert.equal(matchesSubmitted(duringRecovery, { description: 'v0' }), false, 'not the baseline either: conflict, not a safe auto-retry');
+
+    const untouchedByRecovery = await current(contested.id);
+    assert.equal(untouchedByRecovery.description, 'Bob edit', 'refresh-and-compare wrote nothing');
+
+    // The user explicitly decides to send the draft again: a fresh save that
+    // overwrites by last-writer-wins, confirmed by its own reply.
+    const explicit = await client().update(contested.id, { description: 'Alice draft' });
+    assert.equal(explicit.description, 'Alice draft');
+    assert.equal((await current(contested.id)).description, 'Alice draft');
   });
 });
 
