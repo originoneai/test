@@ -1537,6 +1537,161 @@ test('focus: a load that starts after focus moved to Refresh leaves focus on Ref
 });
 
 // ---------------------------------------------------------------------------
+// Review round 2 (NATIVE-UI): a deliberate revert typed after the send is new
+// intent, and only the Refresh that is actually applied announces completion.
+// ---------------------------------------------------------------------------
+test('confirmed save: a title changed back to the original while saving is kept, and only it is sent next', async () => {
+  const original = liveIssue('v1', { title: 'Original title', description: 'Old text' });
+  const reply = { ...original, title: 'New title', description: 'Teammate text', updatedAt: T1 };
+  const patch = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [reply] })],
+    PATCH: [() => patch.promise, (url, init) => jsonResponse(200, { ...reply, ...JSON.parse(init.body), updatedAt: T2 })],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'New title';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  byId(root, 'edit-title').value = 'Original title'; // typed back while Saving…
+  patch.resolve(jsonResponse(200, reply));
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true, 'the dialog does not close over the newer input');
+  assert.equal(byId(root, 'edit-title').value, 'Original title', 'the revert typed during the save is kept');
+  assert.equal(byId(root, 'edit-description').value, 'Teammate text', 'the untouched field follows the reply');
+  assert.equal(byRole(root, 'edit-notice').textContent,
+    'Saved “New title”. Your newer edits (title) are still here and have not been saved. Choose Save changes to save them.');
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ title: 'New title' }, { title: 'Original title' }], 'the teammate’s description is never sent back');
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+});
+
+test('unknown outcome that the check shows applied: a title changed back while saving is kept for an explicit save', async () => {
+  const original = liveIssue('v2', { title: 'Original title' });
+  const applied = { ...original, title: 'New title', updatedAt: T1 };
+  const patch = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [applied] })],
+    PATCH: [() => patch.promise, (url, init) => jsonResponse(200, { ...applied, ...JSON.parse(init.body), updatedAt: T2 })],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'New title';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  byId(root, 'edit-title').value = 'Original title';
+  patch.reject(new TypeError('network connection was lost'));
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
+  assert.equal(byId(root, 'edit-title').value, 'Original title');
+  assert.equal(byRole(root, 'edit-error').textContent,
+    'When checked just now, the server showed the title you sent. The board below shows the same check. Nothing more needs sending for those fields. Your newer edits (title) are still here and have not been saved.');
+  assert.equal(doc.activeElement, byRole(root, 'edit-save'));
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ title: 'New title' }, { title: 'Original title' }]);
+});
+
+test('unknown outcome with failed and repeated checks: the revert is kept and the fields to send are never empty', async () => {
+  const original = liveIssue('v3', { title: 'Original title', description: 'Old text' });
+  const teammate = { ...original, title: 'Teammate title', description: 'Teammate text', updatedAt: T1 };
+  const applied = { ...teammate, title: 'New title', updatedAt: T2 };
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => textResponse(502, GATEWAY_HTML),
+      () => jsonResponse(200, { items: [teammate] }), () => jsonResponse(200, { items: [applied] }), () => jsonResponse(200, { items: [applied] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }, (url, init) => jsonResponse(200, { ...applied, ...JSON.parse(init.body), updatedAt: T2 })],
+  });
+  const patch = deferred();
+  const inner = createHttpAdapter({ fetchImpl });
+  const adapter = { ...inner, update: async (...a) => { await patch.promise; return inner.update(...a); } };
+  const { root } = await mount(adapter);
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'New title';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  byId(root, 'edit-title').value = 'Original title';
+  patch.resolve();
+  await flush(8);
+  // First check fails: the reverted title still has to be sent, since the
+  // server may hold the value sent.
+  assert.equal(byRole(root, 'edit-error').textContent,
+    'Could not confirm whether your changes were saved: The connection to the server failed. The server could not be checked either: The server answered with an unexpected error (502). Your edits are kept here. Choose Check again, or Save changes to send only the fields you edited (title).');
+  assert.equal(byId(root, 'edit-title').value, 'Original title');
+
+  // Second check: a teammate changed title and description.
+  byRole(root, 'edit-check').dispatch('click');
+  await flush(8);
+  assert.equal(byId(root, 'edit-title').value, 'Original title', 'the revert survives the check');
+  assert.equal(byId(root, 'edit-description').value, 'Teammate text', 'the untouched field follows the check');
+  assert.match(byRole(root, 'edit-error').textContent, /Save changes sends only the fields you edited \(title\)/);
+
+  // Third check: the server now shows the title that was sent.
+  byRole(root, 'edit-check').dispatch('click');
+  await flush(8);
+  assert.equal(byId(root, 'edit-title').value, 'Original title', 'the revert survives repeated checks');
+  assert.equal(byRole(root, 'edit-error').textContent,
+    'When checked just now, the server showed the title you sent. The board below shows the same check. Nothing more needs sending for those fields. Your newer edits (title) are still here and have not been saved.');
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ title: 'New title' }, { title: 'Original title' }], 'checks never send; the description is never sent back');
+});
+
+test('unknown outcome: an untouched sent field the server does not show stays as sent across repeated checks', async () => {
+  const original = liveIssue('v4', { title: 'Offline' });
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [original] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'Offline edit';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  for (let i = 0; i < 2; i++) {
+    assert.equal(byId(root, 'edit-title').value, 'Offline edit');
+    assert.match(byRole(root, 'edit-error').textContent, /Save changes sends only the fields you edited \(title\)/);
+    byRole(root, 'edit-check').dispatch('click');
+    await flush(8);
+  }
+  assert.equal(byId(root, 'edit-title').value, 'Offline edit');
+  assert.equal(calls.filter(c => c.method === 'PATCH').length, 1);
+});
+
+test('a manual Refresh superseded by a filter load does not announce Board refreshed', async () => {
+  const a = liveIssue('s1', { title: 'Alpha' });
+  const refreshList = deferred();
+  const filterList = deferred();
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [a] }), () => refreshList.promise, () => filterList.promise, () => jsonResponse(200, { items: [a] })],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const announcer = byRole(root, 'announcer');
+  announcer.textContent = '';
+  byRole(root, 'refresh').dispatch('click');
+  await flush(2);
+  const filter = byRole(root, 'status-filter');
+  filter.value = 'open';
+  filter.dispatch('change');
+  await flush(2);
+  refreshList.resolve(jsonResponse(200, { items: [a] }));
+  await flush(6);
+  assert.equal(announcer.textContent, '', 'the superseded Refresh says nothing');
+  assert.equal(byRole(root, 'refresh').getAttribute('aria-disabled'), 'true', 'the filter load is still running');
+  filterList.resolve(jsonResponse(200, { items: [a] }));
+  await flush(6);
+  assert.doesNotMatch(announcer.textContent, /Board refreshed|Loading issues/);
+
+  // A Refresh that is applied still announces its result.
+  byRole(root, 'refresh').dispatch('click');
+  await flush(6);
+  assert.equal(announcer.textContent, 'Board refreshed. 1 issue shown.');
+});
+
+// ---------------------------------------------------------------------------
 // The board against the real server (src/server.js) with a temporary DATA_DIR
 // ---------------------------------------------------------------------------
 async function bootRealServer(dataDir) {

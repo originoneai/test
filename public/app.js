@@ -345,7 +345,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const dialog = h(doc, 'dialog', { class: 'edit-dialog', 'aria-labelledby': 'edit-heading', 'data-role': 'edit-dialog' }, editForm);
   // seed: per field, the server value that field was last filled from.
   // unconfirmed: { id, submitted, before, reason } after a save with an unknown outcome.
-  const edit = { issue: null, seed: null, trigger: null, saving: false, open: false, unconfirmed: null, serverIssue: null };
+  // placed: per field, the value the dialog last put in (or saw when sending).
+  // uncertain: fields of a save whose outcome is unknown and not yet observed.
+  const edit = { issue: null, seed: null, placed: null, uncertain: new Set(), trigger: null, saving: false, open: false, unconfirmed: null, serverIssue: null };
 
   root.replaceChildren(
     header,
@@ -479,21 +481,24 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     if (hadFocus) restoreCardFocus(hadFocus.id, hadFocus.role);
   }
 
+  // Resolves true only when this load's result was applied to the board and
+  // it succeeded; a load superseded by a newer one resolves false.
   async function load() {
     const seq = ++state.loadSeq;
     state.loading = true;
     render();
     try {
       const items = await adapter.list({ ...state.filters });
-      if (seq !== state.loadSeq) return;
+      if (seq !== state.loadSeq) return false;
       state.issues = items;
       state.loadError = null;
     } catch (error) {
-      if (seq !== state.loadSeq) return;
+      if (seq !== state.loadSeq) return false;
       state.loadError = error;
     }
     state.loading = false;
     render();
+    return !state.loadError;
   }
 
   // The board's filters applied to an unfiltered list, with the same rules as
@@ -655,21 +660,29 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // --- edit dialog -------------------------------------------------------------------
   //
   // The dialog tracks, per field, the server value that field was last filled
-  // from (its "seed"). A field counts as edited only while its input differs
-  // from its own seed, and a save sends only edited fields. When a server
-  // observation of the issue arrives (a confirmed save reply, or the check
-  // after an unknown outcome), fields the user has not edited take the server's
-  // value, and edited fields, including anything typed while the request was
-  // running, are kept. The whole stale form is never compared against a newer
-  // server copy, so a teammate's change to a field the user did not touch is
-  // never sent back.
+  // from (its "seed"), and the value the dialog itself last put in or saw at
+  // send time (its "placed" value). A field counts as edited while its input
+  // differs from its seed, or while it was part of a save whose outcome is
+  // still unknown (the server may hold the sent value, so even a value equal to
+  // the seed has to be sent again). A save sends only edited fields.
+  //
+  // When a server observation of the issue arrives (a confirmed save reply, or
+  // the check after an unknown outcome), a field the user changed since it was
+  // placed, including a change back to the old value, is kept as typed; every
+  // other field takes the server's value. Whether the user meant something is
+  // decided by what they did after the send, never by comparing with the old
+  // seed. The whole stale form is never compared against a newer server copy,
+  // so a teammate's change to a field the user did not touch is never sent back.
   const FIELDS = ['title', 'description', 'status'];
   const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status' };
   const fieldInputs = { title: editTitle, description: editDescription, status: editStatus };
   const serverValue = (issue, field) => (field === 'description' ? issue.description || '' : issue[field]);
   // Titles are stored trimmed (contract), so they are compared trimmed.
   const sameValue = (field, a, b) => (field === 'title' ? String(a).trim() === String(b).trim() : a === b);
-  const editedFields = () => FIELDS.filter(field => !sameValue(field, fieldInputs[field].value, edit.seed[field]));
+  const editedFields = () => FIELDS.filter(field => edit.uncertain.has(field)
+    || !sameValue(field, fieldInputs[field].value, edit.seed[field]));
+  const changedSincePlaced = field => !sameValue(field, fieldInputs[field].value, edit.placed[field]);
+  const placeCurrent = () => { edit.placed = Object.fromEntries(FIELDS.map(field => [field, fieldInputs[field].value])); };
   function editPatch() {
     const patch = {};
     for (const field of editedFields()) patch[field] = fieldInputs[field].value;
@@ -679,15 +692,26 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     edit.issue = issue;
     edit.seed = Object.fromEntries(FIELDS.map(field => [field, serverValue(issue, field)]));
     for (const field of FIELDS) fieldInputs[field].value = edit.seed[field];
+    edit.placed = { ...edit.seed };
+    edit.uncertain = new Set();
   }
-  // Take in a server observation of this issue without touching edited fields.
-  function syncFromServer(issue) {
+  // Take in a server observation of this issue. A field is kept as typed when
+  // the user changed it since it was placed (after the send or the last
+  // observation, even back to the old value), or when it belongs to an
+  // unconfirmed save (`outstanding`: field to value sent) and the server does
+  // not show the value sent. Every other field takes the server value.
+  function syncFromServer(issue, outstanding = {}) {
     for (const field of FIELDS) {
       const value = serverValue(issue, field);
       const input = fieldInputs[field];
-      if (sameValue(field, input.value, edit.seed[field])) input.value = value;
+      const notApplied = field in outstanding && !sameValue(field, value, outstanding[field]);
+      if (!changedSincePlaced(field) && !notApplied) {
+        input.value = value;
+        edit.placed[field] = value;
+      }
       edit.seed[field] = value;
     }
+    edit.uncertain = new Set();
     edit.issue = issue;
   }
   const fieldList = fields => fields.map(field => FIELD_LABELS[field].toLowerCase()).join(', ');
@@ -778,7 +802,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     const kept = 'Your edits are kept here.';
     hideCompare();
     if (obs.error) {
-      showBox(editError, editError, `${lead} The server could not be checked either: ${describe(obs.error)} ${kept} Choose Check again, or Save changes to send only the fields you edited (${fieldList(editedFields())}).`);
+      const toSend = editedFields();
+      const retry = toSend.length > 0
+        ? `Choose Check again, or Save changes to send only the fields you edited (${fieldList(toSend)}).`
+        : 'Choose Check again, or Cancel to close.';
+      showBox(editError, editError, `${lead} The server could not be checked either: ${describe(obs.error)} ${kept} ${retry}`);
       editCheck.focus();
       return;
     }
@@ -806,7 +834,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     const phrases = shows.map(phrase);
     const joined = phrases.length > 1 ? `${phrases.slice(0, -1).join(', ')} and ${phrases[phrases.length - 1]}` : phrases[0];
     const observed = `When checked just now, the server showed ${joined}.${boardNote(obs)}`;
-    syncFromServer(latest);
+    syncFromServer(latest, pending.submitted);
     if (shows.every(s => s.kind === 'sent')) {
       edit.unconfirmed = null;
       editCheck.hidden = true;
@@ -861,6 +889,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     }
     // The seeds of the submitted fields at send time, to describe a later check.
     const before = { ...edit.seed };
+    // What the form held when sent: anything changed after this is new intent.
+    placeCurrent();
     edit.unconfirmed = null;
     editCheck.hidden = true;
     hideCompare();
@@ -875,6 +905,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       showBox(editNotice, editNotice, '');
       if (error?.outcomeUnknown) {
         edit.unconfirmed = { id, submitted: value, before, reason: describe(error) };
+        edit.uncertain = new Set(Object.keys(value));
         editCheck.hidden = false;
         await checkEdit();
       } else if (error?.code === 'NOT_FOUND') {
@@ -917,8 +948,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   retryButton.addEventListener('click', () => load());
   refreshButton.addEventListener('click', async () => {
     if (state.loading) return;
-    await load();
-    if (!state.loadError) announce(`Board refreshed. ${boardStatus.textContent}`);
+    // Announce only when this request's result is the one on the board; a
+    // search or filter started meanwhile supersedes it and reports itself.
+    if (await load()) announce(`Board refreshed. ${boardStatus.textContent}`);
   });
   dismissButton.addEventListener('click', () => showBox(actionErrorBox, actionErrorText, ''));
 
