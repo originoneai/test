@@ -111,7 +111,16 @@ class FakeElement {
       node.parentNode = this; this.children.push(node);
     }
   }
-  replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
+  replaceChildren(...nodes) {
+    for (const old of this.children) old.parentNode = null; // removed nodes are detached, as in a browser
+    this.children = []; this.append(...nodes);
+  }
+  // Like the DOM: true only while the element is inside the mounted page root.
+  get isConnected() {
+    let node = this;
+    while (node.parentNode) node = node.parentNode;
+    return node === this.ownerDocument.root;
+  }
   setAttribute(k, v) { this.attributes.set(k, String(v)); }
   getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
   removeAttribute(k) { this.attributes.delete(k); }
@@ -168,6 +177,7 @@ function recordingAdapter(inner) {
 async function mount(adapter, opts = {}) {
   const doc = fakeDocument();
   const root = doc.createElement('main');
+  doc.root = root;
   const app = mountApp(root, { adapter, doc, searchDelayMs: 0, ...opts });
   await app.ready;
   await flush();
@@ -332,6 +342,7 @@ test('board shows three columns, counts, loading state and the live-data note', 
   const adapter = { mode: 'memory', list: async a => { await gate.promise; return inner.list(a); }, create: inner.create, update: inner.update };
   const doc = fakeDocument();
   const root = doc.createElement('main');
+  doc.root = root;
   const app = mountApp(root, { adapter, doc, searchDelayMs: 0 });
   assert.equal(byRole(root, 'board').getAttribute('aria-busy'), 'true');
   assert.equal(byRole(root, 'board-status').textContent, 'Loading issues…');
@@ -629,6 +640,7 @@ test('a slow earlier search response never overwrites a newer one', async () => 
   const adapter = { mode: 'memory', create: inner.create, update: inner.update, list: async a => { const g = deferred(); gates.push(g); await g.promise; return inner.list(a); } };
   const doc = fakeDocument();
   const root = doc.createElement('main');
+  doc.root = root;
   mountApp(root, { adapter, doc, searchDelayMs: 0 });
   gates[0].resolve();
   await flush();
@@ -716,7 +728,7 @@ test('a well-formed empty list still shows the normal empty state', async () => 
 test('an invalid create response is not reported as saved and keeps the input for retry', async () => {
   const saved = liveIssue('n1', { title: 'Keep me', description: 'and me' });
   const { fetchImpl, calls } = scriptedFetch({
-    GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved] })],
+    GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved] })],
     POST: [() => textResponse(200, GATEWAY_HTML), () => jsonResponse(201, saved)],
   });
   const { root } = await mount(createHttpAdapter({ fetchImpl }));
@@ -728,13 +740,13 @@ test('an invalid create response is not reported as saved and keeps the input fo
   await flush(6);
   const error = byRole(root, 'create-error');
   assert.equal(error.hidden, false);
-  assert.equal(error.textContent, 'Could not confirm whether “Keep me” was saved: The server sent a response the board could not read. The server has no issue with this title and description right now. You can create it again. Your text is kept.');
+  assert.equal(error.textContent, 'Could not confirm whether “Keep me” was saved: The server sent a response the board could not read. When checked just now, the server showed no issue with this title and description. The board below shows the same check. That does not show whether your request failed. If it still does not appear after a Refresh, you can create it again. Your text is kept.');
   assert.doesNotMatch(error.textContent, /was not saved/, 'an unknown outcome is never stated as not saved');
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Issue created/);
   assert.equal(title.value, 'Keep me');
   assert.equal(description.value, 'and me');
   const gets = calls.filter(c => c.method === 'GET').map(c => c.url);
-  assert.deepEqual(gets.slice(1), ['/api/issues?q=Keep+me', '/api/issues'], 'the server is searched for the title, then the board is reloaded');
+  assert.deepEqual(gets.slice(1), ['/api/issues'], 'one unfiltered read serves both the advice and the board');
   assert.equal(calls.filter(c => c.method === 'POST').length, 1, 'never created again automatically');
 
   byRole(root, 'create-form').dispatch('submit');
@@ -777,7 +789,7 @@ test('an invalid edit response keeps the dialog open and says the result could n
   await flush(6);
   assert.equal(dialog.hasAttribute('open'), true);
   assert.equal(editTitle.value, 'Edited title');
-  assert.match(byRole(root, 'edit-error').textContent, /Could not confirm whether your changes were saved: The server sent a response the board could not read\. The server still shows the values from before this save, so the save may not have been applied\. Your changes are kept here\./);
+  assert.match(byRole(root, 'edit-error').textContent, /Could not confirm whether your changes were saved: The server sent a response the board could not read\. When checked just now, the server showed the title from before your save\. The board below shows the same check\. This shows the server’s current values, not whether your request was applied\. Your edits are kept here\./);
   assert.doesNotMatch(byRole(root, 'edit-error').textContent, /[Rr]eload/, 'never asks for a page reload, which would lose the draft');
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Saved/);
   assert.equal(byRole(root, 'edit-check').hidden, false);
@@ -797,8 +809,8 @@ test('an invalid status-change response is not shown as moved and the board is r
   assert.match(byRole(root, 'action-error-text').textContent, /Could not confirm whether “Move me” moved to Done/);
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Moved/);
   assert.deepEqual(cardTitles(root, 'open'), ['Move me']);
-  assert.match(byRole(root, 'action-error-text').textContent, /The server now shows it in Open\. Choose Done again if you still want to move it\.$/);
-  assert.equal(calls.filter(c => c.method === 'GET').length, 3, 'one check of the server, then the board is reloaded');
+  assert.match(byRole(root, 'action-error-text').textContent, /When checked just now, the server showed it in Open\. The board below shows the same check\. Choose Done again if you still want to move it\.$/);
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'one read of the server serves both the advice and the board');
 });
 
 // ---------------------------------------------------------------------------
@@ -848,10 +860,10 @@ test('a status reply that still shows the old status is not announced as moved',
   select.dispatch('change');
   await flush(6);
   assert.equal(byRole(root, 'action-error-text').textContent,
-    `Could not confirm whether “Stale move” moved to Done: ${UNCONFIRMED_MESSAGE} The server now shows it in Open. Choose Done again if you still want to move it.`);
+    `Could not confirm whether “Stale move” moved to Done: ${UNCONFIRMED_MESSAGE} When checked just now, the server showed it in Open. The board below shows the same check. Choose Done again if you still want to move it.`);
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Moved/);
   assert.deepEqual(cardTitles(root, 'open'), ['Stale move']);
-  assert.equal(calls.filter(c => c.method === 'GET').length, 3, 'the server is checked, then the board is reloaded to show the real status');
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'one read of the server shows the real status on the board and in the advice');
 });
 
 test('a create reply for different content keeps the draft and is not announced', async () => {
@@ -865,7 +877,7 @@ test('a create reply for different content keeps the draft and is not announced'
   byRole(root, 'create-form').dispatch('submit');
   await flush(6);
   assert.equal(byRole(root, 'create-error').textContent,
-    `Could not confirm whether “My issue” was saved: ${UNCONFIRMED_MESSAGE} The server has no issue with this title and description right now. You can create it again. Your text is kept.`);
+    `Could not confirm whether “My issue” was saved: ${UNCONFIRMED_MESSAGE} When checked just now, the server showed no issue with this title and description. The board below shows the same check. That does not show whether your request failed. If it still does not appear after a Refresh, you can create it again. Your text is kept.`);
   assert.equal(byId(root, 'new-title').value, 'My issue');
   assert.equal(byId(root, 'new-description').value, 'My text');
   assert.doesNotMatch(byRole(root, 'announcer').textContent, /Issue created/);
@@ -891,7 +903,7 @@ test('an unconfirmed edit re-queries the board in the app, keeps the draft and c
   const edited = liveIssue('e2', { title: 'After', description: 'Draft description', updatedAt: '2026-09-25T01:00:00.000Z' });
   const { fetchImpl, calls } = scriptedFetch({
     GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [original] }),
-      () => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [edited] })],
+      () => jsonResponse(200, { items: [edited] })],
     PATCH: [() => jsonResponse(200, liveIssue('e2', { title: 'Something else' })), () => jsonResponse(200, edited)],
   });
   const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
@@ -905,10 +917,10 @@ test('an unconfirmed edit re-queries the board in the app, keeps the draft and c
   assert.equal(byId(root, 'edit-title').value, 'After');
   assert.equal(byId(root, 'edit-description').value, 'Draft description');
   assert.equal(byRole(root, 'edit-error').textContent,
-    `Could not confirm whether your changes were saved: ${UNCONFIRMED_MESSAGE} The server still shows the values from before this save, so the save may not have been applied. Your changes are kept here. Choose Save changes to send your version again (it replaces what the server shows), Use server values to drop your draft, or Check again.`);
+    `Could not confirm whether your changes were saved: ${UNCONFIRMED_MESSAGE} When checked just now, the server showed the title from before your save and the description from before your save. The board below shows the same check. This shows the server’s current values, not whether your request was applied. Your edits are kept here. Save changes sends only the fields you edited (title, description); fields you did not edit now show the server’s values. Use server values drops your edits, or choose Check again.`);
   assert.equal(byRole(root, 'edit-check').hidden, false);
   assert.equal(byRole(root, 'edit-adopt').hidden, false);
-  assert.equal(byRole(root, 'edit-compare').textContent, 'Server now shows: title “Before”, status Open, description (empty).');
+  assert.equal(byRole(root, 'edit-compare').textContent, 'Server showed at this check: title “Before”, status Open, description (empty).');
   assert.equal(doc.activeElement, byRole(root, 'edit-save'));
   const gets = calls.filter(c => c.method === 'GET').map(c => c.url);
   assert.equal(gets[1], '/api/issues', 'the check asks for all issues, not a page reload');
@@ -930,7 +942,7 @@ test('an unconfirmed edit that the board shows as applied is confirmed, even whe
       () => jsonResponse(200, { items: [moved] }), () => jsonResponse(200, { items: [] })],
     PATCH: [() => { throw new TypeError('network connection was lost'); }],
   });
-  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
   const filter = byRole(root, 'status-filter');
   filter.value = 'open';
   filter.dispatch('change');
@@ -941,16 +953,19 @@ test('an unconfirmed edit that the board shows as applied is confirmed, even whe
   await flush(8);
   const gets = calls.filter(c => c.method === 'GET').map(c => c.url);
   assert.equal(gets[2], '/api/issues', 'the check ignores the active filter');
-  assert.equal(gets[3], '/api/issues?status=open', 'then the filtered board is refreshed');
+  assert.equal(gets.length, 3, 'no second read: the board applies the Open filter to the same check');
+  assert.deepEqual(cardTitles(root, 'open'), [], 'the board agrees with the check: the issue is no longer Open');
   assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
-  assert.equal(byRole(root, 'announcer').textContent, 'The server now shows your changes to “Filtered”, so nothing more needs sending.');
+  assert.equal(byRole(root, 'announcer').textContent,
+    'When checked just now, the server showed the status you sent. The board below shows the same check. Nothing more needs sending for “Filtered”. “Filtered” is no longer shown on the board. Focus moved to the Refresh button.');
+  assert.equal(doc.activeElement, byRole(root, 'refresh'), 'focus goes to a control still on the page');
   assert.equal(calls.filter(c => c.method === 'PATCH').length, 1, 'nothing is sent twice');
 });
 
 test('when the check also fails, the draft stays and Check again tries once more', async () => {
   const original = liveIssue('e4', { title: 'Offline' });
   const { fetchImpl, calls } = scriptedFetch({
-    GET: [() => jsonResponse(200, { items: [original] }), () => textResponse(502, GATEWAY_HTML), () => textResponse(502, GATEWAY_HTML),
+    GET: [() => jsonResponse(200, { items: [original] }), () => textResponse(502, GATEWAY_HTML),
       () => jsonResponse(200, { items: [original] })],
     PATCH: [() => { throw new TypeError('network connection was lost'); }],
   });
@@ -960,13 +975,13 @@ test('when the check also fails, the draft stays and Check again tries once more
   byRole(root, 'edit-form').dispatch('submit');
   await flush(8);
   assert.equal(byRole(root, 'edit-error').textContent,
-    'Could not confirm whether your changes were saved: The connection to the server failed. The board could not be checked either: The server answered with an unexpected error (502). Your changes are kept here. Choose Check again, or Save changes to send them again.');
+    'Could not confirm whether your changes were saved: The connection to the server failed. The server could not be checked either: The server answered with an unexpected error (502). Your edits are kept here. Choose Check again, or Save changes to send only the fields you edited (title).');
   assert.equal(doc.activeElement, byRole(root, 'edit-check'));
   assert.equal(byId(root, 'edit-title').value, 'Offline edit');
 
   byRole(root, 'edit-check').dispatch('click');
   await flush(8);
-  assert.match(byRole(root, 'edit-error').textContent, /The server still shows the values from before this save, so the save may not have been applied\. Your changes are kept here\./);
+  assert.match(byRole(root, 'edit-error').textContent, /When checked just now, the server showed the title from before your save\. The board below shows the same check\. This shows the server’s current values, not whether your request was applied\. Your edits are kept here\./);
   assert.equal(byId(root, 'edit-title').value, 'Offline edit');
   assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
   assert.equal(calls.filter(c => c.method === 'PATCH').length, 1, 'checking never re-sends the change');
@@ -991,7 +1006,7 @@ test('edits typed while the check runs are kept even if the earlier save turns o
   assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
   assert.equal(byId(root, 'edit-title').value, 'Third');
   assert.equal(byRole(root, 'edit-error').textContent,
-    'The board was checked and shows the changes you saved to “Second”. Your newer edits are still here and have not been saved.');
+    'When checked just now, the server showed the title you sent. The board below shows the same check. Nothing more needs sending for those fields. Your newer edits (title) are still here and have not been saved.');
   assert.equal(byRole(root, 'edit-check').hidden, true);
 });
 
@@ -1041,7 +1056,7 @@ test('text typed while a successful edit save is pending survives the reply and 
   assert.equal(dialog.hasAttribute('open'), true, 'newer edits keep the dialog open');
   assert.equal(byId(root, 'edit-title').value, 'Publish the release notes');
   assert.equal(byId(root, 'edit-description').value, 'Also explain the migration and rollback');
-  assert.equal(notice.textContent, 'Saved “Publish the release notes”. Your newer edits are still here and have not been saved. Choose Save changes to save them.');
+  assert.equal(notice.textContent, 'Saved “Publish the release notes”. Your newer edits (description) are still here and have not been saved. Choose Save changes to save them.');
   assert.equal(byRole(root, 'edit-save').disabled, false);
   assert.equal(byRole(root, 'edit-save').textContent, 'Save changes');
   assert.equal(byRole(root, 'edit-error').hidden, true, 'a confirmed save is not shown as an error');
@@ -1078,7 +1093,7 @@ test('an edit made only while the board refreshes after a save is kept for an ex
   assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true);
   assert.equal(byId(root, 'edit-status').value, 'done');
   assert.equal(byId(root, 'edit-description').value, 'First pass');
-  assert.match(byRole(root, 'edit-notice').textContent, /Your newer edits are still here and have not been saved\./);
+  assert.match(byRole(root, 'edit-notice').textContent, /Your newer edits \(status\) are still here and have not been saved\./);
   assert.equal(doc.activeElement, byRole(root, 'edit-save'), 'with no field focused, focus moves to Save changes');
   byRole(root, 'edit-form').dispatch('submit');
   await flush(8);
@@ -1127,7 +1142,7 @@ test('text typed during a save whose outcome is unknown is kept, and the unknown
   assert.equal(byId(root, 'edit-title').value, 'Unknown sent');
   assert.equal(byId(root, 'edit-description').value, 'Typed while pending');
   assert.equal(byRole(root, 'edit-error').textContent,
-    'Could not confirm whether your changes were saved: The connection to the server failed. The server still shows the values from before this save, so the save may not have been applied. Your changes are kept here. Choose Save changes to send your version again (it replaces what the server shows), Use server values to drop your draft, or Check again.');
+    'Could not confirm whether your changes were saved: The connection to the server failed. When checked just now, the server showed the title from before your save. The board below shows the same check. This shows the server’s current values, not whether your request was applied. Your edits are kept here. Save changes sends only the fields you edited (title, description); fields you did not edit now show the server’s values. Use server values drops your edits, or choose Check again.');
   assert.equal(byRole(root, 'edit-check').hidden, false);
   assert.equal(byRole(root, 'edit-notice').hidden, true, 'no saved notice for an unknown outcome');
   assert.equal(doc.activeElement, byRole(root, 'edit-save'));
@@ -1147,11 +1162,13 @@ test('Refresh asks the server again and shows a teammate’s new issue', async (
   const refresh = byRole(root, 'refresh');
   assert.equal(refresh.getAttribute('type'), 'button');
   refresh.dispatch('click');
-  assert.equal(refresh.disabled, true, 'disabled while refreshing');
+  assert.equal(refresh.getAttribute('aria-disabled'), 'true', 'marked unavailable while refreshing');
+  assert.equal(refresh.disabled, false, 'never truly disabled, so keyboard focus on it is not dropped');
   assert.equal(refresh.textContent, 'Refreshing…');
+  refresh.dispatch('click'); // a second press while loading is ignored
   await flush();
   assert.equal(inner.calls.filter(c => c[0] === 'list').length, before + 1);
-  assert.equal(refresh.disabled, false);
+  assert.equal(refresh.getAttribute('aria-disabled'), 'false');
   assert.ok(cardTitles(root, 'open').includes('Added by a teammate'));
   assert.equal(byRole(root, 'announcer').textContent, 'Board refreshed. 5 issues shown.');
 });
@@ -1180,9 +1197,10 @@ test('Use server values replaces the draft with what the server showed and drops
   byId(root, 'edit-title').value = 'My title';
   byRole(root, 'edit-form').dispatch('submit');
   await flush(8);
-  assert.match(byRole(root, 'edit-error').textContent, /The server now shows different values, which may include a teammate’s change\. Your changes are kept here\./);
-  assert.equal(byRole(root, 'edit-compare').textContent, 'Server now shows: title “Teammate title”, status In progress, description “Their text”.');
-  assert.equal(byId(root, 'edit-title').value, 'My title', 'the draft is kept until the user chooses');
+  assert.match(byRole(root, 'edit-error').textContent, /When checked just now, the server showed a different title \(possibly a teammate’s change\)\. The board below shows the same check\./);
+  assert.equal(byRole(root, 'edit-compare').textContent, 'Server showed at this check: title “Teammate title”, status In progress, description “Their text”.');
+  assert.equal(byId(root, 'edit-title').value, 'My title', 'the edited field is kept until the user chooses');
+  assert.equal(byId(root, 'edit-description').value, 'Their text', 'untouched fields already follow the check');
   byRole(root, 'edit-adopt').dispatch('click');
   assert.equal(byId(root, 'edit-title').value, 'Teammate title');
   assert.equal(byId(root, 'edit-description').value, 'Their text');
@@ -1191,7 +1209,7 @@ test('Use server values replaces the draft with what the server showed and drops
   assert.equal(byRole(root, 'edit-compare').hidden, true);
   assert.equal(byRole(root, 'edit-check').hidden, true);
   assert.equal(byRole(root, 'edit-error').hidden, true);
-  assert.equal(byRole(root, 'edit-notice').textContent, 'The form now shows the server’s values. Your draft was dropped.');
+  assert.equal(byRole(root, 'edit-notice').textContent, 'The form now shows the server’s values from the last check. Your edits were dropped.');
   assert.equal(doc.activeElement, byId(root, 'edit-title'));
   // A later edit is compared with the server values, so only the new change is sent.
   byId(root, 'edit-description').value = 'Their text, plus mine';
@@ -1207,7 +1225,7 @@ test('saving again after a teammate’s change sends the kept draft as an explic
   const teammate = liveIssue('u2', { title: 'Teammate title', updatedAt: '2026-09-25T02:00:00.000Z' });
   const mine = { ...teammate, title: 'My title', updatedAt: '2026-09-25T03:00:00.000Z' };
   const { fetchImpl, calls } = scriptedFetch({
-    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [teammate] }), () => jsonResponse(200, { items: [teammate] }), () => jsonResponse(200, { items: [mine] })],
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [teammate] }), () => jsonResponse(200, { items: [mine] })],
     PATCH: [() => { throw new TypeError('network connection was lost'); }, () => jsonResponse(200, mine)],
   });
   const { root } = await mount(createHttpAdapter({ fetchImpl }));
@@ -1226,7 +1244,7 @@ test('saving again after a teammate’s change sends the kept draft as an explic
 test('an unknown create that the server shows as saved warns about duplicates and keeps the text', async () => {
   const saved = liveIssue('d1', { title: 'Printer offline', description: 'Floor 3' });
   const { fetchImpl, calls } = scriptedFetch({
-    GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved, liveIssue('d2', { title: 'Printer offline again' })] }), () => jsonResponse(200, { items: [saved] })],
+    GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved, liveIssue('d2', { title: 'Printer offline again' })] })],
     POST: [() => { throw new TypeError('network connection was lost'); }],
   });
   const { root } = await mount(createHttpAdapter({ fetchImpl }));
@@ -1235,9 +1253,10 @@ test('an unknown create that the server shows as saved warns about duplicates an
   byRole(root, 'create-form').dispatch('submit');
   await flush(8);
   assert.equal(byRole(root, 'create-error').textContent,
-    'Could not confirm whether “Printer offline” was saved: The connection to the server failed. The server now has an issue with this title and description, so it was probably saved. Creating it again would add a duplicate. Your text is kept.');
+    'Could not confirm whether “Printer offline” was saved: The connection to the server failed. When checked just now, the server showed an issue with this title and description. The board below shows the same check. It may be yours or a teammate’s; creating it again could add a duplicate. Your text is kept.');
   assert.equal(byId(root, 'new-title').value, '  Printer offline ');
-  assert.deepEqual(cardTitles(root, 'open'), ['Printer offline']);
+  assert.deepEqual(cardTitles(root, 'open'), ['Printer offline', 'Printer offline again'], 'the board is the same read the advice used');
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'one read after the unknown create');
   assert.equal(calls.filter(c => c.method === 'POST').length, 1);
 });
 
@@ -1251,7 +1270,7 @@ test('an unknown create whose duplicate check also fails says so and keeps the t
   byRole(root, 'create-form').dispatch('submit');
   await flush(8);
   assert.equal(byRole(root, 'create-error').textContent,
-    'Could not confirm whether “Maybe” was saved: The connection to the server failed. The server could not be checked for it either: The server answered with an unexpected error (502). Look for it on the board before creating it again. Your text is kept.');
+    'Could not confirm whether “Maybe” was saved: The connection to the server failed. The server could not be checked either: The server answered with an unexpected error (502). Look for it on the board before creating it again. Your text is kept.');
   assert.equal(byId(root, 'new-title').value, 'Maybe');
 });
 
@@ -1268,7 +1287,7 @@ test('an unknown status change that did land says nothing more needs sending', a
   select.dispatch('change');
   await flush(8);
   assert.equal(byRole(root, 'action-error-text').textContent,
-    'Could not confirm whether “Landed” moved to Done: The connection to the server failed. The server now shows it in Done, so nothing more needs sending.');
+    'Could not confirm whether “Landed” moved to Done: The connection to the server failed. When checked just now, the server showed it in Done. The board below shows the same check. Nothing more needs sending.');
   assert.deepEqual(cardTitles(root, 'done'), ['Landed']);
   assert.equal(calls.filter(c => c.method === 'PATCH').length, 1);
 });
@@ -1297,6 +1316,224 @@ test('a status change or edit on an issue deleted elsewhere says so and refreshe
   assert.equal(byRole(root, 'action-error-text').textContent,
     'Could not change the status of “Gone soon”: the server no longer has this issue. The board was refreshed.');
   assert.equal(allByRole(root, 'card').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// NATIVE-UI review round 1: per-field edits, one observation, focus fallback
+// ---------------------------------------------------------------------------
+test('two windows: a title-only retry after a 502 sends only the title and keeps the teammate’s new description', async () => {
+  const original = liveIssue('w1', { title: 'Shared issue', description: 'Old text' });
+  const teammate = { ...original, description: 'Teammate text', updatedAt: T1 };
+  const mine = { ...teammate, title: 'My new title', updatedAt: T2 };
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [teammate] }), () => jsonResponse(200, { items: [mine] })],
+    PATCH: [() => textResponse(502, GATEWAY_HTML), (url, init) => jsonResponse(200, { ...teammate, ...JSON.parse(init.body), updatedAt: T2 })],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'My new title';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  assert.match(byRole(root, 'edit-error').textContent, /The server answered with an unexpected error \(502\)\. When checked just now, the server showed the title from before your save\./);
+  assert.match(byRole(root, 'edit-error').textContent, /Save changes sends only the fields you edited \(title\)/);
+  assert.equal(byId(root, 'edit-title').value, 'My new title', 'the edited field is kept');
+  assert.equal(byId(root, 'edit-description').value, 'Teammate text', 'the untouched field follows the check, so it cannot overwrite the teammate');
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ title: 'My new title' }, { title: 'My new title' }], 'only the title is ever sent');
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+  assert.deepEqual(cardTitles(root, 'open'), ['My new title']);
+  assert.match(byRole(root, 'announcer').textContent, /Saved “My new title”\./);
+});
+
+test('a confirmed save whose reply has a teammate’s description, with a status change typed meanwhile, next sends only the status', async () => {
+  const original = liveIssue('w2', { title: 'Before', description: 'Old text' });
+  const reply = { ...original, title: 'After', description: 'Teammate text', updatedAt: T1 };
+  const moved = { ...reply, status: 'done', updatedAt: T2 };
+  const patch = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [reply] }), () => jsonResponse(200, { items: [moved] })],
+    PATCH: [() => patch.promise, (url, init) => jsonResponse(200, { ...reply, ...JSON.parse(init.body), updatedAt: T2 })],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'After';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(4);
+  byId(root, 'edit-status').value = 'done';
+  patch.resolve(jsonResponse(200, reply));
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true, 'the newer status edit keeps the dialog open');
+  assert.equal(byId(root, 'edit-status').value, 'done');
+  assert.equal(byId(root, 'edit-description').value, 'Teammate text', 'the reply’s description replaces the untouched field');
+  assert.match(byRole(root, 'edit-notice').textContent, /Your newer edits \(status\) are still here and have not been saved\./);
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  const patches = calls.filter(c => c.method === 'PATCH').map(c => JSON.parse(c.body));
+  assert.deepEqual(patches, [{ title: 'After' }, { status: 'done' }]);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+  assert.deepEqual(cardTitles(root, 'done'), ['After']);
+});
+
+test('recovery advice and the board use one read, and a slower refresh started earlier cannot overwrite it', async () => {
+  const original = liveIssue('o1', { title: 'Observed' });
+  const done = { ...original, status: 'done', updatedAt: T1 };
+  const slowRefresh = deferred();
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => slowRefresh.promise, () => jsonResponse(200, { items: [done] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  byRole(root, 'refresh').dispatch('click');
+  await flush(2);
+  const select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(8);
+  slowRefresh.resolve(jsonResponse(200, { items: [original] }));
+  await flush(8);
+  assert.equal(byRole(root, 'action-error-text').textContent,
+    'Could not confirm whether “Observed” moved to Done: The connection to the server failed. When checked just now, the server showed it in Done. The board below shows the same check. Nothing more needs sending.');
+  assert.deepEqual(cardTitles(root, 'done'), ['Observed'], 'the stale refresh result was discarded');
+  assert.deepEqual(cardTitles(root, 'open'), []);
+  assert.deepEqual(calls.filter(c => c.method === 'GET').map(c => c.url), ['/api/issues', '/api/issues', '/api/issues'], 'no extra read after the check');
+});
+
+test('unknown edit: the comparison, the board and Use server values all come from the same check', async () => {
+  const original = liveIssue('o2', { title: 'One read', description: 'Old' });
+  const teammate = { ...original, title: 'Teammate title', description: 'New', status: 'in_progress', updatedAt: T1 };
+  const { fetchImpl, calls } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [teammate] })],
+    PATCH: [() => { throw new TypeError('network connection was lost'); }],
+  });
+  const { root } = await mount(createHttpAdapter({ fetchImpl }));
+  allByRole(root, 'card-edit')[0].dispatch('click');
+  byId(root, 'edit-title').value = 'My title';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  assert.equal(byRole(root, 'edit-compare').textContent, 'Server showed at this check: title “Teammate title”, status In progress, description “New”.');
+  assert.deepEqual(cardTitles(root, 'in_progress'), ['Teammate title'], 'the board shows the same check');
+  assert.doesNotMatch(byRole(root, 'edit-error').textContent, /now shows|still shows/, 'no claim beyond the moment of the check');
+  byRole(root, 'edit-adopt').dispatch('click');
+  assert.equal(byId(root, 'edit-title').value, 'Teammate title');
+  assert.equal(byId(root, 'edit-status').value, 'in_progress');
+  assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'adopting does not read again');
+});
+
+test('focus: moving a card out of a filtered column goes to its neighbour, or to Refresh when none is left', async () => {
+  const a = liveIssue('f1', { title: 'Alpha' });
+  const b = liveIssue('f2', { title: 'Beta' });
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [a, b] }), () => jsonResponse(200, { items: [a, b] }), () => jsonResponse(200, { items: [b] }), () => jsonResponse(200, { items: [] })],
+    PATCH: [(url, init) => jsonResponse(200, { ...a, ...JSON.parse(init.body), updatedAt: T1 }), (url, init) => jsonResponse(200, { ...b, ...JSON.parse(init.body), updatedAt: T1 })],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  const filter = byRole(root, 'status-filter');
+  filter.value = 'open';
+  filter.dispatch('change');
+  await flush();
+  let select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.focus();
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(8);
+  assert.deepEqual(cardTitles(root, 'open'), ['Beta']);
+  assert.equal(doc.activeElement, byRole(allByRole(root, 'card')[0], 'card-edit'), 'focus lands on Beta’s Edit button');
+  assert.equal(byRole(root, 'announcer').textContent, 'Moved “Alpha” to Done. “Alpha” is no longer shown on the board. Focus moved to “Beta” in Open.');
+  select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.focus();
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(8);
+  assert.equal(allByRole(root, 'card').length, 0);
+  assert.equal(doc.activeElement, byRole(root, 'refresh'));
+  assert.equal(byRole(root, 'announcer').textContent, 'Moved “Beta” to Done. “Beta” is no longer shown on the board. Focus moved to the Refresh button.');
+});
+
+test('focus: a card deleted elsewhere moves focus to the card now in its place, with a notice', async () => {
+  const a = liveIssue('f3', { title: 'Deleted one' });
+  const b = liveIssue('f4', { title: 'Still here' });
+  const notFound = () => jsonResponse(404, { error: { code: 'NOT_FOUND', message: 'Issue not found.' } });
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [a, b] }), () => jsonResponse(200, { items: [b] })],
+    PATCH: [notFound],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  const select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.focus();
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(8);
+  assert.deepEqual(cardTitles(root, 'open'), ['Still here']);
+  assert.equal(doc.activeElement, byRole(allByRole(root, 'card')[0], 'card-edit'));
+  assert.equal(byRole(root, 'announcer').textContent, 'The server no longer has “Deleted one”. Focus moved to “Still here” in Open.');
+});
+
+test('focus: closing the dialog after a save that filters the card out goes to the neighbour, not a detached button', async () => {
+  const a = liveIssue('f5', { title: 'Edited away' });
+  const b = liveIssue('f6', { title: 'Neighbour' });
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [a, b] }), () => jsonResponse(200, { items: [a, b] }), () => jsonResponse(200, { items: [b] })],
+    PATCH: [(url, init) => jsonResponse(200, { ...a, ...JSON.parse(init.body), updatedAt: T1 })],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  const filter = byRole(root, 'status-filter');
+  filter.value = 'open';
+  filter.dispatch('change');
+  await flush();
+  const trigger = allByRole(root, 'card-edit')[0];
+  trigger.focus();
+  trigger.dispatch('click');
+  byId(root, 'edit-status').value = 'done';
+  byRole(root, 'edit-form').dispatch('submit');
+  await flush(8);
+  assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+  assert.equal(trigger.isConnected, false, 'the old Edit button left the page');
+  assert.equal(doc.activeElement, byRole(allByRole(root, 'card')[0], 'card-edit'));
+  assert.match(byRole(root, 'announcer').textContent, /“Edited away” is no longer shown on the board\. Focus moved to “Neighbour” in Open\.$/);
+});
+
+test('focus: a re-render that keeps the card returns focus to the same control', async () => {
+  const a = liveIssue('f7', { title: 'Stays' });
+  const { fetchImpl } = scriptedFetch({ GET: [() => jsonResponse(200, { items: [a] })] });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  byRole(allByRole(root, 'card')[0], 'card-status').focus();
+  const filter = byRole(root, 'status-filter');
+  filter.value = 'open';
+  filter.dispatch('change');
+  await flush();
+  const now = byRole(allByRole(root, 'card')[0], 'card-status');
+  assert.equal(doc.activeElement, now, 'focus follows the re-rendered status control');
+  assert.equal(now.isConnected, true);
+});
+
+test('focus: a load that starts after focus moved to Refresh leaves focus on Refresh', async () => {
+  const a = liveIssue('f8', { title: 'Only card' });
+  const list = deferred();
+  const { fetchImpl } = scriptedFetch({
+    GET: [() => jsonResponse(200, { items: [a] }), () => jsonResponse(200, { items: [] }), () => list.promise],
+    PATCH: [(url, init) => jsonResponse(200, { ...a, ...JSON.parse(init.body), updatedAt: T1 })],
+  });
+  const { root, doc } = await mount(createHttpAdapter({ fetchImpl }));
+  const filter = byRole(root, 'status-filter');
+  filter.value = 'open';
+  // the card leaves the Open filter, so focus goes to Refresh
+  const select = byRole(allByRole(root, 'card')[0], 'card-status');
+  select.focus();
+  select.value = 'done';
+  select.dispatch('change');
+  await flush(8);
+  const refresh = byRole(root, 'refresh');
+  assert.equal(doc.activeElement, refresh);
+  filter.dispatch('change'); // another load starts while Refresh has focus
+  await flush(2);
+  assert.equal(refresh.getAttribute('aria-disabled'), 'true');
+  assert.equal(refresh.disabled, false, 'a disabled button would lose keyboard focus in a real browser');
+  assert.equal(doc.activeElement, refresh);
+  list.resolve(jsonResponse(200, { items: [] }));
+  await flush(4);
+  assert.equal(doc.activeElement, refresh);
 });
 
 // ---------------------------------------------------------------------------

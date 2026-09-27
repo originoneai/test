@@ -229,7 +229,13 @@ function formatTime(iso) {
 export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayMs = 200 } = {}) {
   if (!adapter) throw new Error('mountApp requires an adapter');
   const state = { issues: [], filters: { status: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
-  const editButtons = new Map();
+  // Controls of the cards on screen, per issue id, and each column's order, so
+  // focus can go back to a control that is still on the page after a render.
+  const cardControls = new Map(); // id -> { edit, select, title }
+  const columnIds = Object.fromEntries(STATUSES.map(s => [s, []]));
+  // Last position of every issue that has been shown: { status, index, title }.
+  // Kept after the card is gone so focus can move to its neighbour.
+  const lastSeen = new Map();
   let searchTimer = null;
 
   // --- header -------------------------------------------------------------
@@ -337,8 +343,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     h(doc, 'div', { class: 'form-actions' }, editCancel, editCheck, editAdopt, editSave),
   );
   const dialog = h(doc, 'dialog', { class: 'edit-dialog', 'aria-labelledby': 'edit-heading', 'data-role': 'edit-dialog' }, editForm);
-  // unconfirmed: { id, submitted, form, reason } after a save with an unknown outcome.
-  const edit = { issue: null, trigger: null, saving: false, open: false, unconfirmed: null, serverIssue: null };
+  // seed: per field, the server value that field was last filled from.
+  // unconfirmed: { id, submitted, before, reason } after a save with an unknown outcome.
+  const edit = { issue: null, seed: null, trigger: null, saving: false, open: false, unconfirmed: null, serverIssue: null };
 
   root.replaceChildren(
     header,
@@ -380,18 +387,65 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     const select = statusSelect(doc, selectId);
     select.value = issue.status;
     select.setAttribute('data-role', 'card-status');
+    select.setAttribute('data-issue-id', issue.id);
     const selectLabel = h(doc, 'label', { for: selectId, class: 'sr-only' });
     selectLabel.textContent = `Status for ${issue.title}`;
     select.addEventListener('change', () => moveIssue(issue, select, card));
     const editButton = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'card-edit', text: 'Edit' });
     editButton.setAttribute('aria-label', `Edit issue: ${issue.title}`);
+    editButton.setAttribute('data-issue-id', issue.id);
     editButton.addEventListener('click', () => openEdit(issue, editButton));
-    editButtons.set(issue.id, editButton);
+    cardControls.set(issue.id, { edit: editButton, select, title: issue.title });
     card.append(h(doc, 'div', { class: 'card-actions' }, selectLabel, select, editButton));
     return h(doc, 'li', {}, card);
   }
 
+  // Which card control has focus right now, if any: { id, role }.
+  function focusedCardControl() {
+    const active = doc.activeElement;
+    const id = active?.getAttribute?.('data-issue-id');
+    const controls = id ? cardControls.get(id) : null;
+    if (!controls) return null;
+    if (active === controls.edit) return { id, role: 'card-edit' };
+    if (active === controls.select) return { id, role: 'card-status' };
+    return null;
+  }
+
+  /**
+   * Put focus back on a card control that is still on the page. Prefers the
+   * same control of the same issue; if that card is gone (a filter, a deletion
+   * or a refresh removed it), moves to the Edit button of the card now in its
+   * place in the same column, else to the Refresh button, and says why.
+   * Returns the element that received focus.
+   */
+  function restoreCardFocus(id, role = 'card-edit', { prefix = '', gone = '' } = {}) {
+    const controls = cardControls.get(id);
+    const same = controls && (role === 'card-status' ? controls.select : controls.edit);
+    if (same && same.isConnected && !same.disabled) {
+      same.focus();
+      if (prefix) announce(prefix);
+      return same;
+    }
+    const seen = lastSeen.get(id);
+    const reason = gone || (seen ? `“${seen.title}” is no longer shown on the board.` : 'That issue is no longer shown on the board.');
+    const lead = prefix ? `${prefix} ${reason}` : reason;
+    const ids = seen ? columnIds[seen.status] : [];
+    if (ids.length > 0) {
+      const neighbour = cardControls.get(ids[Math.min(seen.index, ids.length - 1)]);
+      if (neighbour?.edit.isConnected) {
+        neighbour.edit.focus();
+        announce(`${lead} Focus moved to “${neighbour.title}” in ${STATUS_LABELS[seen.status]}.`);
+        return neighbour.edit;
+      }
+    }
+    refreshButton.focus();
+    announce(`${lead} Focus moved to the Refresh button.`);
+    return refreshButton;
+  }
+
   function render() {
+    // Re-rendering replaces the cards, so remember which card control had focus.
+    const hadFocus = focusedCardControl();
     board.setAttribute('aria-busy', state.loading ? 'true' : 'false');
     board.classList.toggle('is-loading', state.loading);
     const keptList = state.loadError && state.issues.length > 0;
@@ -399,12 +453,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       ? `Could not load issues: ${describe(state.loadError)} ${keptList ? 'The board still shows the last list that loaded.' : 'The list was not updated.'} Try again.`
       : '');
     const groups = groupByStatus(state.issues);
-    editButtons.clear();
+    cardControls.clear();
     for (const status of STATUSES) {
       const { count, list, empty } = columns[status];
       const items = groups[status];
       count.textContent = String(items.length);
       list.replaceChildren(...items.map(renderCard));
+      columnIds[status] = items.map(issue => issue.id);
+      items.forEach((issue, index) => lastSeen.set(issue.id, { status, index, title: issue.title }));
       const label = STATUS_LABELS[status].toLowerCase();
       empty.textContent = filtersActive() ? `No ${label} issues match these filters.` : `No ${label} issues.`;
       // An empty column is only claimed after a successful load.
@@ -415,8 +471,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     else if (state.issues.length === 0) boardStatus.textContent = filtersActive() ? 'No issues match your search.' : 'No issues yet. Create the first one.';
     else boardStatus.textContent = `${state.issues.length} ${state.issues.length === 1 ? 'issue' : 'issues'} shown.`;
     boardStatus.classList.toggle('is-loading', state.loading);
-    refreshButton.disabled = state.loading;
+    // aria-disabled rather than disabled: disabling a focused button would drop
+    // keyboard focus to the page whenever a load starts (for example the search
+    // debounce firing just after focus was moved here).
+    refreshButton.setAttribute('aria-disabled', state.loading ? 'true' : 'false');
     refreshButton.textContent = state.loading ? 'Refreshing…' : 'Refresh';
+    if (hadFocus) restoreCardFocus(hadFocus.id, hadFocus.role);
   }
 
   async function load() {
@@ -436,15 +496,50 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     render();
   }
 
-  // Issues on the server with exactly this (trimmed) title and description.
-  async function findMatchingIssues(input) {
-    try {
-      const items = await adapter.list({ q: input.title });
-      return { matches: items.filter(item => item.title === input.title && item.description === input.description) };
-    } catch (error) {
-      return { matches: [], error };
-    }
+  // The board's filters applied to an unfiltered list, with the same rules as
+  // the API (docs/api.md, src/store.js): exact status, and q as a
+  // case-insensitive substring of the title or description.
+  function applyFilters(items, { status = '', q = '' } = {}) {
+    const needle = q ? q.toLowerCase() : '';
+    return items.filter(issue => (!status || issue.status === status)
+      && (!needle || issue.title.toLowerCase().includes(needle)
+        || (issue.description || '').toLowerCase().includes(needle)));
   }
+
+  /**
+   * One read of the server for recovery after an unknown outcome. The advice,
+   * the comparison, "Use server values" and the board are all taken from this
+   * single unfiltered list (the board applies the current filters to it), so
+   * they cannot disagree. Any load still in flight is discarded. If the user
+   * starts a newer load before this read returns, the board shows that newer
+   * load instead and `boardShowsIt` is false.
+   * Returns { items } or { error }, plus boardShowsIt.
+   */
+  async function observe() {
+    const seq = ++state.loadSeq;
+    state.loading = true;
+    render();
+    let result;
+    try {
+      result = { items: await adapter.list({}) };
+    } catch (error) {
+      result = { error };
+    }
+    result.boardShowsIt = seq === state.loadSeq;
+    if (result.boardShowsIt) {
+      if (result.error) state.loadError = result.error;
+      else {
+        state.issues = applyFilters(result.items, state.filters);
+        state.loadError = null;
+      }
+      state.loading = false;
+      render();
+    }
+    return result;
+  }
+  const boardNote = obs => (obs.boardShowsIt
+    ? ' The board below shows the same check.'
+    : ' The board below was loaded again after this check and may show newer values.');
   const quoteText = text => (text ? `“${text}”` : '(empty)');
   function issueSummary(issue) {
     return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}, description ${quoteText(issue.description)}`;
@@ -494,13 +589,16 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         const kept = unchanged ? 'Your text is kept.' : 'Your newer draft was left unchanged.';
         const input = { title: value.title, description: value.description ?? '' };
         showBox(createPending, createPending, `Checking the server for “${value.title}”…`);
-        const found = await findMatchingIssues(input);
+        const obs = await observe();
         let check;
-        if (found.error) check = `The server could not be checked for it either: ${describe(found.error)} Look for it on the board before creating it again.`;
-        else if (found.matches.length > 0) check = `The server now has ${found.matches.length === 1 ? 'an issue' : `${found.matches.length} issues`} with this title and description, so it was probably saved. Creating it again would add a duplicate.`;
-        else check = 'The server has no issue with this title and description right now. You can create it again.';
+        if (obs.error) check = `The server could not be checked either: ${describe(obs.error)} Look for it on the board before creating it again.`;
+        else {
+          const matches = obs.items.filter(item => item.title === input.title && item.description === input.description);
+          check = matches.length > 0
+            ? `When checked just now, the server showed ${matches.length === 1 ? 'an issue' : `${matches.length} issues`} with this title and description.${boardNote(obs)} It may be yours or a teammate’s; creating it again could add a duplicate.`
+            : `When checked just now, the server showed no issue with this title and description.${boardNote(obs)} That does not show whether your request failed. If it still does not appear after a Refresh, you can create it again.`;
+        }
         showBox(createError, createError, `Could not confirm whether “${value.title}” was saved: ${describe(error)} ${check} ${kept}`);
-        await load();
       } else {
         const kept = unchanged
           ? 'Your text is kept so you can try again.'
@@ -525,43 +623,78 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     showBox(actionErrorBox, actionErrorText, '');
     try {
       confirmSaved(await adapter.update(issue.id, { status: next }), { status: next }, { id: issue.id });
-      announce(`Moved “${issue.title}” to ${STATUS_LABELS[next]}.`);
       await load();
-      editButtons.get(issue.id)?.focus();
+      restoreCardFocus(issue.id, 'card-edit', { prefix: `Moved “${issue.title}” to ${STATUS_LABELS[next]}.` });
     } catch (error) {
       select.value = previous;
       select.disabled = false;
       card.setAttribute('aria-busy', 'false');
       if (error?.outcomeUnknown) {
-        // Ask the server what it shows now (all statuses, so filters cannot hide it).
-        let now = null;
-        let checkError = null;
-        try { now = (await adapter.list({})).find(item => item.id === issue.id) ?? null; } catch (e) { checkError = e; }
+        // One read of the server (all statuses) for both the advice and the board.
+        const obs = await observe();
+        const now = obs.error ? null : obs.items.find(item => item.id === issue.id) ?? null;
         let seen;
-        if (checkError) seen = `The server could not be checked either: ${describe(checkError)} Check the board before trying again.`;
-        else if (!now) seen = 'The server no longer shows this issue.';
-        else if (now.status === next) seen = `The server now shows it in ${STATUS_LABELS[next]}, so nothing more needs sending.`;
-        else seen = `The server now shows it in ${STATUS_LABELS[now.status]}. Choose ${STATUS_LABELS[next]} again if you still want to move it.`;
+        if (obs.error) seen = `The server could not be checked either: ${describe(obs.error)} Check the board before trying again.`;
+        else if (!now) seen = `When checked just now, the server did not show this issue.${boardNote(obs)}`;
+        else if (now.status === next) seen = `When checked just now, the server showed it in ${STATUS_LABELS[next]}.${boardNote(obs)} Nothing more needs sending.`;
+        else seen = `When checked just now, the server showed it in ${STATUS_LABELS[now.status]}.${boardNote(obs)} Choose ${STATUS_LABELS[next]} again if you still want to move it.`;
         showBox(actionErrorBox, actionErrorText, `Could not confirm whether “${issue.title}” moved to ${STATUS_LABELS[next]}: ${describe(error)} ${seen}`);
-        await load();
-        (editButtons.get(issue.id) ?? select).focus();
+        restoreCardFocus(issue.id, 'card-status');
       } else if (error?.code === 'NOT_FOUND') {
         showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: the server no longer has this issue. The board was refreshed.`);
         await load();
+        restoreCardFocus(issue.id, 'card-edit', { gone: `The server no longer has “${issue.title}”.` });
       } else {
         showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: ${describe(error)}`);
-        select.focus();
+        if (select.isConnected) select.focus();
+        else restoreCardFocus(issue.id, 'card-status');
       }
     }
   }
 
   // --- edit dialog -------------------------------------------------------------------
-  function openEdit(issue, trigger) {
+  //
+  // The dialog tracks, per field, the server value that field was last filled
+  // from (its "seed"). A field counts as edited only while its input differs
+  // from its own seed, and a save sends only edited fields. When a server
+  // observation of the issue arrives (a confirmed save reply, or the check
+  // after an unknown outcome), fields the user has not edited take the server's
+  // value, and edited fields, including anything typed while the request was
+  // running, are kept. The whole stale form is never compared against a newer
+  // server copy, so a teammate's change to a field the user did not touch is
+  // never sent back.
+  const FIELDS = ['title', 'description', 'status'];
+  const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status' };
+  const fieldInputs = { title: editTitle, description: editDescription, status: editStatus };
+  const serverValue = (issue, field) => (field === 'description' ? issue.description || '' : issue[field]);
+  // Titles are stored trimmed (contract), so they are compared trimmed.
+  const sameValue = (field, a, b) => (field === 'title' ? String(a).trim() === String(b).trim() : a === b);
+  const editedFields = () => FIELDS.filter(field => !sameValue(field, fieldInputs[field].value, edit.seed[field]));
+  function editPatch() {
+    const patch = {};
+    for (const field of editedFields()) patch[field] = fieldInputs[field].value;
+    return patch;
+  }
+  function seedFrom(issue) {
     edit.issue = issue;
+    edit.seed = Object.fromEntries(FIELDS.map(field => [field, serverValue(issue, field)]));
+    for (const field of FIELDS) fieldInputs[field].value = edit.seed[field];
+  }
+  // Take in a server observation of this issue without touching edited fields.
+  function syncFromServer(issue) {
+    for (const field of FIELDS) {
+      const value = serverValue(issue, field);
+      const input = fieldInputs[field];
+      if (sameValue(field, input.value, edit.seed[field])) input.value = value;
+      edit.seed[field] = value;
+    }
+    edit.issue = issue;
+  }
+  const fieldList = fields => fields.map(field => FIELD_LABELS[field].toLowerCase()).join(', ');
+
+  function openEdit(issue, trigger) {
     edit.trigger = trigger;
-    editTitle.value = issue.title;
-    editDescription.value = issue.description || '';
-    editStatus.value = issue.status;
+    seedFrom(issue);
     setFieldError(editTitle, editTitleError, '');
     setFieldError(editDescription, editDescriptionError, '');
     showBox(editError, editError, '');
@@ -575,19 +708,27 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editTitle.focus();
   }
 
-  function closeEdit({ restoreFocusTo } = {}) {
+  // message: announced together with where focus went.
+  function closeEdit({ message = '' } = {}) {
     if (!edit.open) return;
     if (typeof dialog.close === 'function') dialog.close();
     else dialog.removeAttribute('open');
     edit.open = false;
-    const target = restoreFocusTo || (edit.issue && editButtons.get(edit.issue.id)) || edit.trigger;
+    const id = edit.issue?.id;
+    const trigger = edit.trigger;
     edit.issue = null;
     edit.trigger = null;
     edit.unconfirmed = null;
     editCheck.hidden = true;
     hideCompare();
     showBox(editNotice, editNotice, '');
-    target?.focus();
+    // The card that opened the dialog may have been re-rendered, filtered out or
+    // deleted meanwhile: only focus a control that is still on the page.
+    if (id) restoreCardFocus(id, 'card-edit', { prefix: message });
+    else {
+      (trigger?.isConnected ? trigger : refreshButton).focus();
+      if (message) announce(message);
+    }
   }
 
   editCancel.addEventListener('click', () => { if (!edit.saving) closeEdit(); });
@@ -607,16 +748,6 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editAdopt.hidden = true;
     edit.serverIssue = null;
   }
-  const readEditForm = () => ({ title: editTitle.value, description: editDescription.value, status: editStatus.value });
-  const sameForm = (a, b) => a.title === b.title && a.description === b.description && a.status === b.status;
-  // The fields of `form` that differ from the saved `issue` (title compared trimmed, per contract).
-  function changesFrom(form, issue) {
-    const patch = {};
-    if (form.title.trim() !== issue.title) patch.title = form.title;
-    if (form.description !== (issue.description || '')) patch.description = form.description;
-    if (form.status !== issue.status) patch.status = form.status;
-    return patch;
-  }
   const editFields = [editTitle, editDescription, editStatus];
 
   function setEditBusy(busy, label) {
@@ -629,64 +760,72 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editForm.setAttribute('aria-busy', busy ? 'true' : 'false');
   }
 
-  // After a save with an unknown outcome, ask the API for the issue again (all
-  // statuses, no search, so filters cannot hide it) and tell the user what the
-  // server now shows. The dialog and the draft stay as they are unless the
-  // server shows every submitted change and the draft was not edited since.
+  // After a save with an unknown outcome, read the server once (all statuses,
+  // no search, so filters cannot hide the issue). The advice, the comparison,
+  // "Use server values" and the board behind the dialog all come from that one
+  // read. Fields the user did not edit take the server's values; edited fields
+  // stay as typed. The wording reports what the server showed at this check; it
+  // does not claim to know whether the original request was applied.
   async function checkEdit() {
     const pending = edit.unconfirmed;
     if (!pending || edit.saving) return;
+    const lead = `Could not confirm whether your changes were saved: ${pending.reason}`;
     setEditBusy(true, 'Checking…');
-    showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} Checking the board again…`);
-    let latest = null;
-    let checkError = null;
-    try {
-      const items = await adapter.list({});
-      latest = items.find(item => item.id === pending.id) ?? null;
-    } catch (error) {
-      checkError = error;
-    }
-    // Refresh the board behind the dialog too, so it matches what was checked.
-    await load();
+    showBox(editError, editError, `${lead} Checking the server…`);
+    const obs = await observe();
     setEditBusy(false);
     if (edit.unconfirmed !== pending || !edit.open) return;
-    const kept = 'Your changes are kept here.';
+    const kept = 'Your edits are kept here.';
     hideCompare();
-    if (checkError) {
-      showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board could not be checked either: ${describe(checkError)} ${kept} Choose Check again, or Save changes to send them again.`);
+    if (obs.error) {
+      showBox(editError, editError, `${lead} The server could not be checked either: ${describe(obs.error)} ${kept} Choose Check again, or Save changes to send only the fields you edited (${fieldList(editedFields())}).`);
       editCheck.focus();
       return;
     }
+    const latest = obs.items.find(item => item.id === pending.id) ?? null;
     if (!latest) {
-      showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} The board was checked again, but this issue was not found. ${kept} Choose Check again, or Cancel to close.`);
+      showBox(editError, editError, `${lead} When checked just now, the server did not show this issue.${boardNote(obs)} ${kept} Choose Check again, or Cancel to close.`);
       editCheck.focus();
       return;
     }
-    // Later saves are compared against what the server shows now.
-    edit.issue = latest;
-    if (matchesSubmitted(latest, pending.submitted)) {
+    // Per submitted field: does the server show the value sent, the value from
+    // before the save, or something else?
+    const sent = Object.keys(pending.submitted);
+    const shows = sent.map(field => {
+      const now = serverValue(latest, field);
+      if (sameValue(field, now, pending.submitted[field])) return { field, kind: 'sent' };
+      if (sameValue(field, now, pending.before[field])) return { field, kind: 'before' };
+      return { field, kind: 'other' };
+    });
+    const phrase = ({ field, kind }) => {
+      const name = FIELD_LABELS[field].toLowerCase();
+      if (kind === 'sent') return `the ${name} you sent`;
+      if (kind === 'before') return `the ${name} from before your save`;
+      return `a different ${name} (possibly a teammate’s change)`;
+    };
+    const phrases = shows.map(phrase);
+    const joined = phrases.length > 1 ? `${phrases.slice(0, -1).join(', ')} and ${phrases[phrases.length - 1]}` : phrases[0];
+    const observed = `When checked just now, the server showed ${joined}.${boardNote(obs)}`;
+    syncFromServer(latest);
+    if (shows.every(s => s.kind === 'sent')) {
       edit.unconfirmed = null;
       editCheck.hidden = true;
-      if (sameForm(readEditForm(), pending.form)) {
+      if (editedFields().length === 0) {
         showBox(editError, editError, '');
-        announce(`The server now shows your changes to “${latest.title}”, so nothing more needs sending.`);
-        closeEdit();
+        closeEdit({ message: `${observed} Nothing more needs sending for “${latest.title}”.` });
       } else {
-        showBox(editError, editError, `The board was checked and shows the changes you saved to “${latest.title}”. Your newer edits are still here and have not been saved.`);
+        showBox(editError, editError, `${observed} Nothing more needs sending for those fields. Your newer edits (${fieldList(editedFields())}) are still here and have not been saved.`);
         editSave.focus();
       }
       return;
     }
-    // The server shows something else. Say whether it still has the values from
-    // before this save, or different ones (possibly a teammate's change).
-    const base = pending.base;
-    const unchangedOnServer = latest.title === base.title && (latest.description || '') === (base.description || '') && latest.status === base.status;
-    const seen = unchangedOnServer
-      ? 'The server still shows the values from before this save, so the save may not have been applied.'
-      : 'The server now shows different values, which may include a teammate’s change.';
-    showBox(editError, editError, `Could not confirm whether your changes were saved: ${pending.reason} ${seen} ${kept} Choose Save changes to send your version again (it replaces what the server shows), Use server values to drop your draft, or Check again.`);
+    const edited = editedFields();
+    const next = edited.length > 0
+      ? `Save changes sends only the fields you edited (${fieldList(edited)}); fields you did not edit now show the server’s values. Use server values drops your edits, or choose Check again.`
+      : 'None of your fields differ from the server now. Choose Cancel to close, or Check again.';
+    showBox(editError, editError, `${lead} ${observed} This shows the server’s current values, not whether your request was applied. ${kept} ${next}`);
     edit.serverIssue = latest;
-    showBox(editCompare, editCompare, `Server now shows: ${issueSummary(latest)}.`);
+    showBox(editCompare, editCompare, `Server showed at this check: ${issueSummary(latest)}.`);
     editAdopt.hidden = false;
     editSave.focus();
   }
@@ -696,24 +835,20 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   editAdopt.addEventListener('click', () => {
     const latest = edit.serverIssue;
     if (!latest || edit.saving) return;
-    edit.issue = latest;
+    seedFrom(latest);
     edit.unconfirmed = null;
-    editTitle.value = latest.title;
-    editDescription.value = latest.description || '';
-    editStatus.value = latest.status;
     editCheck.hidden = true;
     hideCompare();
     showBox(editError, editError, '');
-    showBox(editNotice, editNotice, 'The form now shows the server’s values. Your draft was dropped.');
+    showBox(editNotice, editNotice, 'The form now shows the server’s values from the last check. Your edits were dropped.');
     editTitle.focus();
   });
 
   editForm.addEventListener('submit', async event => {
     event.preventDefault();
     if (edit.saving || !edit.issue) return;
-    const issue = edit.issue;
-    const form = readEditForm();
-    const patch = changesFrom(form, issue);
+    const id = edit.issue.id;
+    const patch = editPatch();
     showBox(editError, editError, '');
     showBox(editNotice, editNotice, '');
     if (Object.keys(patch).length === 0) { closeEdit(); return; }
@@ -724,6 +859,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       (errors.title ? editTitle : editDescription).focus();
       return;
     }
+    // The seeds of the submitted fields at send time, to describe a later check.
+    const before = { ...edit.seed };
     edit.unconfirmed = null;
     editCheck.hidden = true;
     hideCompare();
@@ -732,12 +869,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     let updated;
     try {
       // Only a reply for this issue that shows every submitted field counts as saved.
-      updated = confirmSaved(await adapter.update(issue.id, value), value, { id: issue.id });
+      updated = confirmSaved(await adapter.update(id, value), value, { id });
     } catch (error) {
       setEditBusy(false);
       showBox(editNotice, editNotice, '');
       if (error?.outcomeUnknown) {
-        edit.unconfirmed = { id: issue.id, submitted: value, form, base: issue, reason: describe(error) };
+        edit.unconfirmed = { id, submitted: value, before, reason: describe(error) };
         editCheck.hidden = false;
         await checkEdit();
       } else if (error?.code === 'NOT_FOUND') {
@@ -748,23 +885,22 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       }
       return;
     }
-    // The confirmed reply is the new saved baseline; later saves send only what
-    // differs from it. The dialog stays busy (fields still editable) until the
-    // board behind it has been refreshed.
-    edit.issue = updated;
+    // The confirmed reply is a server observation of this issue: untouched
+    // fields follow it, edited fields (including text typed during the request)
+    // are kept for the next explicit save. The dialog stays busy (fields still
+    // editable) until the board behind it has been refreshed.
+    syncFromServer(updated);
     setEditBusy(true, 'Refreshing…');
     showBox(editNotice, editNotice, `Saved “${updated.title}”. Refreshing the board… Anything you change now stays here.`);
     await load();
     setEditBusy(false);
     if (!edit.open || edit.issue !== updated) return;
-    const current = readEditForm();
-    if (sameForm(current, form) || Object.keys(changesFrom(current, updated)).length === 0) {
-      announce(`Saved “${updated.title}”.`);
-      closeEdit();
+    const remaining = editedFields();
+    if (remaining.length === 0) {
+      closeEdit({ message: `Saved “${updated.title}”.` });
       return;
     }
-    // Text typed while the save or the refresh was running is kept for an explicit save.
-    showBox(editNotice, editNotice, `Saved “${updated.title}”. Your newer edits are still here and have not been saved. Choose Save changes to save them.`);
+    showBox(editNotice, editNotice, `Saved “${updated.title}”. Your newer edits (${fieldList(remaining)}) are still here and have not been saved. Choose Save changes to save them.`);
     if (!editFields.includes(doc.activeElement)) editSave.focus();
   });
 
@@ -780,6 +916,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   });
   retryButton.addEventListener('click', () => load());
   refreshButton.addEventListener('click', async () => {
+    if (state.loading) return;
     await load();
     if (!state.loadError) announce(`Board refreshed. ${boardStatus.textContent}`);
   });
