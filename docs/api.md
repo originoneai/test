@@ -176,26 +176,36 @@ the server refuses it as corrupt. Backups can be made by copying the file
 while the server is stopped, or at any time — a snapshot mid-rename can never
 be torn because of the atomic write.
 
-## Integration notes for the board (TEST-UI)
+## Integration notes for the board
 
-`public/app.js` already ships `createHttpAdapter()` implementing this API:
+`public/app.js` ships `createHttpAdapter()` and the board uses it
+exclusively — there is no fixture mode and no offline fallback:
 
 - `list({status, q})`, `create({title, description})`, `update(id, patch)`
   map 1:1 to the endpoints above and verify every reply against the issue
   contract (an unconfirmable save is surfaced as `outcomeUnknown`).
-- Switching `DATA_MODE` to `'api'` and removing the fixture section is the
-  integration step owned by the UI developer; nothing on the server side
-  needs to change for it.
 - The adapter relies on: trimmed-title echo on create/update, newest-first
   lists, stable `error.code` values, and `no-store` caching. This document is
   the agreement for all four; changes go through a recorded AWR contract note
   before either side ships them.
+- After an unconfirmed save the board keeps the user's draft, re-queries the
+  server and leaves the re-send / adopt / drop decision with the user, as the
+  failure semantics above require. It never re-sends a change on its own.
+- A human-facing tour of these flows (including restart, backup and reset)
+  lives in [walkthrough.md](walkthrough.md).
 
 ## Verification
 
-- `npm test` — full suite (API, storage, scaffold, UI).
-- `test/api.test.js` includes an integration regression that boots the real
-  server and drives it through `createHttpAdapter` from `public/app.js`,
-  including a restart to prove durability.
-- `test/storage.test.js` covers the store directly: on-disk format, reload,
-  corruption refusal, write guards, serialization and failed-write recovery.
+- `npm test` — full suite (API, storage, scaffold, UI, integration).
+- `test/api.test.js` — the HTTP contract, including an integration regression
+  that boots the real server and drives it through `createHttpAdapter` from
+  `public/app.js`, with a restart proving durability, and the dropped-reply +
+  concurrent-edit interleaving that mandates refresh-and-compare recovery.
+- `test/storage.test.js` — the store directly: on-disk format, reload,
+  corruption refusal, write guards with boundary acceptance, serialization,
+  failed-write recovery.
+- `test/integration.test.js` — the documented HTTP journey and data
+  lifecycle as executable regression: a real server process started from a
+  clean data directory (health, create/edit/filter, restart persistence),
+  then backup, corrupt-store refusal without rewrite, restore, and reset to
+  empty.
