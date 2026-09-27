@@ -1791,3 +1791,170 @@ test('real server: a validation error from the API keeps the draft and names the
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Error classification: only the documented definite rejections mean "not
+// applied". INTERNAL_ERROR and any structured error the contract does not
+// list are unknown outcomes (docs/api.md, error model), so the board keeps the
+// draft, checks the server and compares, and never re-sends on its own.
+// ---------------------------------------------------------------------------
+const DEFINITE_REPLIES = [
+  ['VALIDATION_ERROR', 400], ['INVALID_JSON', 400], ['INVALID_URL', 400], ['NOT_FOUND', 404],
+  ['METHOD_NOT_ALLOWED', 405], ['PAYLOAD_TOO_LARGE', 413], ['STORAGE_ERROR', 500],
+];
+const errorReply = (status, code, message) => () => jsonResponse(status, { error: { code, message } });
+
+test('HTTP adapter: only documented definite errors mean not applied; other structured errors are unknown outcomes', async () => {
+  const unknown = [
+    ['INTERNAL_ERROR', 500], ['EDIT_CONFLICT', 409], ['SOMETHING_NEW', 400], ['RATE_LIMITED', 429],
+    ['NOT_FOUND', 500], ['STORAGE_ERROR', 503], ['VALIDATION_ERROR', 422], ['toString', 400],
+  ];
+  for (const [code, status] of [...DEFINITE_REPLIES, ...unknown]) {
+    const expectedUnknown = !DEFINITE_REPLIES.some(([c, s]) => c === code && s === status);
+    const api = createHttpAdapter({ fetchImpl: errorReply(status, code, `Server says ${code}.`) });
+    for (const [op, call] of [['create', () => api.create({ title: 'T' })], ['update', () => api.update('x', { status: 'done' })], ['list', () => api.list()]]) {
+      await assert.rejects(call(),
+        e => e instanceof ApiError && e.code === code && e.status === status && e.message === `Server says ${code}.` && e.outcomeUnknown === expectedUnknown,
+        `${op}: ${code} with ${status} should be ${expectedUnknown ? 'an unknown outcome' : 'a definite rejection'}`);
+    }
+  }
+});
+
+const UNKNOWN_STRUCTURED_REPLIES = [
+  ['INTERNAL_ERROR', errorReply(500, 'INTERNAL_ERROR', 'Unexpected server error.'), 'Unexpected server error.'],
+  ['an unrecognised structured error', errorReply(409, 'EDIT_CONFLICT', 'Someone else changed this issue.'), 'Someone else changed this issue.'],
+];
+
+for (const [name, reply, message] of UNKNOWN_STRUCTURED_REPLIES) {
+  test(`create answered with ${name} that did land: the text is kept, the server is checked, nothing is re-posted`, async () => {
+    const saved = liveIssue('ie-c1', { title: 'Printer offline', description: 'Floor 3' });
+    const { fetchImpl, calls } = scriptedFetch({
+      GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved] })],
+      POST: [reply],
+    });
+    const { root } = await mount(createHttpAdapter({ fetchImpl }));
+    byId(root, 'new-title').value = 'Printer offline';
+    byId(root, 'new-description').value = 'Floor 3';
+    byRole(root, 'create-form').dispatch('submit');
+    await flush(8);
+    assert.equal(byRole(root, 'create-error').textContent,
+      `Could not confirm whether “Printer offline” was saved: ${message} When checked just now, the server showed an issue with this title and description. The board below shows the same check. It may be yours or a teammate’s; creating it again could add a duplicate. Your text is kept.`);
+    assert.equal(byId(root, 'new-title').value, 'Printer offline');
+    assert.equal(byId(root, 'new-description').value, 'Floor 3');
+    assert.deepEqual(cardTitles(root, 'open'), ['Printer offline']);
+    assert.equal(calls.filter(c => c.method === 'GET').length, 2, 'one read of the server after the reply');
+    assert.equal(calls.filter(c => c.method === 'POST').length, 1, 'never re-posted automatically');
+  });
+
+  test(`edit answered with ${name} that did not land: the dialog keeps the draft and offers the check, nothing is re-sent`, async () => {
+    const original = liveIssue('ie-e1', { title: 'Before' });
+    const { fetchImpl, calls } = scriptedFetch({
+      GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [original] })],
+      PATCH: [reply],
+    });
+    const { root } = await mount(createHttpAdapter({ fetchImpl }));
+    allByRole(root, 'card-edit')[0].dispatch('click');
+    byId(root, 'edit-title').value = 'After';
+    byRole(root, 'edit-form').dispatch('submit');
+    await flush(8);
+    assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), true, 'the dialog stays open');
+    assert.equal(byId(root, 'edit-title').value, 'After', 'the draft is kept');
+    const text = byRole(root, 'edit-error').textContent;
+    assert.ok(text.startsWith(`Could not confirm whether your changes were saved: ${message} When checked just now, the server showed the title from before your save.`), text);
+    assert.doesNotMatch(text, /^Could not save:/, 'never presented as a definite failure');
+    assert.equal(byRole(root, 'edit-check').hidden, false);
+    assert.equal(byRole(root, 'edit-adopt').hidden, false);
+    assert.equal(byRole(root, 'edit-compare').textContent, 'Server showed at this check: title “Before”, status Open, description (empty).');
+    const gets = calls.filter(c => c.method === 'GET').map(c => c.url);
+    assert.deepEqual(gets.slice(1), ['/api/issues'], 'exactly one unfiltered check');
+    assert.equal(calls.filter(c => c.method === 'PATCH').length, 1, 'never re-sent automatically');
+  });
+
+  test(`edit answered with ${name} that did land: the check confirms it instead of calling it unsaved`, async () => {
+    const original = liveIssue('ie-e2', { title: 'Before' });
+    const applied = { ...original, title: 'After', updatedAt: '2026-09-25T01:00:00.000Z' };
+    const { fetchImpl, calls } = scriptedFetch({
+      GET: [() => jsonResponse(200, { items: [original] }), () => jsonResponse(200, { items: [applied] })],
+      PATCH: [reply],
+    });
+    const { root } = await mount(createHttpAdapter({ fetchImpl }));
+    allByRole(root, 'card-edit')[0].dispatch('click');
+    byId(root, 'edit-title').value = 'After';
+    byRole(root, 'edit-form').dispatch('submit');
+    await flush(8);
+    assert.equal(byRole(root, 'edit-dialog').hasAttribute('open'), false);
+    assert.match(byRole(root, 'announcer').textContent, /^When checked just now, the server showed the title you sent\. The board below shows the same check\. Nothing more needs sending for “After”\./);
+    assert.deepEqual(cardTitles(root, 'open'), ['After']);
+    assert.equal(calls.filter(c => c.method === 'PATCH').length, 1, 'nothing is sent twice');
+  });
+
+  test(`status change answered with ${name}: the board checks the server and says what it showed, nothing is re-sent`, async () => {
+    const landed = liveIssue('ie-m1', { title: 'Landed' });
+    const stuck = liveIssue('ie-m2', { title: 'Stuck', createdAt: '2026-09-24T00:00:00.000Z' });
+    const { fetchImpl, calls } = scriptedFetch({
+      GET: [
+        () => jsonResponse(200, { items: [landed, stuck] }),
+        () => jsonResponse(200, { items: [{ ...landed, status: 'done', updatedAt: '2026-09-25T01:00:00.000Z' }, stuck] }),
+        () => jsonResponse(200, { items: [{ ...landed, status: 'done', updatedAt: '2026-09-25T01:00:00.000Z' }, stuck] }),
+      ],
+      PATCH: [reply],
+    });
+    const { root } = await mount(createHttpAdapter({ fetchImpl }));
+    const landedSelect = byRole(allByRole(root, 'card')[0], 'card-status');
+    landedSelect.value = 'done';
+    landedSelect.dispatch('change');
+    await flush(8);
+    assert.equal(byRole(root, 'action-error-text').textContent,
+      `Could not confirm whether “Landed” moved to Done: ${message} When checked just now, the server showed it in Done. The board below shows the same check. Nothing more needs sending.`);
+    assert.deepEqual(cardTitles(root, 'done'), ['Landed']);
+
+    const stuckSelect = byRole(allByRole(byRole(root, 'list-open'), 'card')[0], 'card-status');
+    stuckSelect.value = 'done';
+    stuckSelect.dispatch('change');
+    await flush(8);
+    assert.equal(byRole(root, 'action-error-text').textContent,
+      `Could not confirm whether “Stuck” moved to Done: ${message} When checked just now, the server showed it in Open. The board below shows the same check. Choose Done again if you still want to move it.`);
+    assert.deepEqual(cardTitles(root, 'open'), ['Stuck']);
+    assert.equal(byRole(allByRole(byRole(root, 'list-open'), 'card')[0], 'card-status').value, 'open');
+    assert.equal(calls.filter(c => c.method === 'PATCH').length, 2, 'one request per user action, none repeated');
+  });
+}
+
+test('documented definite rejections still say the change was not saved, with no server check and no re-send', async () => {
+  for (const [code, status] of [['STORAGE_ERROR', 500], ['VALIDATION_ERROR', 400]]) {
+    const message = `Definite ${code}.`;
+    const original = liveIssue('def-1', { title: 'Kept' });
+    const { fetchImpl, calls } = scriptedFetch({
+      GET: [() => jsonResponse(200, { items: [original] })],
+      POST: [errorReply(status, code, message)],
+      PATCH: [errorReply(status, code, message)],
+    });
+    const { root } = await mount(createHttpAdapter({ fetchImpl }));
+
+    byId(root, 'new-title').value = 'New one';
+    byRole(root, 'create-form').dispatch('submit');
+    await flush(8);
+    assert.equal(byRole(root, 'create-error').textContent, `Could not create the issue: ${message} Your text is kept so you can try again.`, code);
+    assert.equal(byId(root, 'new-title').value, 'New one');
+
+    allByRole(root, 'card-edit')[0].dispatch('click');
+    byId(root, 'edit-title').value = 'Changed';
+    byRole(root, 'edit-form').dispatch('submit');
+    await flush(8);
+    assert.equal(byRole(root, 'edit-error').textContent, `Could not save: ${message} Your changes are kept so you can try again.`, code);
+    assert.equal(byRole(root, 'edit-check').hidden, true, `${code}: no unknown-outcome check`);
+    assert.equal(byId(root, 'edit-title').value, 'Changed');
+    byRole(root, 'edit-cancel').dispatch('click');
+
+    const select = byRole(allByRole(root, 'card')[0], 'card-status');
+    select.value = 'done';
+    select.dispatch('change');
+    await flush(8);
+    assert.equal(byRole(root, 'action-error-text').textContent, `Could not change the status of “Kept”: ${message}`, code);
+    assert.equal(select.value, 'open', `${code}: the select returns to the previous status`);
+
+    assert.equal(calls.filter(c => c.method === 'GET').length, 1, `${code}: no server check after a definite rejection`);
+    assert.equal(calls.filter(c => c.method === 'POST').length, 1);
+    assert.equal(calls.filter(c => c.method === 'PATCH').length, 2);
+  }
+});

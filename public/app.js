@@ -106,6 +106,21 @@ export function matchesSubmitted(issue, submitted) {
   return true;
 }
 
+// The error answers docs/api.md defines as definite rejections: the change was
+// not applied. Each is trusted only with its documented HTTP status. Any other
+// structured error (INTERNAL_ERROR, a code the contract does not list, or a
+// listed code with another status) leaves the outcome unknown.
+const DEFINITE_ERRORS = Object.freeze({
+  VALIDATION_ERROR: 400,
+  INVALID_JSON: 400,
+  INVALID_URL: 400,
+  NOT_FOUND: 404,
+  METHOD_NOT_ALLOWED: 405,
+  PAYLOAD_TOO_LARGE: 413,
+  STORAGE_ERROR: 500,
+});
+const isDefiniteError = (code, status) => Object.hasOwn(DEFINITE_ERRORS, code) && DEFINITE_ERRORS[code] === status;
+
 export const UNCONFIRMED_MESSAGE = 'The server’s reply does not show the values that were submitted.';
 
 /**
@@ -148,10 +163,12 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
     try { data = await res.json(); } catch { parsed = false; }
     if (!res.ok) {
       const err = parsed && data && typeof data === 'object' ? data.error : null;
-      // A contract error body is a definite answer from the API. Anything else
-      // (for example a gateway HTML page) says nothing about what happened.
+      // Only a documented definite rejection means the change was not applied.
+      // Other structured errors keep their code and message but leave the
+      // outcome unknown; anything unstructured (for example a gateway HTML
+      // page) says nothing about what happened.
       if (err && typeof err.code === 'string' && typeof err.message === 'string') {
-        throw new ApiError(err.code, err.message, res.status);
+        throw new ApiError(err.code, err.message, res.status, { outcomeUnknown: !isDefiniteError(err.code, res.status) });
       }
       throw new ApiError(`HTTP_${res.status}`, `The server answered with an unexpected error (${res.status}).`, res.status, { outcomeUnknown: true });
     }
