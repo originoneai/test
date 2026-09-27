@@ -1,6 +1,8 @@
 // Durable JSON issue store for TEST-API (specs/issue-tracker.md).
-// Single JSON file under DATA_DIR. Writes are atomic (temp file + fsync + rename)
-// and serialized in-process. A mutation commits in two phases: it first persists
+// Single JSON file under DATA_DIR. Writes are atomic (temp file + fsync + rename,
+// then a best-effort directory fsync where the platform allows it) and serialized
+// in-process. Surviving a process crash or restart is covered by tests;
+// power-loss durability is platform/filesystem-dependent and not claimed. A mutation commits in two phases: it first persists
 // a candidate snapshot, and only after that succeeds is the snapshot published
 // to memory. Readers therefore never observe data that is not durable, and a
 // failed write leaves both disk and memory at the previous committed state, so
@@ -49,6 +51,32 @@ export class StoreError extends Error {
   }
 }
 
+// The writer side of the record contract enforced by #parseStore: whatever
+// this class persists must reload cleanly, so both mutation entry points
+// validate exactly what the loader will later refuse. The API layer already
+// validates; these guards keep a direct caller from bricking the store.
+function writeGuard(detail) {
+  return new StoreError(`Cannot write the issue store: ${detail}`);
+}
+
+function guardTitle(title) {
+  if (typeof title !== 'string' || title !== title.trim() || title.trim().length < 1 || title.length > TITLE_MAX) {
+    throw writeGuard(`title must be a trimmed string of 1-${TITLE_MAX} characters.`);
+  }
+}
+
+function guardDescription(description) {
+  if (typeof description !== 'string' || description.length > DESCRIPTION_MAX) {
+    throw writeGuard(`description must be a string of at most ${DESCRIPTION_MAX} characters.`);
+  }
+}
+
+function guardStatus(status) {
+  if (typeof status !== 'string' || !ISSUE_STATUSES.has(status)) {
+    throw writeGuard('status must be one of: open, in_progress, done.');
+  }
+}
+
 export class IssueStore {
   constructor(dataDir = process.env.DATA_DIR || DEFAULT_DATA_DIR) {
     this.dataDir = resolve(dataDir);
@@ -78,6 +106,9 @@ export class IssueStore {
   async create({ title, description = '', status = 'open' }) {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
+      guardTitle(title);
+      guardDescription(description);
+      guardStatus(status);
       const now = new Date().toISOString();
       const issue = { id: randomUUID(), title, description, status, createdAt: now, updatedAt: now };
       const candidate = [...this.issues, issue];
@@ -90,6 +121,15 @@ export class IssueStore {
   async update(id, patch) {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
+      const keys = Object.keys(patch);
+      // id/createdAt/updatedAt are server-owned; patching them or writing
+      // non-contract values would produce a record the loader refuses.
+      if (keys.length === 0 || keys.some((key) => key !== 'title' && key !== 'description' && key !== 'status')) {
+        throw writeGuard('only title, description and status are patchable.');
+      }
+      if ('title' in patch) guardTitle(patch.title);
+      if ('description' in patch) guardDescription(patch.description);
+      if ('status' in patch) guardStatus(patch.status);
       const index = this.issues.findIndex((candidate) => candidate.id === id);
       if (index === -1) return null;
       const updated = { ...this.issues[index], ...patch, updatedAt: new Date().toISOString() };
@@ -217,6 +257,21 @@ export class IssueStore {
     } catch (err) {
       await unlink(tmpPath).catch(() => {});
       throw new StoreError(`Cannot persist issue store ${this.storePath}: ${err.message}`);
+    }
+    // Past this point the rename has landed, so the mutation is committed on
+    // disk and must not be reported as failed. The directory fsync is an
+    // additional best-effort durability measure where the platform supports
+    // it — not a power-loss guarantee. Platforms that refuse it only lose
+    // this extra measure, which is logged, never fatal.
+    try {
+      const dirHandle = await open(this.dataDir, 'r');
+      try {
+        await dirHandle.sync();
+      } finally {
+        await dirHandle.close();
+      }
+    } catch (err) {
+      console.error(`[issue-store] directory fsync after rename failed for ${this.storePath}: ${err.message}`);
     }
   }
 }
