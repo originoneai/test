@@ -28,13 +28,16 @@ npm test
 `npm test` runs five suites: API, storage, scaffold, UI, integration. A clean
 checkout must pass all of them before you change anything.
 
-**Shell requirements.** The shell snippets in this document assume a POSIX
-shell (`sh`/`bash`) with the common utilities `cp`, `mv`, `mktemp`, `rm`,
-`rmdir`, `wc`, `ls` and `mkdir` (`mktemp` is a common utility, not a POSIX
-standard one). The snippets have not been verified on native Windows
-(CMD/PowerShell) or Git Bash. `npm test` runs on Node and covers the same
-behavior semantically on the platforms it is run on; the literal snippets are
-executed by the test suite only where a POSIX shell is available.
+**Shell and tooling requirements.** Running the application needs only
+Node.js 20 or newer — no npm dependencies (that statement is about npm
+packages, not about your operating system's tools). The **full `npm test`
+suite**, however, invokes a POSIX `sh` unconditionally, with no automatic
+fallback or skip: running it requires a POSIX shell and the utilities
+`cp`, `mv`, `mktemp`, `rm`, `rmdir`, `wc`, `ls` and `mkdir` (`mktemp` is a
+common utility, not a POSIX standard one). The walkthrough's command
+examples additionally use `curl`. Native Windows (CMD/PowerShell) and Git
+Bash have not been verified for either the shell snippets or the full test
+suite.
 
 ## 2. Start the tracker
 
@@ -331,8 +334,10 @@ Or, if you would rather start empty, use the reset procedure in section 6.
 - How to contribute (humans and agents), review gates and evidence rules:
   [CONTRIBUTING.md](../CONTRIBUTING.md).
 - The HTTP journey and data lifecycle of this document, as executable
-  semantic regression (`node --test test/integration.test.js`; the backup and
-  restore shell blocks themselves are executed verbatim by a targeted test).
-  Automated UI behavior lives in `test/ui.test.js` (fake DOM, some
-  real-server adapter cases); the browser walkthrough itself is a separate
+  semantic regression (`node --test test/integration.test.js`); the
+  documented backup, restore and reset shell blocks themselves are executed
+  verbatim by targeted tests, with `npm start` stubbed so no real server is
+  launched by those snippets. Automated UI behavior lives in
+  `test/ui.test.js` (fake DOM, some real-server adapter cases); the browser
+  walkthrough itself is a separate
   activity, Agent-operated so far and not independent human verification.

@@ -271,13 +271,17 @@ test('data lifecycle: backup, corrupt store refused untouched, restore, reset', 
 });
 
 // ---------------------------------------------------------------------------
-// The documented shell blocks, executed verbatim. The backup (§5) and
-// restore (§7) blocks are extracted from docs/walkthrough.md and run exactly
-// as printed, so the snippets cannot drift from tested behavior. These
-// regressions exist because the review round found the exact defect family
-// they cover: a zero-byte "backup" left behind when there is nothing to back
-// up or the copy fails, and a restore that could truncate the live store.
-// Deterministic copy failures are injected through a PATH shim (partial
+// The documented shell blocks, executed verbatim. The backup (§5), restore
+// (§7) and reset (§6) blocks are extracted from docs/walkthrough.md and run
+// exactly as printed, so the snippets cannot drift from tested behavior;
+// `npm start` inside them is stubbed through PATH, so no real server is
+// launched by these snippets (the journey/lifecycle tests above, by
+// contrast, boot real `node src/server.js` child processes). These
+// regressions exist because review found the exact defect family they cover:
+// a zero-byte "backup" left behind when there is nothing to back up or the
+// copy fails, a restore that could truncate the live store or lose the bytes
+// it replaced, and a reset that could leave empty archive debris.
+// Deterministic copy/move failures are injected through PATH shims (partial
 // write, then nonzero exit), so every case runs for any user, root included.
 // ---------------------------------------------------------------------------
 

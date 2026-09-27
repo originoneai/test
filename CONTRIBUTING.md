@@ -31,7 +31,11 @@ node --test test/ui.test.js         # board (fake DOM)
 node --test test/integration.test.js  # walkthrough journey + data lifecycle
 ```
 
-Node.js 20+ only, zero dependencies. CI runs the same command.
+Node.js 20+ and zero npm dependencies run the application itself. The full
+`npm test` suite additionally requires a POSIX shell (`sh`) and common shell
+utilities — it invokes `sh` unconditionally, with no fallback or skip; it is
+unverified on native Windows and Git Bash. CI runs the same command on a
+POSIX environment.
 
 ## For human contributors
 
