@@ -14,8 +14,9 @@ import { randomUUID } from 'node:crypto';
 
 const DEFAULT_DATA_DIR = '.data';
 const STORE_FILENAME = 'issues.json';
-const ISSUE_FIELDS = ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']; // exact, sorted
+const ISSUE_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // exact, sorted
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
+const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -77,6 +78,12 @@ function guardStatus(status) {
   }
 }
 
+function guardPriority(priority) {
+  if (typeof priority !== 'string' || !ISSUE_PRIORITIES.has(priority)) {
+    throw writeGuard('priority must be one of: low, normal, high, urgent.');
+  }
+}
+
 export class IssueStore {
   constructor(dataDir = process.env.DATA_DIR || DEFAULT_DATA_DIR) {
     this.dataDir = resolve(dataDir);
@@ -88,10 +95,11 @@ export class IssueStore {
     this.tmpCounter = 0;
   }
 
-  async list({ status, query } = {}) {
+  async list({ status, priority, query } = {}) {
     await this.#ensureLoaded();
     let items = this.issues.slice().reverse(); // newest first: array is kept in creation order
     if (status) items = items.filter((issue) => issue.status === status);
+    if (priority) items = items.filter((issue) => issue.priority === priority);
     if (query) {
       const needle = query.toLowerCase();
       items = items.filter(
@@ -103,14 +111,15 @@ export class IssueStore {
     return items.map((issue) => ({ ...issue }));
   }
 
-  async create({ title, description = '', status = 'open' }) {
+  async create({ title, description = '', status = 'open', priority = 'normal' }) {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
       guardTitle(title);
       guardDescription(description);
       guardStatus(status);
+      guardPriority(priority);
       const now = new Date().toISOString();
-      const issue = { id: randomUUID(), title, description, status, createdAt: now, updatedAt: now };
+      const issue = { id: randomUUID(), title, description, status, priority, createdAt: now, updatedAt: now };
       const candidate = [...this.issues, issue];
       await this.#persist(candidate);
       this.issues = candidate;
@@ -124,12 +133,13 @@ export class IssueStore {
       const keys = Object.keys(patch);
       // id/createdAt/updatedAt are server-owned; patching them or writing
       // non-contract values would produce a record the loader refuses.
-      if (keys.length === 0 || keys.some((key) => key !== 'title' && key !== 'description' && key !== 'status')) {
-        throw writeGuard('only title, description and status are patchable.');
+      if (keys.length === 0 || keys.some((key) => key !== 'title' && key !== 'description' && key !== 'status' && key !== 'priority')) {
+        throw writeGuard('only title, description, status and priority are patchable.');
       }
       if ('title' in patch) guardTitle(patch.title);
       if ('description' in patch) guardDescription(patch.description);
       if ('status' in patch) guardStatus(patch.status);
+      if ('priority' in patch) guardPriority(patch.priority);
       const index = this.issues.findIndex((candidate) => candidate.id === id);
       if (index === -1) return null;
       const updated = { ...this.issues[index], ...patch, updatedAt: new Date().toISOString() };
@@ -225,6 +235,9 @@ export class IssueStore {
       }
       if (!ISSUE_STATUSES.has(issue.status)) {
         throw refuse(`item ${index} status "${issue.status}" is not one of: open, in_progress, done.`);
+      }
+      if (!ISSUE_PRIORITIES.has(issue.priority)) {
+        throw refuse(`item ${index} priority "${issue.priority}" is not one of: low, normal, high, urgent.`);
       }
       if (!isValidIsoUtc(issue.createdAt) || !isValidIsoUtc(issue.updatedAt)) {
         throw refuse(`item ${index} createdAt/updatedAt must be valid ISO UTC timestamps.`);
