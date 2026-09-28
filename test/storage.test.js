@@ -46,9 +46,11 @@ test('create persists a contract-shaped file and list reads newest first', async
     for (const issue of stored.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt'],
+        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
       );
     }
+    assert.equal(stored.issues[0].priority, 'normal', 'omitted priority persists as the default');
+    assert.equal(stored.issues[1].priority, 'normal');
     assert.deepEqual(await readdir(dir), ['issues.json'], 'no temp files remain');
   });
 });
@@ -93,6 +95,7 @@ test('corrupt store files are refused, reported and never rewritten', async () =
         title: 'Stored item',
         description: '',
         status: 'open',
+        priority: 'normal',
         createdAt: '2026-02-28T12:34:56Z',
         updatedAt: '2026-02-28T12:34:56Z',
         ...overrides,
@@ -101,6 +104,7 @@ test('corrupt store files are refused, reported and never rewritten', async () =
       ['not json', '{"issues": ['],
       ['extra top-level key', '{"issues": [], "extra": 1}'],
       ['status outside the enum', `{"issues": [${record({ status: 'closed' })}]}`],
+      ['priority outside the enum', `{"issues": [${record({ priority: 'critical' })}]}`],
       ['duplicate ids', `{"issues": [${record()}, ${record({ title: 'Copy' })}]}`],
       ['non-string field', `{"issues": [${record({ title: 7 })}]}`],
     ];
@@ -129,6 +133,7 @@ test('store-level guards reject contract-breaking writes before touching disk', 
 
     const rejections = [
       ['create with a non-contract status', () => store.create({ title: 'Bad status', status: 'closed' })],
+      ['create with a non-contract priority', () => store.create({ title: 'Bad priority', priority: 'critical' })],
       ['create with a non-string title', () => store.create({ title: 42 })],
       ['create with an untrimmed title', () => store.create({ title: ' padded ' })],
       ['create with a whitespace-only title', () => store.create({ title: '   ' })],
@@ -138,6 +143,7 @@ test('store-level guards reject contract-breaking writes before touching disk', 
       ['update patching createdAt', () => store.update(created.id, { createdAt: '2020-01-01T00:00:00Z' })],
       ['update with a non-string description', () => store.update(created.id, { description: null })],
       ['update with a non-contract status', () => store.update(created.id, { status: 'later' })],
+      ['update with a non-contract priority', () => store.update(created.id, { priority: 'whenever' })],
       ['update with an untrimmed title', () => store.update(created.id, { title: ' padded ' })],
       ['update with a 121-character title', () => store.update(created.id, { title: 'u'.repeat(121) })],
       ['update with a 4001-character description', () => store.update(created.id, { description: 'x'.repeat(4001) })],
@@ -198,6 +204,7 @@ test('concurrent first touches share a single load', async () => {
         title: 'Preloaded',
         description: '',
         status: 'open',
+        priority: 'normal',
         createdAt: '2026-01-01T00:00:00Z',
         updatedAt: '2026-01-01T00:00:00Z',
       }],

@@ -176,8 +176,8 @@ test('walkthrough journey: clean start, everyday use, restart keeps data', async
       for (const issue of beforeRestart) {
         assert.deepEqual(
           Object.keys(issue).sort(),
-          ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt'],
-          'full record shape as documented',
+          ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+          'full record shape as served',
         );
       }
     } finally {
@@ -215,7 +215,7 @@ test('data lifecycle: backup, corrupt store refused untouched, restore, reset', 
       assert.equal(originalItems.length, 1);
       assert.deepEqual(
         Object.keys(originalItems[0]).sort(),
-        ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt'],
+        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
       );
     } finally {
       await one.stop();
@@ -307,7 +307,7 @@ const issueBackups = (cwd) =>
 test('documented backup block: no fake backup on missing/empty data, unique success, clean failure', async () => {
   const block = documentedShellBlock('## 5. Backup', '## 6.', 'mktemp');
   const run = (cwd, env = process.env) => spawnSync('sh', ['-c', block], { cwd, encoding: 'utf8', env });
-  const validStore = JSON.stringify({ issues: [{ id: '11111111-1111-4111-8111-111111111111', title: 'Kept', description: '', status: 'open', createdAt: '2026-09-27T00:00:00.000Z', updatedAt: '2026-09-27T00:00:00.000Z' }] }, null, 2) + '\n';
+  const validStore = JSON.stringify({ issues: [{ id: '11111111-1111-4111-8111-111111111111', title: 'Kept', description: '', status: 'open', priority: 'normal', createdAt: '2026-09-27T00:00:00.000Z', updatedAt: '2026-09-27T00:00:00.000Z' }] }, null, 2) + '\n';
 
   // Missing store file (fresh checkout or after a reset): message only, nothing created.
   const missingRoot = await mkdtemp(join(tmpdir(), 'doc-backup-missing-'));
@@ -385,7 +385,7 @@ test('documented backup block: no fake backup on missing/empty data, unique succ
 
 test('documented restore block: verified source, atomic replace, start only on success', async () => {
   const block = documentedShellBlock('## 7. Recovery', '## Where to go next', 'RESTORE_TMP');
-  const backupBytes = JSON.stringify({ issues: [{ id: '22222222-2222-4222-8222-222222222222', title: 'From backup', description: '', status: 'done', createdAt: '2026-09-26T00:00:00.000Z', updatedAt: '2026-09-26T00:00:00.000Z' }] }, null, 2) + '\n';
+  const backupBytes = JSON.stringify({ issues: [{ id: '22222222-2222-4222-8222-222222222222', title: 'From backup', description: '', status: 'done', priority: 'normal', createdAt: '2026-09-26T00:00:00.000Z', updatedAt: '2026-09-26T00:00:00.000Z' }] }, null, 2) + '\n';
   const otherBytes = JSON.stringify({ issues: [] }, null, 2) + '\n';
 
   // `npm start` on the success path is neutralized with a PATH shim that
@@ -533,7 +533,7 @@ test('documented restore block: verified source, atomic replace, start only on s
 
 test('documented reset block: absent source, clean archive, no debris on failure', async () => {
   const block = documentedShellBlock('## 6. Reset', '## 7.', 'data-old');
-  const dataBytes = JSON.stringify({ issues: [{ id: '33333333-3333-4333-8333-333333333333', title: 'Before reset', description: '', status: 'open', createdAt: '2026-09-26T00:00:00.000Z', updatedAt: '2026-09-26T00:00:00.000Z' }] }, null, 2) + '\n';
+  const dataBytes = JSON.stringify({ issues: [{ id: '33333333-3333-4333-8333-333333333333', title: 'Before reset', description: '', status: 'open', priority: 'normal', createdAt: '2026-09-26T00:00:00.000Z', updatedAt: '2026-09-26T00:00:00.000Z' }] }, null, 2) + '\n';
 
   async function withResetRoot(run) {
     const root = await mkdtemp(join(tmpdir(), 'doc-reset-'));
