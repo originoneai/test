@@ -1,9 +1,9 @@
 // End-to-end priority journey over the real server process and the board's
 // real HTTP adapter: create with priority, filtered reads, restart
-// durability, and unknown-outcome recovery for a priority edit. The adapter
-// currently drops the priority filter and save confirmation does not compare
-// priority, so the checks describing those behaviors fail until the frontend
-// provides them; the legs the server alone determines hold today.
+// durability, and unknown-outcome recovery for a priority edit. These checks
+// state the adapter and save-confirmation behavior the board must provide; a
+// failure identifies priority forwarding or verification the board module
+// does not provide.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -16,7 +16,6 @@ import { createHttpAdapter, matchesSubmitted } from '../public/app.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = join(repoRoot, 'src/server.js');
-const NO_UI_YET = 'public/app.js has no priority support yet';
 
 // Borrow a free port, then boot the real `node src/server.js` the way a
 // contributor does (same contract as test/integration.test.js).
@@ -121,11 +120,11 @@ test('adapter journey: create with priority, filter through the adapter, restart
       assert.deepEqual(
         onlyHigh.map((issue) => issue.title),
         ['Journey high'],
-        NO_UI_YET + ': the adapter currently drops the priority filter',
+        'the adapter must forward the priority filter to the server',
       );
 
       const composed = await adapter.list({ priority: 'high', status: 'open', q: 'shared' });
-      assert.deepEqual(composed.map((issue) => issue.title), ['Journey high'], NO_UI_YET + ': priority must compose with status and q');
+      assert.deepEqual(composed.map((issue) => issue.title), ['Journey high'], 'the priority filter must compose with status and q');
     } finally {
       await one.stop();
     }
@@ -144,7 +143,7 @@ test('adapter journey: create with priority, filter through the adapter, restart
       assert.deepEqual(
         after.map((issue) => issue.id),
         [createdHigh.id],
-        NO_UI_YET + ': post-restart filtering still needs the adapter to forward priority',
+        'the adapter must forward the priority filter after a restart too',
       );
     } finally {
       await two.stop();
@@ -181,7 +180,7 @@ test('unknown-outcome priority save recovers by refresh-and-compare, never blind
       assert.equal(
         matchesSubmitted(seenAfterDrop, { priority: 'low' }),
         false,
-        NO_UI_YET + ': refresh-and-compare must distinguish priority values',
+        'refresh-and-compare must distinguish priority values',
       );
     } finally {
       await one.stop();
