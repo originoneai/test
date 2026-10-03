@@ -271,6 +271,15 @@ function recordingAdapter(issues) {
   const store = new Map(issues.map((issue) => [issue.id, { ...issue }]));
   const calls = { list: [], create: [], update: [] };
   const copy = (issue) => ({ ...issue });
+  // The store mutation without recording, so gated wrappers can record the
+  // call themselves before stalling or throwing and counts stay exact.
+  function applyUpdate(id, patch) {
+    const issue = store.get(id);
+    if (!issue) throw new Error('unknown id ' + id);
+    const next = { ...issue, ...patch, updatedAt: '2026-09-28T12:00:01.000Z' };
+    store.set(id, next);
+    return copy(next);
+  }
   return {
     mode: 'recording', calls,
     async list(filters = {}) {
@@ -297,12 +306,9 @@ function recordingAdapter(issues) {
     },
     async update(id, patch) {
       calls.update.push({ id, patch: { ...patch } });
-      const issue = store.get(id);
-      if (!issue) throw new Error('unknown id ' + id);
-      const next = { ...issue, ...patch, updatedAt: '2026-09-28T12:00:01.000Z' };
-      store.set(id, next);
-      return copy(next);
+      return applyUpdate(id, patch);
     },
+    applyUpdate,
   };
 }
 
@@ -318,14 +324,19 @@ function boardIssues() {
   ];
 }
 
-async function mountBoard({ issues = [], searchDelayMs = 0 } = {}) {
+// Mount the board against a caller-supplied adapter, so direct-card checks
+// can gate individual update/list replies while every call stays recorded.
+async function mountBoardWith(adapter, { searchDelayMs = 0 } = {}) {
   const doc = new FakeDocument();
   const root = new FakeElement(doc, 'div');
   doc.root = root;
-  const adapter = recordingAdapter(issues);
   const app = mountApp(root, { adapter, doc, searchDelayMs });
   await app.ready;
   return { doc, root, adapter, app };
+}
+
+async function mountBoard({ issues = [], searchDelayMs = 0 } = {}) {
+  return mountBoardWith(recordingAdapter(issues), { searchDelayMs });
 }
 
 test('fake-DOM select values follow platform default rules (harness sanity)', () => {
@@ -470,6 +481,278 @@ test('the mounted edit dialog seeds a priority control with the current value an
     board.adapter.calls.update[0].patch,
     { priority: 'urgent' },
     'a priority-only edit sends exactly the changed priority',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Direct card-level priority changes (first-use feedback)
+// ---------------------------------------------------------------------------
+
+// The first real use of the integrated board asked for priority changes
+// directly on the card, without opening the edit dialog. These checks pin the
+// requested behavior at the mounted surface: a per-card priority control,
+// visible pending and failed states, unknown outcomes resolved against the
+// server instead of re-sent, no duplicate mutations on retry, stale replies
+// that cannot clobber a newer change, and sensible keyboard focus when a
+// change moves the card out of the active priority filter. Controls are found
+// by contract (the four offered values), not by markup ids, so the owning UI
+// developer is free in presentation as long as the behavior holds.
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+const cardOfId = (root, id) => byRole(root, 'card').find((el) => el.getAttribute('data-issue-id') === id);
+
+const cardPriorityControl = (root, id) => {
+  const card = cardOfId(root, id);
+  return card ? prioritySelectIn(card) ?? null : null;
+};
+
+// A recording adapter whose update replies can be gated, and whose next list
+// can be armed after mounting to serve one stale snapshot. Gated update calls
+// are recorded before stalling; the intercepted stale list records itself and
+// normal lists delegate unchanged, so call counts stay exact.
+function directCardAdapter(issues, { updateGate } = {}) {
+  const inner = recordingAdapter(issues);
+  let staleReply = null;
+  return {
+    mode: 'recording',
+    calls: inner.calls,
+    armStaleList(snapshot) {
+      staleReply = { gate: deferred(), snapshot };
+      return staleReply.gate;
+    },
+    async list(filters = {}) {
+      if (staleReply) {
+        const stale = staleReply;
+        staleReply = null;
+        inner.calls.list.push({ ...filters });
+        await stale.gate.promise;
+        return stale.snapshot;
+      }
+      return inner.list(filters);
+    },
+    create: inner.create.bind(inner),
+    async update(id, patch) {
+      inner.calls.update.push({ id, patch: { ...patch } });
+      if (updateGate) await updateGate.promise;
+      return inner.applyUpdate(id, patch);
+    },
+  };
+}
+
+test('each mounted card exposes a direct priority control seeded with its current value; changing it sends a priority-only update', async () => {
+  const board = await mountBoard({ issues: boardIssues() });
+  const issue = boardIssues()[2];
+
+  const control = cardPriorityControl(board.root, issue.id);
+  assert.ok(control, 'every card offers a priority control with the four values, so triage never needs the edit dialog');
+  assertControlOptions(control, { allowAllOption: false });
+  assert.equal(control.value, issue.priority, "the card control is seeded with the issue's current priority");
+  const name = accessibleName(control, board.root);
+  assert.ok(name && /priority/i.test(name), 'the card priority control has a readable accessible name: ' + JSON.stringify(name));
+
+  control.value = 'urgent';
+  await control.dispatch('change');
+
+  assert.equal(board.adapter.calls.update.length, 1, 'changing the card control updates the issue exactly once');
+  assert.deepEqual(
+    board.adapter.calls.update[0],
+    { id: issue.id, patch: { priority: 'urgent' } },
+    'a direct card change sends exactly the changed priority',
+  );
+  const controlAfter = cardPriorityControl(board.root, issue.id);
+  assert.ok(controlAfter && controlAfter.value === 'urgent', 'the re-rendered card reflects the saved priority');
+});
+
+test('a direct card priority change is visibly pending and cannot double-send', async () => {
+  const issues = boardIssues();
+  const updateGate = deferred();
+  const adapter = directCardAdapter(issues, { updateGate });
+  const board = await mountBoardWith(adapter);
+  const issue = issues[2];
+
+  const control = cardPriorityControl(board.root, issue.id);
+  assert.ok(control, 'the card offers a direct priority control');
+  control.value = 'urgent';
+  const settling = control.dispatch('change');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(adapter.calls.update.length, 1, 'the in-flight change was recorded once');
+
+  const busyCard = cardOfId(board.root, issue.id);
+  assert.ok(
+    control.disabled === true
+      || busyCard.getAttribute('aria-busy') === 'true'
+      || /saving/i.test(busyCard.textContent),
+    'while the change is in flight the card or its control shows a pending state',
+  );
+
+  control.value = 'low';
+  await control.dispatch('change');
+  assert.equal(adapter.calls.update.length, 1, 'a second change during the pending save sends nothing');
+
+  updateGate.resolve();
+  await settling;
+  assert.equal(adapter.calls.update.length, 1, 'settling the save adds no duplicate mutation');
+  const settled = cardPriorityControl(board.root, issue.id);
+  assert.ok(settled && settled.value === 'urgent', 'the saved choice wins; the value typed during the flight never leaks in');
+});
+
+test('a definitely failed direct change reports the failure, restores the previous priority, and one retry sends exactly one new update', async () => {
+  const issues = boardIssues();
+  const inner = recordingAdapter(issues);
+  let failNext = true;
+  const adapter = {
+    mode: 'recording',
+    calls: inner.calls,
+    list: inner.list.bind(inner),
+    create: inner.create.bind(inner),
+    async update(id, patch) {
+      inner.calls.update.push({ id, patch: { ...patch } });
+      if (failNext) {
+        failNext = false;
+        throw new ApiError('VALIDATION_ERROR', 'Choose a valid priority.', 400);
+      }
+      return inner.applyUpdate(id, patch);
+    },
+  };
+  const board = await mountBoardWith(adapter);
+  const issue = issues[2];
+  const previous = issue.priority;
+
+  const control = cardPriorityControl(board.root, issue.id);
+  assert.ok(control, 'the card offers a direct priority control');
+  control.value = 'urgent';
+  await control.dispatch('change');
+  assert.equal(adapter.calls.update.length, 1, 'the failed attempt was sent once');
+
+  const failedCard = cardOfId(board.root, issue.id);
+  assert.ok(
+    /not saved|failed|error/i.test(failedCard.textContent),
+    'a definite failure is visible on the card',
+  );
+  const restored = cardPriorityControl(board.root, issue.id);
+  assert.ok(restored && restored.value === previous, 'after a definite failure the control returns to the previous priority');
+
+  const retry = cardPriorityControl(board.root, issue.id);
+  retry.value = 'urgent';
+  await retry.dispatch('change');
+  assert.equal(adapter.calls.update.length, 2, 'retrying sends exactly one more update, never a duplicate');
+  assert.deepEqual(adapter.calls.update[1].patch, { priority: 'urgent' });
+  const afterRetry = cardPriorityControl(board.root, issue.id);
+  assert.ok(afterRetry && afterRetry.value === 'urgent', 'the retried change is saved');
+});
+
+test('an unknown-outcome direct change is resolved against the server, never blindly re-sent', async () => {
+  const issues = boardIssues();
+  const inner = recordingAdapter(issues);
+  const adapter = {
+    mode: 'recording',
+    calls: inner.calls,
+    list: inner.list.bind(inner),
+    create: inner.create.bind(inner),
+    async update(id, patch) {
+      inner.calls.update.push({ id, patch: { ...patch } });
+      const error = new ApiError('INTERNAL_ERROR', 'Internal error.', 500);
+      error.outcomeUnknown = true;
+      throw error;
+    },
+  };
+  const board = await mountBoardWith(adapter);
+  const issue = issues[2];
+  const listsBefore = adapter.calls.list.length;
+
+  const control = cardPriorityControl(board.root, issue.id);
+  assert.ok(control, 'the card offers a direct priority control');
+  control.value = 'urgent';
+  await control.dispatch('change');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(adapter.calls.update.length, 1, 'an unknown outcome never triggers a blind second update');
+  assert.ok(
+    adapter.calls.list.length > listsBefore,
+    'the board checks the server to learn what actually happened',
+  );
+  const resolved = cardPriorityControl(board.root, issue.id);
+  assert.ok(resolved && resolved.value === issue.priority, 'the rendered priority follows the server truth, which the recording store never changed');
+});
+
+test('a stale list reply arriving after a saved direct change cannot clobber the saved value', async () => {
+  const issues = boardIssues();
+  const issue = issues[2];
+  const updateGate = deferred();
+  const adapter = directCardAdapter(issues, { updateGate });
+  const board = await mountBoardWith(adapter);
+
+  // Arm the stale snapshot only after mounting, so the board's initial load is
+  // never intercepted. The snapshot is a correct-shaped reply for the search
+  // below, computed from the pre-change state: exactly the matching issue with
+  // its old priority. It is stale only because the direct change settles first.
+  const staleGate = adapter.armStaleList([{ ...issue }]);
+  const toolbar = elementsOf(board.root).find((el) => el.getAttribute('role') === 'search');
+  const search = elementsOf(toolbar).find((el) => el.getAttribute('id') === 'search');
+  const listsBefore = adapter.calls.list.length;
+  search.value = 'needle';
+  await search.dispatch('input');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(adapter.calls.list.length, listsBefore + 1, 'the stalled stale load was issued exactly once');
+
+  const control = cardPriorityControl(board.root, issue.id);
+  assert.ok(control, 'the card offers a direct priority control');
+  control.value = 'urgent';
+  const settling = control.dispatch('change');
+  updateGate.resolve();
+  await settling;
+  assert.equal(adapter.calls.update.length, 1, 'the direct change was sent exactly once');
+
+  const saved = cardPriorityControl(board.root, issue.id);
+  assert.ok(saved && saved.value === 'urgent', 'the saved priority is rendered before the stale reply lands');
+
+  staleGate.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const afterStale = cardPriorityControl(board.root, issue.id);
+  assert.ok(
+    afterStale && afterStale.value === 'urgent',
+    'the older stale reply is discarded and never overwrites the newer saved state',
+  );
+});
+
+test('changing a card out of the active priority filter removes the card and keeps keyboard focus on a connected element', async () => {
+  const board = await mountBoard({ issues: boardIssues() });
+  const issue = boardIssues()[0];
+
+  const toolbar = elementsOf(board.root).find((el) => el.getAttribute('role') === 'search');
+  const filter = prioritySelectIn(toolbar);
+  assert.ok(filter, 'the toolbar priority filter is available');
+  filter.value = 'urgent';
+  await filter.dispatch('change');
+  assert.deepEqual(
+    byRole(board.root, 'card').map((el) => el.getAttribute('data-issue-id')),
+    [issue.id],
+    'only the urgent card is on the board',
+  );
+
+  const control = cardPriorityControl(board.root, issue.id);
+  assert.ok(control, 'the card offers a direct priority control');
+  control.focus();
+  assert.equal(board.doc.activeElement, control, 'a keyboard user works from the card priority control');
+
+  control.value = 'low';
+  await control.dispatch('change');
+
+  assert.ok(
+    !byRole(board.root, 'card').some((el) => el.getAttribute('data-issue-id') === issue.id),
+    'the changed card leaves the active priority filter',
+  );
+  const active = board.doc.activeElement;
+  assert.ok(active && active !== control && active.isConnected, 'focus is not left on the removed control');
+  assert.ok(
+    active === board.root || elementsOf(board.root).includes(active),
+    'focus lands on a connected element inside the board',
   );
 });
 
