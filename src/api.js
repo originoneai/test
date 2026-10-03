@@ -1,5 +1,7 @@
-// Issue API for TEST-API; implements the contract in specs/issue-tracker.md.
-// Routes: GET/POST /api/issues, PATCH /api/issues/:id; other methods get 405.
+// Issue API for TEST-API; implements the contract in specs/issue-tracker.md
+// and specs/weekly-delivery-summary.md.
+// Routes: GET/POST /api/issues, PATCH /api/issues/:id, GET /api/reports/weekly;
+// other methods get 405.
 import { IssueStore } from './store.js';
 
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
@@ -7,6 +9,16 @@ const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
 const BODY_LIMIT_BYTES = 16 * 1024;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_DAYS = 7;
+const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+// Both week boundaries are pinned to four-digit YYYY-MM-DD, so the last
+// selectable whole week starts 9999-12-20 (its exclusive end is 9999-12-27).
+// setUTCFullYear rather than Date.UTC for symmetry with parseIsoDate.
+const lastSelectableWeek = new Date(0);
+lastSelectableWeek.setUTCFullYear(9999, 11, 20);
+lastSelectableWeek.setUTCHours(0, 0, 0, 0);
+const LAST_SELECTABLE_WEEK_MS = lastSelectableWeek.getTime();
 
 let sharedStore = null;
 
@@ -142,6 +154,102 @@ function rejectUnknownFields(res, body, allowed) {
     `Unknown field(s): ${unknown.map((key) => displayValue(key)).join(', ')}. Accepted fields: ${allowed.join(', ')}.`,
   );
   return true;
+}
+
+// A real calendar date in exactly YYYY-MM-DD form, as UTC milliseconds. Date
+// parsing alone cannot be trusted: Date.UTC normalizes impossible dates
+// (Feb 30 rolls into March) instead of rejecting them, so validity is checked
+// by rebuilding the UTC calendar components and comparing them. setUTCFullYear
+// is used because Date.UTC maps two-digit years into 1900-1999.
+function parseIsoDate(value) {
+  const match = ISO_DATE_PATTERN.exec(value);
+  if (!match) return null;
+  const [year, month, day] = match.slice(1).map(Number);
+  const utc = new Date(0);
+  utc.setUTCFullYear(year, month - 1, day);
+  if (utc.getUTCFullYear() !== year || utc.getUTCMonth() !== month - 1 || utc.getUTCDate() !== day) return null;
+  return utc.getTime();
+}
+
+// Manual UTC formatting instead of toISOString: the schema pins both week
+// boundaries to four-digit YYYY-MM-DD, so the year is zero-padded to four
+// digits (getUTCFullYear alone would drop the leading zeros of 0099 or 0100).
+// Weeks whose exclusive end would need a fifth digit are rejected upstream in
+// weeklyReport, never formatted here.
+function formatIsoDate(ms) {
+  const date = new Date(ms);
+  const pad = (value, width) => String(value).padStart(width, '0');
+  return `${pad(date.getUTCFullYear(), 4)}-${pad(date.getUTCMonth() + 1, 2)}-${pad(date.getUTCDate(), 2)}`;
+}
+
+// The Monday 00:00 UTC of the week the given instant falls in. UTC has no DST,
+// so a fixed number of whole days always lands on midnight.
+function startOfUtcWeek(ms) {
+  const date = new Date(ms);
+  const midnight = new Date(0);
+  midnight.setUTCFullYear(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+  midnight.setUTCHours(0, 0, 0, 0);
+  return midnight.getTime() - ((date.getUTCDay() + 6) % 7) * DAY_MS;
+}
+
+async function weeklyReport(searchParams, res) {
+  // Exactly one optional parameter is accepted; unknown names and repeats are
+  // definite input errors, mirroring the unknown-field rule on mutations.
+  const problems = [];
+  let weekStartCount = 0;
+  for (const key of searchParams.keys()) {
+    if (key === 'weekStart') weekStartCount += 1;
+    else problems.push(`Unknown parameter(s): ${displayValue(key)}.`);
+  }
+  if (weekStartCount > 1) problems.push('weekStart must be provided at most once.');
+  if (problems.length > 0) {
+    sendError(res, 400, 'VALIDATION_ERROR', `${problems.join(' ')} Accepted parameters: weekStart.`);
+    return;
+  }
+  const provided = searchParams.get('weekStart');
+  let startMs;
+  if (provided === null) {
+    startMs = startOfUtcWeek(Date.now());
+  } else {
+    startMs = parseIsoDate(provided);
+    if (startMs === null) {
+      sendError(res, 400, 'VALIDATION_ERROR', `Invalid weekStart ${displayValue(provided)}; expected a real date as YYYY-MM-DD.`);
+      return;
+    }
+    // Impossible calendar dates were rejected above; here only the weekday can
+    // still be wrong. Midnight UTC makes getUTCDay exact.
+    if (new Date(startMs).getUTCDay() !== 1) {
+      sendError(res, 400, 'VALIDATION_ERROR', `Invalid weekStart ${displayValue(provided)}; weeks start on a Monday (UTC).`);
+      return;
+    }
+    // Both boundaries must stay four-digit YYYY-MM-DD: the last selectable
+    // whole week starts 9999-12-20; 9999-12-27 would end in year 10000.
+    if (startMs > LAST_SELECTABLE_WEEK_MS) {
+      sendError(res, 400, 'VALIDATION_ERROR', `Invalid weekStart ${displayValue(provided)}; the week must end within year 9999.`);
+      return;
+    }
+  }
+  const endMs = startMs + WEEK_DAYS * DAY_MS;
+  // Counts describe the current state of that week's intake: an issue belongs
+  // to the week its immutable createdAt falls in, but is tallied with the
+  // status and priority stored right now. updatedAt is irrelevant.
+  const items = await getStore().list();
+  const byStatus = { open: 0, in_progress: 0, done: 0 };
+  const byPriority = { low: 0, normal: 0, high: 0, urgent: 0 };
+  let total = 0;
+  for (const issue of items) {
+    const createdMs = Date.parse(issue.createdAt);
+    if (createdMs < startMs || createdMs >= endMs) continue;
+    byStatus[issue.status] += 1;
+    byPriority[issue.priority] += 1;
+    total += 1;
+  }
+  sendJson(res, 200, {
+    schemaVersion: 1,
+    weekStart: formatIsoDate(startMs),
+    weekEndExclusive: formatIsoDate(endMs),
+    created: { total, byStatus, byPriority },
+  });
 }
 
 async function listIssues(searchParams, res) {
@@ -288,6 +396,15 @@ export async function handleApi(req, res) {
       }
       res.setHeader('Allow', 'PATCH');
       sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/issues/:id.`);
+      return;
+    }
+    if (url.pathname === '/api/reports/weekly') {
+      if (req.method === 'GET') {
+        await weeklyReport(url.searchParams, res);
+        return;
+      }
+      res.setHeader('Allow', 'GET');
+      sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/reports/weekly.`);
       return;
     }
     sendError(res, 404, 'NOT_FOUND', 'Unknown API resource.');
