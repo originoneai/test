@@ -20,6 +20,7 @@ operational detail an integrating client needs.
   "title": "Fix login flow",
   "description": "Session expires too early.",
   "status": "open",
+  "priority": "normal",
   "createdAt": "2026-09-27T00:00:00.000Z",
   "updatedAt": "2026-09-27T00:00:00.000Z"
 }
@@ -31,18 +32,20 @@ operational detail an integrating client needs.
 | `title` | Required string, stored **trimmed**, 1–120 characters after trimming. |
 | `description` | Optional string, default `""`, at most 4000 characters. |
 | `status` | `open` \| `in_progress` \| `done` (case sensitive). New issues start `open`; status is not accepted on create. |
+| `priority` | `low` \| `normal` \| `high` \| `urgent` (case sensitive). New issues default `normal`. Records written before the priority field existed (exactly the legacy six-field shape) read as `normal` and are upgraded on disk only by the next successful write, never by a read. |
 | `createdAt` / `updatedAt` | ISO UTC (`Z`) instants taken from the server's wall clock. `createdAt` never changes. `updatedAt` is regenerated at each accepted update: usually later, but **not guaranteed to advance** — same-millisecond updates can tie and a clock rollback can set it earlier. Do not use it for ordering or conflict detection. |
 
-Exactly these six fields are ever returned; unknown fields in input are
+Exactly these seven fields are ever returned; unknown fields in input are
 rejected, so a client can detect its own typos.
 
 ## Endpoints
 
 ### `GET /api/issues`
 
-Query parameters (both optional, combinable):
+Query parameters (all optional, combinable):
 
 - `status` — one of `open`, `in_progress`, `done`; anything else is `400`.
+- `priority` — one of `low`, `normal`, `high`, `urgent`; anything else is `400`.
 - `q` — case-insensitive substring match on title and description.
 
 Response `200`: `{"items":[...]}`, **newest first** (reverse creation order).
@@ -50,15 +53,62 @@ Empty result sets are normal: `{"items":[]}` means "no issues match".
 
 ### `POST /api/issues`
 
-Body: `{"title": "...", "description": "..."}` (`description` optional).
+Body: `{"title": "...", "description": "...", "priority": "..."}` (`description`
+and `priority` optional; `priority` defaults to `normal`).
 Response `201` with the created issue (title echoed trimmed).
 
 ### `PATCH /api/issues/:id`
 
-Body: a **non-empty subset** of `title`, `description`, `status`. Only the
-fields you send change; omitted fields keep their values, so send just what
-the user edited (this is how concurrent edits to different fields merge).
+Body: a **non-empty subset** of `title`, `description`, `status`, `priority`. Only the
+fields you send change; omitted fields keep their values, so send just what the
+user edited (this is how concurrent edits to different fields merge).
 Response `200` with the updated issue, or `404` if the id is unknown.
+
+### `GET /api/reports/weekly`
+
+Weekly intake summary behind the board's Weekly overview section. It is a pure
+read over the same committed data: it never mutates the store, and it is
+independent of any `GET /api/issues` filter the client may hold.
+
+Query parameters — at most one, `weekStart`:
+
+- Omitted → the current UTC week (the Monday 00:00 UTC of "now").
+- `YYYY-MM-DD` — a **real calendar date** that is a **UTC Monday**, selecting
+  `[00:00 UTC, seven days later)`. Selectable whole weeks run from `0000-01-03`
+  to `9999-12-20`; a Monday whose exclusive end would fall in year 10000
+  (e.g. `9999-12-27`) is rejected.
+- Unknown parameter names, repeats, impossible dates (`2026-02-30`),
+  non-ISO forms (`2026-9-28`) and non-Mondays → `400 VALIDATION_ERROR`.
+
+Response `200` (empty-week example; all enum keys are always present, zeros
+included):
+
+```json
+{
+  "schemaVersion": 1,
+  "weekStart": "2026-09-28",
+  "weekEndExclusive": "2026-10-05",
+  "created": {
+    "total": 0,
+    "byStatus": { "open": 0, "in_progress": 0, "done": 0 },
+    "byPriority": { "low": 0, "normal": 0, "high": 0, "urgent": 0 }
+  }
+}
+```
+
+Semantics a client must rely on:
+
+- `created.total` counts exactly the issues whose immutable `createdAt` falls
+  inside `[weekStart, weekEndExclusive)`; `weekEndExclusive` itself is outside.
+- `byStatus` / `byPriority` tally those same issues with the status and
+  priority **stored right now**. Editing or re-prioritizing an issue moves it
+  between buckets on the next report read — the report is a current-state
+  snapshot of that week's intake, not a historical completion timeline.
+- `updatedAt` is not used anywhere: there is no completed-at history to
+  approximate from it.
+- On an unavailable or corrupt store the report answers `500 STORAGE_ERROR`
+  like every other endpoint and leaves the file untouched; recovery is manual
+  as described below.
 
 ### Everything else
 
@@ -204,6 +254,11 @@ exclusively — there is no fixture mode and no offline fallback:
   that boots the real server and drives it through `createHttpAdapter` from
   `public/app.js`, with a restart proving durability, and the dropped-reply +
   concurrent-edit interleaving that mandates refresh-and-compare recovery.
+- `test/weekly-report-api.test.js` — the weekly report contract: current-week
+  default, `[weekStart, weekEndExclusive)` boundaries with current
+  status/priority tallying, legacy records, validation and 405 handling,
+  low-year and upper-boundary week formatting, corrupt-store refusal without
+  rewrite, and read-only behavior next to the issue APIs.
 - `test/storage.test.js` — the store directly: on-disk format, reload,
   corruption refusal, write guards with boundary acceptance, serialization,
   failed-write recovery.
