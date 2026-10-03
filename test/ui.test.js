@@ -67,13 +67,13 @@ function createMemoryAdapter({ issues = sampleIssues(), failures = {}, now = () 
     async create(input) {
       await null;
       maybeFail('create');
-      const extra = Object.keys(input || {}).filter(k => k !== 'title' && k !== 'description');
+      const extra = Object.keys(input || {}).filter(k => k !== 'title' && k !== 'description' && k !== 'priority');
       if (extra.length) throw new ApiError('VALIDATION_ERROR', `Unknown field: ${extra[0]}.`, 400);
       const { errors, value } = validateIssueInput(input);
       const first = Object.values(errors)[0];
       if (first) throw new ApiError('VALIDATION_ERROR', first, 400);
       const stamp = now().toISOString();
-      const issue = { id: makeId(), title: value.title, description: value.description ?? '', status: 'open', createdAt: stamp, updatedAt: stamp };
+      const issue = { id: makeId(), title: value.title, description: value.description ?? '', status: 'open', priority: value.priority ?? 'normal', createdAt: stamp, updatedAt: stamp };
       store.set(issue.id, issue);
       return copy(issue);
     },
@@ -255,7 +255,7 @@ test('HTTP adapter uses the contract endpoints and surfaces error bodies', async
   const fetchImpl = async (url, init) => {
     requests.push({ url, method: init.method, body: init.body, type: init.headers['content-type'] });
     if (url.startsWith('/api/issues?')) return jsonResponse(200, { items: [liveIssue('1')] });
-    if (init.method === 'POST') return jsonResponse(201, liveIssue('2', JSON.parse(init.body)));
+    if (init.method === 'POST') return jsonResponse(201, liveIssue('2', { ...JSON.parse(init.body), priority: 'normal' }));
     if (url === '/api/issues/a%2Fb') return jsonResponse(404, { error: { code: 'NOT_FOUND', message: 'Issue not found.' } });
     if (url === '/api/issues/ok') return jsonResponse(200, liveIssue('ok', { status: 'done' }));
     return jsonResponse(500, null);
@@ -411,7 +411,7 @@ test('create form validates, shows pending state and only reports success after 
   title.value = '  Write tests  ';
   description.value = 'For the board';
   form.dispatch('submit');
-  assert.deepEqual(calls[0], { title: 'Write tests', description: 'For the board' });
+  assert.deepEqual(calls[0], { title: 'Write tests', description: 'For the board', priority: 'normal' });
   const button = byRole(root, 'create-submit');
   assert.equal(button.disabled, true);
   assert.equal(button.textContent, 'Saving…');
@@ -477,7 +477,7 @@ test('a draft typed while the previous create is saving is kept when that save s
   form.dispatch('submit');
   await flush();
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1], { title: 'Second draft', description: 'Typed while the first issue was saving' });
+  assert.deepEqual(calls[1], { title: 'Second draft', description: 'Typed while the first issue was saving', priority: 'normal' });
   assert.deepEqual(cardTitles(root, 'open'), ['Second draft', 'First issue']);
   assert.equal(title.value, '');
   assert.equal(description.value, '');
@@ -726,7 +726,7 @@ test('a well-formed empty list still shows the normal empty state', async () => 
 });
 
 test('an invalid create response is not reported as saved and keeps the input for retry', async () => {
-  const saved = liveIssue('n1', { title: 'Keep me', description: 'and me' });
+  const saved = liveIssue('n1', { title: 'Keep me', description: 'and me', priority: 'normal' });
   const { fetchImpl, calls } = scriptedFetch({
     GET: [() => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [] }), () => jsonResponse(200, { items: [saved] })],
     POST: [() => textResponse(200, GATEWAY_HTML), () => jsonResponse(201, saved)],
@@ -826,7 +826,7 @@ test('save confirmation compares the submitted fields, with the title trimmed pe
   assert.equal(matchesSubmitted(issue, { status: 'in_progress' }), true);
   assert.equal(matchesSubmitted(issue, { status: 'done' }), false, 'a stale status is not a confirmed move');
   assert.equal(matchesSubmitted(issue, { title: 'Other' }), false);
-  assert.deepEqual(expectedCreate({ title: ' New ' }), { title: 'New', description: '', status: 'open' });
+  assert.deepEqual(expectedCreate({ title: ' New ' }), { title: 'New', description: '', status: 'open', priority: 'normal' });
   assert.equal(confirmSaved(issue, { status: 'in_progress' }, { id: 'c1' }), issue);
   assert.throws(() => confirmSaved(issue, { status: 'in_progress' }, { id: 'c2' }),
     e => e.code === 'UNCONFIRMED_RESULT' && e.outcomeUnknown === true && e.message === UNCONFIRMED_MESSAGE);
@@ -841,7 +841,7 @@ test('HTTP create/update reject well-formed replies that do not show the submitt
     e => e.code === 'UNCONFIRMED_RESULT', 'different description');
   await assert.rejects(reply(liveIssue('n', { title: 'Mine', status: 'done' })).create({ title: 'Mine' }),
     e => e.code === 'UNCONFIRMED_RESULT', 'a new issue must be open');
-  assert.equal((await reply(liveIssue('n', { title: 'Mine' })).create({ title: '  Mine  ' })).title, 'Mine', 'trimmed title is confirmed');
+  assert.equal((await reply(liveIssue('n', { title: 'Mine', priority: 'normal' })).create({ title: '  Mine  ' })).title, 'Mine', 'trimmed title is confirmed');
   await assert.rejects(reply(liveIssue('n', { status: 'open' })).update('n', { status: 'done' }),
     e => e.code === 'UNCONFIRMED_RESULT' && e.outcomeUnknown === true, 'same issue, old status');
   await assert.rejects(reply(liveIssue('n', { title: 'Old' })).update('n', { title: 'New' }), e => e.code === 'UNCONFIRMED_RESULT');
@@ -886,7 +886,7 @@ test('a create reply for different content keeps the draft and is not announced'
 test('a create reply with the contract-trimmed title counts as saved', async () => {
   const { fetchImpl, calls } = scriptedFetch({
     GET: [() => jsonResponse(200, { items: [] })],
-    POST: [(url, init) => jsonResponse(201, liveIssue('t1', { title: JSON.parse(init.body).title.trim() }))],
+    POST: [(url, init) => jsonResponse(201, liveIssue('t1', { title: JSON.parse(init.body).title.trim(), priority: 'normal' }))],
   });
   const { root } = await mount(createHttpAdapter({ fetchImpl }));
   byId(root, 'new-title').value = '   Padded title   ';

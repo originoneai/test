@@ -114,6 +114,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
   margin: 0; padding: 10px 12px; border-radius: 8px;
 }
 .notice.error { background: var(--danger-bg); color: var(--danger); border: 1px solid #f5c2bd; font-weight: 600; }
+/* Recovery guidance under a load error: plain text, full width, normal weight. */
+.notice-hint { flex: 1 1 100%; margin: 0; color: var(--text); font-weight: 400; font-size: 0.9rem; overflow-wrap: anywhere; }
+.notice.info { background: var(--blue-100); color: var(--blue-900); border: 1px solid #b7c9e6; }
 .notice[hidden], [hidden] { display: none !important; }
 .board-status { margin: 0; color: var(--muted); font-size: 0.9rem; }
 .board-status.is-loading::before {
@@ -152,7 +155,30 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 .card-title { margin: 0 0 4px; font-size: 1rem; line-height: 1.35; overflow-wrap: anywhere; }
 .card-description { margin: 0 0 6px; color: var(--muted); font-size: 0.9rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .meta { margin: 0 0 8px; color: var(--muted); font-size: 0.8rem; }
+/* Priority badge: the word is always visible; colour and border only reinforce it. */
+.priority-badge {
+  display: inline-block; margin: 0 0 6px; padding: 0 10px;
+  border: 1px solid; border-radius: 999px;
+  font-size: 0.8rem; font-weight: 600; line-height: 1.7;
+}
+.priority-low { background: var(--white); border-color: #b7c9e6; color: var(--muted); }
+.priority-normal { background: var(--blue-100); border-color: #b7c9e6; color: var(--blue-900); }
+.priority-high { background: #fff4e5; border-color: #f0b46b; color: #8a4b00; }
+.priority-urgent { background: var(--danger-bg); border-color: #f5c2bd; color: var(--danger); border-width: 2px; }
 .card-actions { display: flex; gap: 8px; align-items: center; }
+/* Direct priority change on the card: label, select, save state and Retry wrap
+   onto as many lines as the card needs (390 px phones included). */
+.card-priority-row { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin: 0 0 8px; }
+.card-priority-label { font-size: 0.85rem; }
+.card-priority-row select { min-height: 36px; padding: 4px 8px; width: auto; flex: 0 1 9rem; min-width: 7rem; }
+.card-priority-row select[aria-disabled="true"] { cursor: progress; background: var(--blue-100); }
+.card-priority-state { flex: 1 1 100%; font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
+.card-priority-state:empty { display: none; }
+.card-priority-state[data-state="saving"], .card-priority-state[data-state="checking"] { color: var(--blue-900); }
+.card-priority-state[data-state="saved"] { color: #146c2e; font-weight: 600; }
+.card-priority-state[data-state="failed"], .card-priority-state[data-state="unknown"] { color: var(--danger); font-weight: 600; }
+.column h2:focus-visible, .empty:focus-visible { outline: 3px solid var(--blue-500); outline-offset: 2px; }
+.column h2:focus, .empty:focus { outline: 3px solid var(--blue-500); outline-offset: 2px; }
 .card-actions select { min-height: 36px; padding: 4px 8px; flex: 1 1 auto; width: auto; min-width: 0; }
 
 /* Dialog */
@@ -170,7 +196,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 /* Tablet and up */
 @media (min-width: 720px) {
   .app { padding: 24px; }
-  .toolbar { grid-template-columns: minmax(0, 1fr) 220px auto; align-items: end; }
+  .toolbar { grid-template-columns: minmax(0, 1fr) 180px 180px auto; align-items: end; }
 }
 
 /* Desktop */

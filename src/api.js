@@ -3,6 +3,7 @@
 import { IssueStore } from './store.js';
 
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
+const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
 const BODY_LIMIT_BYTES = 16 * 1024;
@@ -123,6 +124,14 @@ function validateStatus(value) {
   return null;
 }
 
+function validatePriority(value) {
+  if (typeof value !== 'string') return 'priority must be a string.';
+  if (!ISSUE_PRIORITIES.has(value)) {
+    return `Invalid priority ${displayValue(value)}; expected one of: low, normal, high, urgent.`;
+  }
+  return null;
+}
+
 function rejectUnknownFields(res, body, allowed) {
   const unknown = Object.keys(body).filter((key) => !allowed.includes(key));
   if (unknown.length === 0) return false;
@@ -141,8 +150,17 @@ async function listIssues(searchParams, res) {
     sendError(res, 400, 'VALIDATION_ERROR', `Invalid status filter ${displayValue(status)}; expected one of: open, in_progress, done.`);
     return;
   }
+  const priority = searchParams.get('priority');
+  if (priority !== null && !ISSUE_PRIORITIES.has(priority)) {
+    sendError(res, 400, 'VALIDATION_ERROR', `Invalid priority filter ${displayValue(priority)}; expected one of: low, normal, high, urgent.`);
+    return;
+  }
   const query = searchParams.get('q');
-  const items = await getStore().list({ status: status || undefined, query: query === null ? undefined : query });
+  const items = await getStore().list({
+    status: status || undefined,
+    priority: priority || undefined,
+    query: query === null ? undefined : query,
+  });
   sendJson(res, 200, { items });
 }
 
@@ -154,7 +172,7 @@ async function createIssue(req, res) {
     sendError(res, 400, 'VALIDATION_ERROR', 'Request body must be a JSON object.');
     return;
   }
-  if (rejectUnknownFields(res, body, ['title', 'description'])) return;
+  if (rejectUnknownFields(res, body, ['title', 'description', 'priority'])) return;
   if (!('title' in body)) {
     sendError(res, 400, 'VALIDATION_ERROR', 'title is required.');
     return;
@@ -173,7 +191,16 @@ async function createIssue(req, res) {
     }
     description = body.description;
   }
-  const issue = await getStore().create({ title: body.title.trim(), description });
+  let priority = 'normal';
+  if ('priority' in body) {
+    const priorityError = validatePriority(body.priority);
+    if (priorityError) {
+      sendError(res, 400, 'VALIDATION_ERROR', priorityError);
+      return;
+    }
+    priority = body.priority;
+  }
+  const issue = await getStore().create({ title: body.title.trim(), description, priority });
   sendJson(res, 201, issue);
 }
 
@@ -185,7 +212,7 @@ async function updateIssue(req, res, id) {
     sendError(res, 400, 'VALIDATION_ERROR', 'Request body must be a JSON object.');
     return;
   }
-  if (rejectUnknownFields(res, body, ['title', 'description', 'status'])) return;
+  if (rejectUnknownFields(res, body, ['title', 'description', 'status', 'priority'])) return;
   const patch = {};
   if ('title' in body) {
     const titleError = validateTitle(body.title);
@@ -211,8 +238,16 @@ async function updateIssue(req, res, id) {
     }
     patch.status = body.status;
   }
+  if ('priority' in body) {
+    const priorityError = validatePriority(body.priority);
+    if (priorityError) {
+      sendError(res, 400, 'VALIDATION_ERROR', priorityError);
+      return;
+    }
+    patch.priority = body.priority;
+  }
   if (Object.keys(patch).length === 0) {
-    sendError(res, 400, 'VALIDATION_ERROR', 'Provide at least one of: title, description, status.');
+    sendError(res, 400, 'VALIDATION_ERROR', 'Provide at least one of: title, description, status, priority.');
     return;
   }
   const updated = await getStore().update(id, patch);

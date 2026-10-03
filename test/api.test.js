@@ -9,8 +9,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server.js';
 import { resetApiStore } from '../src/api.js';
-// The board's real client code (read-only import: TEST-UI owns public/app.js).
-// Driving the live server through this adapter is the integration regression.
+// The board module's real client helpers, imported read-only: the adapter and
+// save-confirmation helpers are the same code the page runs against the API.
 import { ApiError, createHttpAdapter, matchesSubmitted } from '../public/app.js';
 
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -110,10 +110,11 @@ test('create returns full issue with defaults, trimmed title and ISO UTC timesta
     assert.equal(issue.title, 'Fix login flow');
     assert.equal(issue.description, 'Session expires too early.');
     assert.equal(issue.status, 'open');
+    assert.equal(issue.priority, 'normal', 'new issues default to normal priority');
     assert.match(issue.createdAt, ISO_UTC);
     assert.match(issue.updatedAt, ISO_UTC);
     assert.equal(issue.createdAt, issue.updatedAt);
-    assert.deepEqual(Object.keys(issue).sort(), ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']);
+    assert.deepEqual(Object.keys(issue).sort(), ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']);
     const listed = await tracker.list();
     assert.equal(listed.body.items.length, 1);
     assert.deepEqual(listed.body.items[0], issue);
@@ -164,7 +165,9 @@ test('create rejects invalid fields, unknown fields and invalid JSON', async () 
       [{ title: 'ok', description: 7 }, 'non-string description'],
       [{ title: 'ok', description: 'd'.repeat(4001) }, 'description over 4000 characters'],
       [{ title: 'ok', status: 'open' }, 'status not accepted on create'],
-      [{ title: 'ok', priority: 'high' }, 'unknown field'],
+      [{ title: 'ok', priority: 'critical' }, 'invalid priority'],
+      [{ title: 'ok', priority: 'HIGH' }, 'priority is case sensitive'],
+      [{ title: 'ok', assignee: 'zoe' }, 'unknown field (assignee is not part of the contract)'],
     ];
     for (const [payload, label] of cases) {
       const response = await tracker.request('/api/issues', {
@@ -405,6 +408,7 @@ test('a corrupt store fails visibly and is never overwritten', async () => {
       title: 'Stored item',
       description: 'kept text',
       status: 'open',
+      priority: 'normal',
       createdAt: '2026-02-28T12:34:56Z',
       updatedAt: '2026-02-28T12:34:56.000Z',
       ...overrides,
@@ -420,12 +424,13 @@ test('a corrupt store fails visibly and is never overwritten', async () => {
     ['untrimmed title', `{"issues": [${record({ title: ' padded ' })}]}`],
     ['description over 4000 characters', `{"issues": [${record({ description: 'd'.repeat(4001) })}]}`],
     ['status outside the enum', `{"issues": [${record({ status: 'closed' })}]}`],
+    ['priority outside the enum', `{"issues": [${record({ priority: 'critical' })}]}`],
     ['non-utc timestamp form', `{"issues": [${record({ createdAt: '2026-02-28T12:34:56+00:00' })}]}`],
     ['impossible date without milliseconds', `{"issues": [${record({ createdAt: '2026-02-30T00:00:00Z' })}]}`],
     ['impossible date with milliseconds', `{"issues": [${record({ updatedAt: '2026-02-30T00:00:00.000Z' })}]}`],
     ['impossible time', `{"issues": [${record({ createdAt: '2026-02-28T25:00:00Z' })}]}`],
     ['relative timestamp text', `{"issues": [${record({ createdAt: 'yesterday' })}]}`],
-    ['unknown record field', `{"issues": [${record({ priority: 'high' })}]}`],
+    ['unknown record field', `{"issues": [${record({ assignee: 'zoe' })}]}`],
     ['missing record field', '{"issues": [{"id": "11111111-1111-4111-8111-111111111111", "title": "Stored item", "description": "kept text", "status": "open", "createdAt": "2026-02-28T12:34:56Z"}]}'],
   ];
   const loggedErrors = [];
@@ -466,6 +471,12 @@ test('a corrupt store fails visibly and is never overwritten', async () => {
   );
 });
 
+// Six-field records were written before the priority field existed. Legacy
+// support shows such records as priority 'normal', never rewrites the file on
+// reads, and upgrades it atomically on the next successful mutation, with the
+// upgrade retained across restarts. Dedicated migration coverage lives in
+// test/priority-store.test.js, test/priority-api.test.js and
+// test/priority-ui.test.js.
 test('a store file with valid legacy records stays fully usable', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'issue-api-'));
   const storePath = join(dataDir, 'issues.json');
@@ -523,10 +534,18 @@ test('a store file with valid legacy records stays fully usable', async () => {
       );
       const stored = JSON.parse(await readFile(storePath, 'utf8'));
       assert.equal(stored.issues.length, 3);
-      assert.deepEqual(
-        Object.keys(stored.issues[2]).sort(),
-        ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt'],
-      );
+      // With legacy support, a successful mutation persists every record in
+      // the seven-field shape and the two legacy records read back as
+      // 'normal'; before that support exists the test fails earlier, at the
+      // list above.
+      for (const issue of stored.issues) {
+        assert.deepEqual(
+          Object.keys(issue).sort(),
+          ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+        );
+      }
+      assert.equal(stored.issues[0].priority, 'normal', 'legacy records upgrade to normal');
+      assert.equal(stored.issues[1].priority, 'normal', 'untouched legacy records upgrade on the same write');
     } finally {
       await tracker.stop();
     }

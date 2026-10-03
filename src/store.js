@@ -7,15 +7,20 @@
 // to memory. Readers therefore never observe data that is not durable, and a
 // failed write leaves both disk and memory at the previous committed state, so
 // nothing uncommitted can ride along with a later successful write.
-// A corrupt store file is reported, never rewritten.
+// A corrupt store file is reported, never rewritten. Pre-priority records
+// (exactly the legacy six fields) are valid legacy data: they read as
+// 'normal' and are upgraded on disk only by the next successful write,
+// never by a read.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const DEFAULT_DATA_DIR = '.data';
 const STORE_FILENAME = 'issues.json';
-const ISSUE_FIELDS = ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']; // exact, sorted
+const ISSUE_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // exact, sorted
+const LEGACY_ISSUE_FIELDS = ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']; // pre-priority shape, exact, sorted
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
+const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -77,6 +82,12 @@ function guardStatus(status) {
   }
 }
 
+function guardPriority(priority) {
+  if (typeof priority !== 'string' || !ISSUE_PRIORITIES.has(priority)) {
+    throw writeGuard('priority must be one of: low, normal, high, urgent.');
+  }
+}
+
 export class IssueStore {
   constructor(dataDir = process.env.DATA_DIR || DEFAULT_DATA_DIR) {
     this.dataDir = resolve(dataDir);
@@ -88,10 +99,11 @@ export class IssueStore {
     this.tmpCounter = 0;
   }
 
-  async list({ status, query } = {}) {
+  async list({ status, priority, query } = {}) {
     await this.#ensureLoaded();
     let items = this.issues.slice().reverse(); // newest first: array is kept in creation order
     if (status) items = items.filter((issue) => issue.status === status);
+    if (priority) items = items.filter((issue) => issue.priority === priority);
     if (query) {
       const needle = query.toLowerCase();
       items = items.filter(
@@ -103,14 +115,15 @@ export class IssueStore {
     return items.map((issue) => ({ ...issue }));
   }
 
-  async create({ title, description = '', status = 'open' }) {
+  async create({ title, description = '', status = 'open', priority = 'normal' }) {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
       guardTitle(title);
       guardDescription(description);
       guardStatus(status);
+      guardPriority(priority);
       const now = new Date().toISOString();
-      const issue = { id: randomUUID(), title, description, status, createdAt: now, updatedAt: now };
+      const issue = { id: randomUUID(), title, description, status, priority, createdAt: now, updatedAt: now };
       const candidate = [...this.issues, issue];
       await this.#persist(candidate);
       this.issues = candidate;
@@ -124,12 +137,13 @@ export class IssueStore {
       const keys = Object.keys(patch);
       // id/createdAt/updatedAt are server-owned; patching them or writing
       // non-contract values would produce a record the loader refuses.
-      if (keys.length === 0 || keys.some((key) => key !== 'title' && key !== 'description' && key !== 'status')) {
-        throw writeGuard('only title, description and status are patchable.');
+      if (keys.length === 0 || keys.some((key) => key !== 'title' && key !== 'description' && key !== 'status' && key !== 'priority')) {
+        throw writeGuard('only title, description, status and priority are patchable.');
       }
       if ('title' in patch) guardTitle(patch.title);
       if ('description' in patch) guardDescription(patch.description);
       if ('status' in patch) guardStatus(patch.status);
+      if ('priority' in patch) guardPriority(patch.priority);
       const index = this.issues.findIndex((candidate) => candidate.id === id);
       if (index === -1) return null;
       const updated = { ...this.issues[index], ...patch, updatedAt: new Date().toISOString() };
@@ -173,8 +187,9 @@ export class IssueStore {
     this.issues = this.#parseStore(raw);
   }
 
-  // A store file is only trusted when every record matches the data contract;
-  // anything else is corruption: it is reported and the file is kept as-is, so
+  // A store file is only trusted when every record matches the data contract
+  // or the exact pre-priority legacy shape (no priority field); anything else
+  // is corruption: it is reported and the file is kept as-is, so
   // neither reads nor later successful writes can launder it. Timestamps are
   // not compared against each other: the writer does not guarantee a monotonic
   // clock, and a system clock rollback must not invalidate real data.
@@ -196,14 +211,19 @@ export class IssueStore {
       throw refuse('expected exactly one top-level field "issues" holding an array');
     }
     const seenIds = new Set();
+    const issues = [];
     for (const [index, issue] of parsed.issues.entries()) {
       if (issue === null || typeof issue !== 'object' || Array.isArray(issue)) {
         throw refuse(`item ${index} is not an issue object.`);
       }
       const keys = Object.keys(issue).sort();
-      if (keys.join(',') !== ISSUE_FIELDS.join(',')) {
+      const keyList = keys.join(',');
+      // The only tolerated deviation from the full contract is the exact
+      // pre-priority shape: records written before the priority field existed.
+      const legacy = keyList === LEGACY_ISSUE_FIELDS.join(',');
+      if (!legacy && keyList !== ISSUE_FIELDS.join(',')) {
         throw refuse(
-          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
+          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')} or the legacy fields ${LEGACY_ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
         );
       }
       if (Object.values(issue).some((value) => typeof value !== 'string')) {
@@ -226,11 +246,18 @@ export class IssueStore {
       if (!ISSUE_STATUSES.has(issue.status)) {
         throw refuse(`item ${index} status "${issue.status}" is not one of: open, in_progress, done.`);
       }
+      if (!legacy && !ISSUE_PRIORITIES.has(issue.priority)) {
+        throw refuse(`item ${index} priority "${issue.priority}" is not one of: low, normal, high, urgent.`);
+      }
       if (!isValidIsoUtc(issue.createdAt) || !isValidIsoUtc(issue.updatedAt)) {
         throw refuse(`item ${index} createdAt/updatedAt must be valid ISO UTC timestamps.`);
       }
+      // Legacy records are upgraded in memory only: reads never touch the
+      // file, and the next successful mutation persists the whole snapshot,
+      // upgrading every legacy record in one atomic write.
+      issues.push(legacy ? { ...issue, priority: 'normal' } : issue);
     }
-    return parsed.issues;
+    return issues;
   }
 
   #enqueue(operation) {

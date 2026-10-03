@@ -6,8 +6,8 @@
 // no offline fallback: if the API cannot be reached, the board says so.
 //
 // The adapter interface follows docs/api.md:
-//   list({ status, q }) -> Promise<Issue[]>          (GET   /api/issues)
-//   create({ title, description }) -> Promise<Issue> (POST  /api/issues)
+//   list({ status, priority, q }) -> Promise<Issue[]>          (GET   /api/issues)
+//   create({ title, description, priority }) -> Promise<Issue> (POST  /api/issues)
 //   update(id, patch) -> Promise<Issue>              (PATCH /api/issues/:id)
 // Failures reject with ApiError { code, message, status, outcomeUnknown }.
 // outcomeUnknown is true when no trustworthy answer came back (the connection
@@ -22,6 +22,21 @@
 
 export const STATUSES = ['open', 'in_progress', 'done'];
 export const STATUS_LABELS = { open: 'Open', in_progress: 'In progress', done: 'Done' };
+// Issue priority (specs/sim-ws-biz-01-priority-triage.md): exactly these four
+// values, lowest first; a new issue defaults to normal.
+export const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+export const PRIORITY_LABELS = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
+export const DEFAULT_PRIORITY = 'normal';
+
+/**
+ * The priority the board shows and filters by. A record saved before priority
+ * existed carries no priority field; it is treated as Normal on screen only.
+ * The board never writes that value back on its own: a record is changed on
+ * the server only by a save the user makes.
+ */
+export function effectivePriority(issue) {
+  return issue && PRIORITIES.includes(issue.priority) ? issue.priority : DEFAULT_PRIORITY;
+}
 export const TITLE_MAX = 120;
 export const DESCRIPTION_MAX = 4000;
 
@@ -39,7 +54,7 @@ export class ApiError extends Error {
 // Pure helpers (shared by the UI and both adapters)
 // ---------------------------------------------------------------------------
 
-const ALLOWED_FIELDS = ['title', 'description', 'status'];
+const ALLOWED_FIELDS = ['title', 'description', 'status', 'priority'];
 
 /**
  * Validate create/edit input against the product contract.
@@ -70,6 +85,10 @@ export function validateIssueInput(input, { partial = false } = {}) {
     if (!STATUSES.includes(input.status)) errors.status = 'Choose a valid status.';
     else value.status = input.status;
   }
+  if ('priority' in input) {
+    if (!PRIORITIES.includes(input.priority)) errors.priority = 'Choose a valid priority.';
+    else value.priority = input.priority;
+  }
   if (partial && Object.keys(input).length === 0) errors.form = 'Nothing to update.';
   return { errors, value };
 }
@@ -82,10 +101,16 @@ export function groupByStatus(issues) {
 
 const isIsoTime = value => typeof value === 'string' && value !== '' && !Number.isNaN(Date.parse(value));
 
-/** True when `value` has the issue shape from specs/issue-tracker.md. */
+/**
+ * True when `value` has the issue shape from specs/issue-tracker.md. A priority,
+ * when the record carries one, must be one of PRIORITIES. A record without the
+ * field (saved before priority existed) stays readable; it is shown as Normal
+ * (effectivePriority) and can never confirm a save that sent a priority.
+ */
 export function isValidIssue(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const { id, title, description, status, createdAt, updatedAt } = value;
+  if ('priority' in value && !PRIORITIES.includes(value.priority)) return false;
   return typeof id === 'string' && id !== ''
     && typeof title === 'string' && title.trim().length >= 1 && title.trim().length <= TITLE_MAX
     && typeof description === 'string' && description.length <= DESCRIPTION_MAX
@@ -103,6 +128,7 @@ export function matchesSubmitted(issue, submitted) {
   if ('title' in submitted && issue.title !== String(submitted.title).trim()) return false;
   if ('description' in submitted && issue.description !== submitted.description) return false;
   if ('status' in submitted && issue.status !== submitted.status) return false;
+  if ('priority' in submitted && issue.priority !== submitted.priority) return false;
   return true;
 }
 
@@ -135,9 +161,14 @@ export function confirmSaved(issue, submitted, { id, status = 0 } = {}) {
   return issue;
 }
 
-/** The fields a created issue must show: the submitted text and the defaults. */
+/** The fields a created issue must show: the submitted values and the defaults. */
 export function expectedCreate(input) {
-  return { title: String(input.title).trim(), description: input.description ?? '', status: 'open' };
+  return {
+    title: String(input.title).trim(),
+    description: input.description ?? '',
+    status: 'open',
+    priority: input.priority ?? DEFAULT_PRIORITY,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +213,10 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
   }
   return {
     mode: 'api',
-    async list({ status = '', q = '' } = {}) {
+    async list({ status = '', priority = '', q = '' } = {}) {
       const params = new URLSearchParams();
       if (status) params.set('status', status);
+      if (priority) params.set('priority', priority);
       if (q) params.set('q', q);
       const query = params.toString();
       const { data, status: code } = await request('GET', '/api/issues' + (query ? '?' + query : ''));
@@ -228,6 +260,32 @@ function statusSelect(doc, id, { includeAll = false } = {}) {
   return select;
 }
 
+function prioritySelect(doc, id, { includeAll = false } = {}) {
+  const select = h(doc, 'select', { id });
+  if (includeAll) select.append(h(doc, 'option', { value: '', text: 'All priorities' }));
+  for (const priority of PRIORITIES) {
+    select.append(h(doc, 'option', {
+      value: priority, text: PRIORITY_LABELS[priority],
+      selected: !includeAll && priority === DEFAULT_PRIORITY,
+    }));
+  }
+  if (!includeAll) select.value = DEFAULT_PRIORITY;
+  return select;
+}
+
+// The server answers 500 STORAGE_ERROR when its saved issues cannot be read or
+// written (docs/api.md: the store is corrupt or unavailable; it is never
+// rewritten). On a load, that is a data problem the user cannot fix from the
+// board, so the board explains it and how it is recovered.
+function isStorageProblem(error) {
+  return Boolean(error && error.code === 'STORAGE_ERROR' && error.status === 500);
+}
+export const STORAGE_HINT = 'The server could not read its saved issues. The data file may be damaged '
+  + '(for example after a hand edit) or storage may be unavailable. Nothing was changed or deleted: '
+  + 'the server never rewrites a file it cannot read. To recover, ask whoever runs this server to check '
+  + 'its log for the problem it found, keep a copy of the data file (issues.json), then fix it or put back '
+  + 'a good backup and restart the server. Then choose Retry.';
+
 function describe(error) {
   if (error && typeof error.message === 'string' && error.message) return error.message;
   return 'Something went wrong.';
@@ -245,14 +303,22 @@ function formatTime(iso) {
  */
 export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayMs = 200 } = {}) {
   if (!adapter) throw new Error('mountApp requires an adapter');
-  const state = { issues: [], filters: { status: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
+  const state = { issues: [], filters: { status: '', priority: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
   // Controls of the cards on screen, per issue id, and each column's order, so
   // focus can go back to a control that is still on the page after a render.
-  const cardControls = new Map(); // id -> { edit, select, title }
+  const cardControls = new Map(); // id -> { edit, select, priority, title }
   const columnIds = Object.fromEntries(STATUSES.map(s => [s, []]));
   // Last position of every issue that has been shown: { status, index, title }.
   // Kept after the card is gone so focus can move to its neighbour.
   const lastSeen = new Map();
+  // Direct priority changes made on a card, per issue id. Kept across renders
+  // so a card that is re-rendered (by a search, a filter or a refresh) still
+  // shows its saving, saved, failed or unconfirmed state.
+  //   { state: 'saving' | 'checking' | 'saved' | 'failed' | 'unknown',
+  //     target, previous, title, message }
+  const prioritySaves = new Map();
+  // Where focus went when a focused card priority control left the board.
+  let priorityFocusMove = null; // { id, description }
   let searchTimer = null;
 
   // --- header -------------------------------------------------------------
@@ -272,6 +338,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const newTitleError = h(doc, 'p', { id: 'new-title-error', class: 'field-error', 'data-role': 'new-title-error', hidden: true });
   const newDescription = h(doc, 'textarea', { id: 'new-description', name: 'description', rows: '3', 'aria-describedby': 'new-description-error' });
   const newDescriptionError = h(doc, 'p', { id: 'new-description-error', class: 'field-error', hidden: true });
+  const newPriority = prioritySelect(doc, 'new-priority');
+  newPriority.setAttribute('name', 'priority');
+  newPriority.setAttribute('data-role', 'new-priority');
+  newPriority.setAttribute('aria-describedby', 'new-priority-hint');
   const createButton = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'create-submit', text: 'Create issue' });
   const createError = h(doc, 'p', { class: 'form-error', role: 'alert', 'data-role': 'create-error', hidden: true });
   // Visible while a create request is in flight. The fields stay editable so the
@@ -290,6 +360,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       newDescription,
       newDescriptionError,
     ),
+    h(doc, 'div', { class: 'field' },
+      h(doc, 'label', { for: 'new-priority', text: 'Priority' }),
+      newPriority,
+      h(doc, 'p', { id: 'new-priority-hint', class: 'hint', text: `New issues default to ${PRIORITY_LABELS[DEFAULT_PRIORITY]}.` }),
+    ),
     createError,
     createPending,
     h(doc, 'div', { class: 'form-actions' }, createButton),
@@ -299,11 +374,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const searchInput = h(doc, 'input', { id: 'search', type: 'search', autocomplete: 'off', placeholder: 'Title or description', 'data-role': 'search' });
   const filterSelect = statusSelect(doc, 'status-filter', { includeAll: true });
   filterSelect.setAttribute('data-role', 'status-filter');
+  const priorityFilter = prioritySelect(doc, 'priority-filter', { includeAll: true });
+  priorityFilter.setAttribute('data-role', 'priority-filter');
   // Asks the server for the current list, for example to see a teammate's changes.
   const refreshButton = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'refresh', text: 'Refresh' });
   const toolbar = h(doc, 'section', { class: 'panel toolbar', role: 'search', 'aria-label': 'Filter issues' },
     h(doc, 'div', { class: 'field grow' }, h(doc, 'label', { for: 'search', text: 'Search issues' }), searchInput),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'status-filter', text: 'Status' }), filterSelect),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'priority-filter', text: 'Priority' }), priorityFilter),
     h(doc, 'div', { class: 'field toolbar-action' }, refreshButton),
   );
 
@@ -311,23 +389,35 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const boardStatus = h(doc, 'p', { class: 'board-status', role: 'status', 'data-role': 'board-status' });
   const loadErrorText = h(doc, 'span', { 'data-role': 'load-error-text' });
   const retryButton = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'retry', text: 'Retry' });
-  const loadErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'load-error', hidden: true }, loadErrorText, ' ', retryButton);
+  // Extra guidance when the server says its storage cannot be read (docs/api.md:
+  // a corrupt or unavailable store answers 500 STORAGE_ERROR and is never
+  // rewritten). Hidden for other load failures.
+  const loadErrorHint = h(doc, 'p', { class: 'notice-hint', 'data-role': 'load-error-hint', hidden: true });
+  const loadErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'load-error', hidden: true }, loadErrorText, ' ', retryButton, loadErrorHint);
   const actionErrorText = h(doc, 'span', { 'data-role': 'action-error-text' });
   const dismissButton = h(doc, 'button', { type: 'button', class: 'button subtle', text: 'Dismiss' });
   const actionErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'action-error', hidden: true }, actionErrorText, ' ', dismissButton);
+  // Visible note for a card priority change whose card is no longer shown
+  // (it left the current filters, or the server no longer has it).
+  const priorityNoticeText = h(doc, 'span', { 'data-role': 'priority-notice-text' });
+  const priorityNoticeDismiss = h(doc, 'button', { type: 'button', class: 'button subtle', text: 'Dismiss' });
+  const priorityNotice = h(doc, 'div', { class: 'notice info', 'data-role': 'priority-notice', hidden: true }, priorityNoticeText, ' ', priorityNoticeDismiss);
   const columns = {};
   const board = h(doc, 'div', { class: 'board', 'data-role': 'board', 'aria-busy': 'false' });
   for (const status of STATUSES) {
     const headingId = `column-${status}-heading`;
     const count = h(doc, 'span', { class: 'count', 'data-role': `count-${status}`, text: '0' });
     const list = h(doc, 'ul', { class: 'cards', 'aria-labelledby': headingId, 'data-role': `list-${status}` });
-    const empty = h(doc, 'p', { class: 'empty', 'data-role': `empty-${status}`, hidden: true });
+    // Both can take focus from script (tabindex -1, not in the tab order), so a
+    // card that leaves the view never drops keyboard focus to the page.
+    const empty = h(doc, 'p', { class: 'empty', 'data-role': `empty-${status}`, tabindex: '-1', hidden: true });
+    const heading = h(doc, 'h2', { id: headingId, tabindex: '-1', 'data-role': `heading-${status}` }, STATUS_LABELS[status], ' ', count);
     const column = h(doc, 'section', { class: `column column-${status}`, 'aria-labelledby': headingId, 'data-role': `column-${status}` },
-      h(doc, 'h2', { id: headingId }, STATUS_LABELS[status], ' ', count),
+      heading,
       list,
       empty,
     );
-    columns[status] = { count, list, empty };
+    columns[status] = { count, list, empty, heading };
     board.append(column);
   }
 
@@ -337,6 +427,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const editDescription = h(doc, 'textarea', { id: 'edit-description', name: 'description', rows: '5', 'aria-describedby': 'edit-description-error' });
   const editDescriptionError = h(doc, 'p', { id: 'edit-description-error', class: 'field-error', hidden: true });
   const editStatus = statusSelect(doc, 'edit-status');
+  const editPriority = prioritySelect(doc, 'edit-priority');
+  editPriority.setAttribute('data-role', 'edit-priority');
   const editError = h(doc, 'p', { class: 'form-error', role: 'alert', hidden: true, 'data-role': 'edit-error' });
   const editSave = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'edit-save', text: 'Save changes' });
   const editCancel = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-cancel', text: 'Cancel' });
@@ -354,6 +446,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-title', text: 'Title' }), editTitle, editTitleError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-description', text: 'Description' }), editDescription, editDescriptionError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-status', text: 'Status' }), editStatus),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-priority', text: 'Priority' }), editPriority),
     editNotice,
     editError,
     editCompare,
@@ -371,7 +464,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     live,
     h(doc, 'div', { class: 'layout' },
       h(doc, 'aside', { class: 'sidebar' }, createForm),
-      h(doc, 'div', { class: 'main' }, toolbar, loadErrorBox, actionErrorBox, boardStatus, board),
+      h(doc, 'div', { class: 'main' }, toolbar, loadErrorBox, actionErrorBox, priorityNotice, boardStatus, board),
     ),
     dialog,
   );
@@ -387,12 +480,19 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     textEl.textContent = message || '';
     box.hidden = !message;
   }
-  function filtersActive() { return Boolean(state.filters.status || state.filters.q.trim()); }
+  function filtersActive() { return Boolean(state.filters.status || state.filters.priority || state.filters.q.trim()); }
 
   function renderCard(issue) {
     const title = h(doc, 'h3', { class: 'card-title', 'data-role': 'card-title' });
     title.textContent = issue.title;
     const card = h(doc, 'article', { class: 'card', 'data-issue-id': issue.id, 'data-role': 'card' }, title);
+    // Readable priority badge: the visible word plus a screen-reader prefix, so
+    // it never relies on colour alone. A record saved before priority existed
+    // shows Normal, like every new issue.
+    const shownPriority = effectivePriority(issue);
+    card.append(h(doc, 'p', { class: `priority-badge priority-${shownPriority}`, 'data-role': 'card-priority', 'data-priority': shownPriority },
+      h(doc, 'span', { class: 'sr-only', text: 'Priority: ' }),
+      PRIORITY_LABELS[shownPriority]), ' ');
     if (issue.description) {
       const desc = h(doc, 'p', { class: 'card-description', 'data-role': 'card-description' });
       desc.textContent = issue.description;
@@ -414,9 +514,53 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editButton.setAttribute('aria-label', `Edit issue: ${issue.title}`);
     editButton.setAttribute('data-issue-id', issue.id);
     editButton.addEventListener('click', () => openEdit(issue, editButton));
-    cardControls.set(issue.id, { edit: editButton, select, title: issue.title });
+    const priority = renderCardPriority(issue, card);
+    cardControls.set(issue.id, { edit: editButton, select, priority, title: issue.title });
     card.append(h(doc, 'div', { class: 'card-actions' }, selectLabel, select, editButton));
     return h(doc, 'li', {}, card);
+  }
+
+  // The card's own priority control: a labelled select that saves on change,
+  // a visible save state next to it and, after a failed or unconfirmed save, a
+  // Retry button that sends the same priority again. Returns the select.
+  function renderCardPriority(issue, card) {
+    const id = issue.id;
+    const save = prioritySaves.get(id);
+    const controlId = `priority-${id}`;
+    const stateId = `priority-${id}-state`;
+    const control = prioritySelect(doc, controlId);
+    control.setAttribute('data-role', 'card-priority-control');
+    control.setAttribute('data-issue-id', id);
+    control.setAttribute('aria-describedby', stateId);
+    const shown = effectivePriority(issue);
+    // While a save is in flight the control shows the value being saved; in
+    // every other state it shows the value the server last reported.
+    control.value = save && (save.state === 'saving' || save.state === 'checking') ? save.target : shown;
+    const busy = save && (save.state === 'saving' || save.state === 'checking');
+    // aria-disabled rather than disabled, so a focused control keeps focus;
+    // a change made while busy is undone by the change handler.
+    if (busy) {
+      control.setAttribute('aria-disabled', 'true');
+      card.setAttribute('aria-busy', 'true');
+    }
+    control.addEventListener('change', () => savePriority(id, control.value, { control }));
+    const label = h(doc, 'label', { for: controlId, class: 'card-priority-label' }, 'Priority',
+      h(doc, 'span', { class: 'sr-only', text: ` for ${issue.title}` }));
+    const stateText = h(doc, 'span', { id: stateId, class: 'card-priority-state', 'data-role': 'card-priority-state' });
+    if (save) {
+      stateText.textContent = save.message;
+      stateText.setAttribute('data-state', save.state);
+    }
+    const row = h(doc, 'div', { class: 'card-priority-row' }, label, control, stateText);
+    if (save && (save.state === 'failed' || save.state === 'unknown')) {
+      const retry = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'card-priority-retry', 'data-issue-id': id,
+        text: `Retry ${PRIORITY_LABELS[save.target]}` });
+      retry.setAttribute('aria-label', `Retry saving priority ${PRIORITY_LABELS[save.target]} for ${issue.title}`);
+      retry.addEventListener('click', () => savePriority(id, save.target, { retry: true, control: retry }));
+      row.append(retry);
+    }
+    card.append(row);
+    return control;
   }
 
   // Which card control has focus right now, if any: { id, role }.
@@ -427,6 +571,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     if (!controls) return null;
     if (active === controls.edit) return { id, role: 'card-edit' };
     if (active === controls.select) return { id, role: 'card-status' };
+    if (active === controls.priority) return { id, role: 'card-priority-control' };
+    if (active?.getAttribute?.('data-role') === 'card-priority-retry') return { id, role: 'card-priority-control' };
     return null;
   }
 
@@ -438,6 +584,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
    * Returns the element that received focus.
    */
   function restoreCardFocus(id, role = 'card-edit', { prefix = '', gone = '' } = {}) {
+    if (role === 'card-priority-control') return restorePriorityFocus(id);
     const controls = cardControls.get(id);
     const same = controls && (role === 'card-status' ? controls.select : controls.edit);
     if (same && same.isConnected && !same.disabled) {
@@ -462,15 +609,58 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     return refreshButton;
   }
 
+  /**
+   * Focus for a card priority control after a render. The same card's control
+   * when it is still shown; otherwise the priority control of the next card in
+   * its column, else the previous one, else the column's empty-state message or
+   * heading. Records where focus went (priorityFocusMove) so the change that
+   * caused it can say so in one announcement. Returns the focused element.
+   */
+  function restorePriorityFocus(id) {
+    const controls = cardControls.get(id);
+    if (controls?.priority?.isConnected) {
+      controls.priority.focus();
+      return controls.priority;
+    }
+    const seen = lastSeen.get(id);
+    if (!seen) {
+      refreshButton.focus();
+      priorityFocusMove = { id, description: 'the Refresh button' };
+      return refreshButton;
+    }
+    const ids = columnIds[seen.status];
+    const column = STATUS_LABELS[seen.status];
+    if (ids.length > 0) {
+      // The card's old index now holds the next card; past the end, the previous.
+      const next = seen.index < ids.length;
+      const neighbour = cardControls.get(ids[next ? seen.index : ids.length - 1]);
+      if (neighbour?.priority?.isConnected) {
+        neighbour.priority.focus();
+        priorityFocusMove = { id, description: `the ${next ? 'next' : 'previous'} card, “${neighbour.title}”, in ${column}` };
+        return neighbour.priority;
+      }
+    }
+    const { empty, heading } = columns[seen.status];
+    const target = empty.hidden ? heading : empty;
+    target.focus();
+    priorityFocusMove = { id, description: empty.hidden ? `the ${column} column heading` : `the empty ${column} column` };
+    return target;
+  }
+
   function render() {
     // Re-rendering replaces the cards, so remember which card control had focus.
     const hadFocus = focusedCardControl();
     board.setAttribute('aria-busy', state.loading ? 'true' : 'false');
     board.classList.toggle('is-loading', state.loading);
     const keptList = state.loadError && state.issues.length > 0;
+    const storageProblem = isStorageProblem(state.loadError);
     showBox(loadErrorBox, loadErrorText, state.loadError
       ? `Could not load issues: ${describe(state.loadError)} ${keptList ? 'The board still shows the last list that loaded.' : 'The list was not updated.'} Try again.`
       : '');
+    showBox(loadErrorHint, loadErrorHint, storageProblem ? STORAGE_HINT : '');
+    // With nothing loaded, an unreadable store is not an empty board: the
+    // columns are hidden so zero counts cannot read as "no issues".
+    board.hidden = storageProblem && state.issues.length === 0;
     const groups = groupByStatus(state.issues);
     cardControls.clear();
     for (const status of STATUSES) {
@@ -486,7 +676,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       empty.hidden = items.length > 0 || state.loading || Boolean(state.loadError);
     }
     if (state.loading) boardStatus.textContent = 'Loading issues…';
-    else if (state.loadError) boardStatus.textContent = state.issues.length > 0 ? 'Issues could not be refreshed. Showing the last list that loaded.' : 'Issues could not be loaded.';
+    else if (state.loadError) {
+      boardStatus.textContent = state.issues.length > 0
+        ? 'Issues could not be refreshed. Showing the last list that loaded.'
+        : storageProblem ? 'Issues could not be loaded: the server cannot read its saved issues.' : 'Issues could not be loaded.';
+    }
     else if (state.issues.length === 0) boardStatus.textContent = filtersActive() ? 'No issues match your search.' : 'No issues yet. Create the first one.';
     else boardStatus.textContent = `${state.issues.length} ${state.issues.length === 1 ? 'issue' : 'issues'} shown.`;
     boardStatus.classList.toggle('is-loading', state.loading);
@@ -505,7 +699,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     state.loading = true;
     render();
     try {
-      const items = await adapter.list({ ...state.filters });
+      // The priority filter is sent only when one is chosen ("All priorities").
+      const { priority, ...rest } = state.filters;
+      const items = await adapter.list(priority ? { ...rest, priority } : rest);
       if (seq !== state.loadSeq) return false;
       state.issues = items;
       state.loadError = null;
@@ -519,11 +715,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   }
 
   // The board's filters applied to an unfiltered list, with the same rules as
-  // the API (docs/api.md, src/store.js): exact status, and q as a
-  // case-insensitive substring of the title or description.
-  function applyFilters(items, { status = '', q = '' } = {}) {
+  // the API (docs/api.md, src/store.js): exact status, exact priority, and q
+  // as a case-insensitive substring of the title or description.
+  function applyFilters(items, { status = '', priority = '', q = '' } = {}) {
     const needle = q ? q.toLowerCase() : '';
     return items.filter(issue => (!status || issue.status === status)
+      && (!priority || effectivePriority(issue) === priority)
       && (!needle || issue.title.toLowerCase().includes(needle)
         || (issue.description || '').toLowerCase().includes(needle)));
   }
@@ -564,7 +761,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     : ' The board below was loaded again after this check and may show newer values.');
   const quoteText = text => (text ? `“${text}”` : '(empty)');
   function issueSummary(issue) {
-    return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}, description ${quoteText(issue.description)}`;
+    // Records without a priority field are summarised without one, so the
+    // comparison only shows what the server actually returned.
+    const priority = PRIORITIES.includes(issue.priority) ? `, priority ${PRIORITY_LABELS[issue.priority]}` : '';
+    return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}${priority}, description ${quoteText(issue.description)}`;
   }
 
   // --- create ---------------------------------------------------------------------
@@ -576,27 +776,30 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     // Snapshot exactly what was submitted. The fields stay editable while the
     // request is in flight, so on success we only clear the form if the user has
     // not started a new draft in the meantime; a changed draft is never cleared.
-    const submitted = { title: newTitle.value, description: newDescription.value };
+    const submitted = { title: newTitle.value, description: newDescription.value, priority: newPriority.value };
     const { errors, value } = validateIssueInput(submitted);
     setFieldError(newTitle, newTitleError, errors.title);
     setFieldError(newDescription, newDescriptionError, errors.description);
-    if (errors.title || errors.description) {
-      (errors.title ? newTitle : newDescription).focus();
+    if (errors.priority) showBox(createError, createError, errors.priority);
+    if (errors.title || errors.description || errors.priority) {
+      (errors.title ? newTitle : errors.description ? newDescription : newPriority).focus();
       return;
     }
-    const draftUnchanged = () => newTitle.value === submitted.title && newDescription.value === submitted.description;
+    const draftUnchanged = () => newTitle.value === submitted.title && newDescription.value === submitted.description
+      && newPriority.value === submitted.priority;
     creating = true;
     createButton.disabled = true;
     createButton.textContent = 'Saving…';
     createForm.setAttribute('aria-busy', 'true');
     showBox(createPending, createPending, `Saving “${value.title}”… You can keep typing your next issue; it will not be cleared.`);
     try {
-      const input = { title: value.title, description: value.description ?? '' };
+      const input = { title: value.title, description: value.description ?? '', priority: value.priority };
       // Only a reply that shows what was submitted counts as saved.
       const created = confirmSaved(await adapter.create(input), expectedCreate(input));
       if (draftUnchanged()) {
         newTitle.value = '';
         newDescription.value = '';
+        newPriority.value = DEFAULT_PRIORITY;
         announce(`Issue created: ${created.title}`);
       } else {
         announce(`Issue created: ${created.title}. Your new draft was kept.`);
@@ -609,12 +812,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         // and never create it again automatically (docs/api.md: a blind re-post
         // can duplicate). Look for a matching issue and let the user decide.
         const kept = unchanged ? 'Your text is kept.' : 'Your newer draft was left unchanged.';
-        const input = { title: value.title, description: value.description ?? '' };
+        const input = { title: value.title, description: value.description ?? '', priority: value.priority };
         showBox(createPending, createPending, `Checking the server for “${value.title}”…`);
         const obs = await observe();
         let check;
         if (obs.error) check = `The server could not be checked either: ${describe(obs.error)} Look for it on the board before creating it again.`;
         else {
+          // Any issue with the same text may be this one (a teammate may also
+          // have changed its priority since), so priority does not narrow it.
           const matches = obs.items.filter(item => item.title === input.title && item.description === input.description);
           check = matches.length > 0
             ? `When checked just now, the server showed ${matches.length === 1 ? 'an issue' : `${matches.length} issues`} with this title and description.${boardNote(obs)} It may be yours or a teammate’s; creating it again could add a duplicate.`
@@ -674,6 +879,122 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     }
   }
 
+  // --- card priority -------------------------------------------------------------
+  //
+  // A priority chosen on a card is saved at once with a PATCH that carries only
+  // the priority. The current search and filters stay as they are: the board is
+  // reloaded with them, so a card that no longer matches leaves the view and
+  // focus moves to a neighbour (see restorePriorityFocus). Only one priority
+  // save per card is in flight; a change made meanwhile is undone and named.
+  // An unknown outcome is never re-sent automatically: the server is read once
+  // and the card says what it showed; Retry is the user's explicit choice.
+  const priorityName = value => PRIORITY_LABELS[value] ?? String(value);
+  function showPriorityNotice(message) { showBox(priorityNotice, priorityNoticeText, message); }
+  priorityNoticeDismiss.addEventListener('click', () => showPriorityNotice(''));
+
+  // Announce `message`, adding where focus went if this card's control left.
+  function announcePriority(id, message) {
+    const moved = priorityFocusMove?.id === id ? priorityFocusMove : null;
+    priorityFocusMove = null;
+    announce(moved ? `${message} Focus moved to ${moved.description}.` : message);
+  }
+  const onBoard = id => state.issues.some(item => item.id === id);
+  const leftView = title => `“${title}” no longer matches the current search and filters, so it is hidden.`;
+
+  async function savePriority(id, next, { retry = false, control = null } = {}) {
+    const current = state.issues.find(item => item.id === id);
+    const pending = prioritySaves.get(id);
+    if (pending && (pending.state === 'saving' || pending.state === 'checking')) {
+      // A save for this card is still in flight: keep its value on screen.
+      if (control && control.tagName !== 'BUTTON' && 'value' in control) control.value = pending.target;
+      announce(`Still saving priority ${priorityName(pending.target)} for “${pending.title}”. Wait for it to finish.`);
+      return;
+    }
+    if (!current) return;
+    const title = current.title;
+    const previous = effectivePriority(current);
+    if (!retry && next === previous) {
+      // Choosing the value already saved clears an old failed state, sends nothing.
+      if (pending) { prioritySaves.delete(id); render(); }
+      return;
+    }
+    const { errors, value } = validateIssueInput({ priority: next }, { partial: true });
+    if (errors.priority) {
+      if (control && 'value' in control) control.value = previous;
+      announce(errors.priority);
+      return;
+    }
+    // A fresh change: older "Saved" notes on other cards are no longer news.
+    for (const [otherId, other] of prioritySaves) if (other.state === 'saved') prioritySaves.delete(otherId);
+    showPriorityNotice('');
+    showBox(actionErrorBox, actionErrorText, '');
+    const label = priorityName(value.priority);
+    prioritySaves.set(id, { state: 'saving', target: value.priority, previous, title, message: `Saving ${label}…` });
+    render();
+    announce(`Saving priority ${label} for “${title}”…`);
+    try {
+      // Only a reply for this issue that shows the sent priority counts as saved.
+      const saved = confirmSaved(await adapter.update(id, { priority: value.priority }), { priority: value.priority }, { id });
+      prioritySaves.set(id, { state: 'saved', target: value.priority, previous, title, message: `Saved: ${label}.` });
+      // Show the confirmed record at once, then reload with the current filters.
+      state.issues = state.issues.map(item => (item.id === id ? saved : item));
+      priorityFocusMove = null;
+      await load();
+      if (onBoard(id)) announcePriority(id, `Priority of “${title}” saved: ${label}.`);
+      else {
+        prioritySaves.delete(id);
+        showPriorityNotice(`Saved: “${title}” is now ${label}. ${leftView(title)}`);
+        announcePriority(id, `Priority of “${title}” saved: ${label}. ${leftView(title)}`);
+      }
+    } catch (error) {
+      if (error?.outcomeUnknown) {
+        prioritySaves.set(id, { state: 'checking', target: value.priority, previous, title, message: 'Not confirmed. Checking the server…' });
+        render();
+        // One read of the server (no filters) decides what the card says.
+        const obs = await observe();
+        const now = obs.error ? null : obs.items.find(item => item.id === id) ?? null;
+        const lead = `Could not confirm whether “${title}” was saved as ${label}: ${describe(error)}`;
+        let entry = null;
+        let message;
+        if (obs.error) {
+          entry = { state: 'unknown', message: `Not confirmed. The server could not be checked: ${describe(obs.error)} Retry sends ${label} again.` };
+          message = `${lead} The server could not be checked either: ${describe(obs.error)} Retry sends ${label} again.`;
+        } else if (!now) {
+          message = `${lead} When checked just now, the server did not show this issue.${boardNote(obs)}`;
+        } else if (now.priority === value.priority) {
+          entry = { state: 'saved', message: `Saved: ${label} (checked with the server).` };
+          message = `${lead} When checked just now, the server showed ${label}.${boardNote(obs)} Nothing more needs sending.`;
+        } else {
+          const shown = priorityName(effectivePriority(now));
+          const whose = effectivePriority(now) === previous ? 'the priority from before' : 'a different priority (possibly a teammate’s change)';
+          entry = { state: 'unknown', message: `Not confirmed. The server shows ${shown}, ${whose}. Retry sends ${label} again.` };
+          message = `${lead} When checked just now, the server showed ${shown}, ${whose}.${boardNote(obs)} Retry sends ${label} again.`;
+        }
+        if (entry) prioritySaves.set(id, { target: value.priority, previous, title, ...entry });
+        else prioritySaves.delete(id);
+        render();
+        if (!onBoard(id)) {
+          prioritySaves.delete(id);
+          showBox(actionErrorBox, actionErrorText, `${message} ${obs.error ? '' : leftView(title)}`.trim());
+        }
+        announcePriority(id, message);
+      } else if (error?.code === 'NOT_FOUND') {
+        prioritySaves.delete(id);
+        showBox(actionErrorBox, actionErrorText, `Could not change the priority of “${title}”: the server no longer has this issue. The board was refreshed.`);
+        priorityFocusMove = null;
+        await load();
+        announcePriority(id, `Could not change the priority of “${title}”: the server no longer has this issue.`);
+      } else {
+        // A definite rejection: nothing changed. The card shows the saved value
+        // again, says why, and offers Retry.
+        prioritySaves.set(id, { state: 'failed', target: value.priority, previous, title,
+          message: `Not saved: ${describe(error)} Still ${priorityName(previous)}.` });
+        render();
+        announce(`Could not save priority ${label} for “${title}”: ${describe(error)} It is still ${priorityName(previous)}. Use Retry to try again.`);
+      }
+    }
+  }
+
   // --- edit dialog -------------------------------------------------------------------
   //
   // The dialog tracks, per field, the server value that field was last filled
@@ -690,10 +1011,16 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // decided by what they did after the send, never by comparing with the old
   // seed. The whole stale form is never compared against a newer server copy,
   // so a teammate's change to a field the user did not touch is never sent back.
-  const FIELDS = ['title', 'description', 'status'];
-  const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status' };
-  const fieldInputs = { title: editTitle, description: editDescription, status: editStatus };
-  const serverValue = (issue, field) => (field === 'description' ? issue.description || '' : issue[field]);
+  const FIELDS = ['title', 'description', 'status', 'priority'];
+  const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status', priority: 'Priority' };
+  const fieldInputs = { title: editTitle, description: editDescription, status: editStatus, priority: editPriority };
+  // A record without priority (saved before priority existed) seeds the
+  // control with Normal; priority is then sent only if the user changes it.
+  const serverValue = (issue, field) => {
+    if (field === 'description') return issue.description || '';
+    if (field === 'priority') return effectivePriority(issue);
+    return issue[field];
+  };
   // Titles are stored trimmed (contract), so they are compared trimmed.
   const sameValue = (field, a, b) => (field === 'title' ? String(a).trim() === String(b).trim() : a === b);
   const editedFields = () => FIELDS.filter(field => edit.uncertain.has(field)
@@ -789,7 +1116,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editAdopt.hidden = true;
     edit.serverIssue = null;
   }
-  const editFields = [editTitle, editDescription, editStatus];
+  const editFields = [editTitle, editDescription, editStatus, editPriority];
 
   function setEditBusy(busy, label) {
     edit.saving = busy;
@@ -900,8 +1227,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     const { errors, value } = validateIssueInput(patch, { partial: true });
     setFieldError(editTitle, editTitleError, errors.title);
     setFieldError(editDescription, editDescriptionError, errors.description);
-    if (errors.title || errors.description) {
-      (errors.title ? editTitle : editDescription).focus();
+    if (errors.priority) showBox(editError, editError, errors.priority);
+    if (errors.title || errors.description || errors.priority) {
+      (errors.title ? editTitle : errors.description ? editDescription : editPriority).focus();
       return;
     }
     // The seeds of the submitted fields at send time, to describe a later check.
@@ -959,7 +1287,13 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     searchTimer = setTimeout(() => { searchTimer = null; load(); }, searchDelayMs);
   });
   filterSelect.addEventListener('change', () => {
+    showPriorityNotice('');
     state.filters.status = filterSelect.value;
+    load();
+  });
+  priorityFilter.addEventListener('change', () => {
+    showPriorityNotice('');
+    state.filters.priority = priorityFilter.value;
     load();
   });
   retryButton.addEventListener('click', () => load());
