@@ -6,8 +6,8 @@
 // no offline fallback: if the API cannot be reached, the board says so.
 //
 // The adapter interface follows docs/api.md:
-//   list({ status, q }) -> Promise<Issue[]>          (GET   /api/issues)
-//   create({ title, description }) -> Promise<Issue> (POST  /api/issues)
+//   list({ status, priority, q }) -> Promise<Issue[]>          (GET   /api/issues)
+//   create({ title, description, priority }) -> Promise<Issue> (POST  /api/issues)
 //   update(id, patch) -> Promise<Issue>              (PATCH /api/issues/:id)
 // Failures reject with ApiError { code, message, status, outcomeUnknown }.
 // outcomeUnknown is true when no trustworthy answer came back (the connection
@@ -22,6 +22,11 @@
 
 export const STATUSES = ['open', 'in_progress', 'done'];
 export const STATUS_LABELS = { open: 'Open', in_progress: 'In progress', done: 'Done' };
+// Issue priority (specs/sim-ws-biz-01-priority-triage.md): exactly these four
+// values, lowest first; a new issue defaults to normal.
+export const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+export const PRIORITY_LABELS = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
+export const DEFAULT_PRIORITY = 'normal';
 export const TITLE_MAX = 120;
 export const DESCRIPTION_MAX = 4000;
 
@@ -39,7 +44,7 @@ export class ApiError extends Error {
 // Pure helpers (shared by the UI and both adapters)
 // ---------------------------------------------------------------------------
 
-const ALLOWED_FIELDS = ['title', 'description', 'status'];
+const ALLOWED_FIELDS = ['title', 'description', 'status', 'priority'];
 
 /**
  * Validate create/edit input against the product contract.
@@ -70,6 +75,10 @@ export function validateIssueInput(input, { partial = false } = {}) {
     if (!STATUSES.includes(input.status)) errors.status = 'Choose a valid status.';
     else value.status = input.status;
   }
+  if ('priority' in input) {
+    if (!PRIORITIES.includes(input.priority)) errors.priority = 'Choose a valid priority.';
+    else value.priority = input.priority;
+  }
   if (partial && Object.keys(input).length === 0) errors.form = 'Nothing to update.';
   return { errors, value };
 }
@@ -82,10 +91,16 @@ export function groupByStatus(issues) {
 
 const isIsoTime = value => typeof value === 'string' && value !== '' && !Number.isNaN(Date.parse(value));
 
-/** True when `value` has the issue shape from specs/issue-tracker.md. */
+/**
+ * True when `value` has the issue shape from specs/issue-tracker.md. A priority,
+ * when the record carries one, must be one of PRIORITIES. A record without the
+ * field (a server that predates priority) stays readable; it shows no badge and
+ * can never confirm a save that sent a priority.
+ */
 export function isValidIssue(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const { id, title, description, status, createdAt, updatedAt } = value;
+  if ('priority' in value && !PRIORITIES.includes(value.priority)) return false;
   return typeof id === 'string' && id !== ''
     && typeof title === 'string' && title.trim().length >= 1 && title.trim().length <= TITLE_MAX
     && typeof description === 'string' && description.length <= DESCRIPTION_MAX
@@ -103,6 +118,7 @@ export function matchesSubmitted(issue, submitted) {
   if ('title' in submitted && issue.title !== String(submitted.title).trim()) return false;
   if ('description' in submitted && issue.description !== submitted.description) return false;
   if ('status' in submitted && issue.status !== submitted.status) return false;
+  if ('priority' in submitted && issue.priority !== submitted.priority) return false;
   return true;
 }
 
@@ -135,9 +151,14 @@ export function confirmSaved(issue, submitted, { id, status = 0 } = {}) {
   return issue;
 }
 
-/** The fields a created issue must show: the submitted text and the defaults. */
+/** The fields a created issue must show: the submitted values and the defaults. */
 export function expectedCreate(input) {
-  return { title: String(input.title).trim(), description: input.description ?? '', status: 'open' };
+  return {
+    title: String(input.title).trim(),
+    description: input.description ?? '',
+    status: 'open',
+    priority: input.priority ?? DEFAULT_PRIORITY,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +203,10 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
   }
   return {
     mode: 'api',
-    async list({ status = '', q = '' } = {}) {
+    async list({ status = '', priority = '', q = '' } = {}) {
       const params = new URLSearchParams();
       if (status) params.set('status', status);
+      if (priority) params.set('priority', priority);
       if (q) params.set('q', q);
       const query = params.toString();
       const { data, status: code } = await request('GET', '/api/issues' + (query ? '?' + query : ''));
@@ -228,6 +250,19 @@ function statusSelect(doc, id, { includeAll = false } = {}) {
   return select;
 }
 
+function prioritySelect(doc, id, { includeAll = false } = {}) {
+  const select = h(doc, 'select', { id });
+  if (includeAll) select.append(h(doc, 'option', { value: '', text: 'All priorities' }));
+  for (const priority of PRIORITIES) {
+    select.append(h(doc, 'option', {
+      value: priority, text: PRIORITY_LABELS[priority],
+      selected: !includeAll && priority === DEFAULT_PRIORITY,
+    }));
+  }
+  if (!includeAll) select.value = DEFAULT_PRIORITY;
+  return select;
+}
+
 function describe(error) {
   if (error && typeof error.message === 'string' && error.message) return error.message;
   return 'Something went wrong.';
@@ -245,7 +280,7 @@ function formatTime(iso) {
  */
 export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayMs = 200 } = {}) {
   if (!adapter) throw new Error('mountApp requires an adapter');
-  const state = { issues: [], filters: { status: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
+  const state = { issues: [], filters: { status: '', priority: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
   // Controls of the cards on screen, per issue id, and each column's order, so
   // focus can go back to a control that is still on the page after a render.
   const cardControls = new Map(); // id -> { edit, select, title }
@@ -272,6 +307,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const newTitleError = h(doc, 'p', { id: 'new-title-error', class: 'field-error', 'data-role': 'new-title-error', hidden: true });
   const newDescription = h(doc, 'textarea', { id: 'new-description', name: 'description', rows: '3', 'aria-describedby': 'new-description-error' });
   const newDescriptionError = h(doc, 'p', { id: 'new-description-error', class: 'field-error', hidden: true });
+  const newPriority = prioritySelect(doc, 'new-priority');
+  newPriority.setAttribute('name', 'priority');
+  newPriority.setAttribute('data-role', 'new-priority');
+  newPriority.setAttribute('aria-describedby', 'new-priority-hint');
   const createButton = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'create-submit', text: 'Create issue' });
   const createError = h(doc, 'p', { class: 'form-error', role: 'alert', 'data-role': 'create-error', hidden: true });
   // Visible while a create request is in flight. The fields stay editable so the
@@ -290,6 +329,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       newDescription,
       newDescriptionError,
     ),
+    h(doc, 'div', { class: 'field' },
+      h(doc, 'label', { for: 'new-priority', text: 'Priority' }),
+      newPriority,
+      h(doc, 'p', { id: 'new-priority-hint', class: 'hint', text: `New issues default to ${PRIORITY_LABELS[DEFAULT_PRIORITY]}.` }),
+    ),
     createError,
     createPending,
     h(doc, 'div', { class: 'form-actions' }, createButton),
@@ -299,11 +343,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const searchInput = h(doc, 'input', { id: 'search', type: 'search', autocomplete: 'off', placeholder: 'Title or description', 'data-role': 'search' });
   const filterSelect = statusSelect(doc, 'status-filter', { includeAll: true });
   filterSelect.setAttribute('data-role', 'status-filter');
+  const priorityFilter = prioritySelect(doc, 'priority-filter', { includeAll: true });
+  priorityFilter.setAttribute('data-role', 'priority-filter');
   // Asks the server for the current list, for example to see a teammate's changes.
   const refreshButton = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'refresh', text: 'Refresh' });
   const toolbar = h(doc, 'section', { class: 'panel toolbar', role: 'search', 'aria-label': 'Filter issues' },
     h(doc, 'div', { class: 'field grow' }, h(doc, 'label', { for: 'search', text: 'Search issues' }), searchInput),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'status-filter', text: 'Status' }), filterSelect),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'priority-filter', text: 'Priority' }), priorityFilter),
     h(doc, 'div', { class: 'field toolbar-action' }, refreshButton),
   );
 
@@ -337,6 +384,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const editDescription = h(doc, 'textarea', { id: 'edit-description', name: 'description', rows: '5', 'aria-describedby': 'edit-description-error' });
   const editDescriptionError = h(doc, 'p', { id: 'edit-description-error', class: 'field-error', hidden: true });
   const editStatus = statusSelect(doc, 'edit-status');
+  const editPriority = prioritySelect(doc, 'edit-priority');
+  editPriority.setAttribute('data-role', 'edit-priority');
   const editError = h(doc, 'p', { class: 'form-error', role: 'alert', hidden: true, 'data-role': 'edit-error' });
   const editSave = h(doc, 'button', { type: 'submit', class: 'button primary', 'data-role': 'edit-save', text: 'Save changes' });
   const editCancel = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'edit-cancel', text: 'Cancel' });
@@ -354,6 +403,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-title', text: 'Title' }), editTitle, editTitleError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-description', text: 'Description' }), editDescription, editDescriptionError),
     h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-status', text: 'Status' }), editStatus),
+    h(doc, 'div', { class: 'field' }, h(doc, 'label', { for: 'edit-priority', text: 'Priority' }), editPriority),
     editNotice,
     editError,
     editCompare,
@@ -387,12 +437,19 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     textEl.textContent = message || '';
     box.hidden = !message;
   }
-  function filtersActive() { return Boolean(state.filters.status || state.filters.q.trim()); }
+  function filtersActive() { return Boolean(state.filters.status || state.filters.priority || state.filters.q.trim()); }
 
   function renderCard(issue) {
     const title = h(doc, 'h3', { class: 'card-title', 'data-role': 'card-title' });
     title.textContent = issue.title;
     const card = h(doc, 'article', { class: 'card', 'data-issue-id': issue.id, 'data-role': 'card' }, title);
+    // Readable priority badge: the visible word plus a screen-reader prefix, so
+    // it never relies on colour alone. A record without priority shows none.
+    if (PRIORITIES.includes(issue.priority)) {
+      card.append(h(doc, 'p', { class: `priority-badge priority-${issue.priority}`, 'data-role': 'card-priority', 'data-priority': issue.priority },
+        h(doc, 'span', { class: 'sr-only', text: 'Priority: ' }),
+        PRIORITY_LABELS[issue.priority]), ' ');
+    }
     if (issue.description) {
       const desc = h(doc, 'p', { class: 'card-description', 'data-role': 'card-description' });
       desc.textContent = issue.description;
@@ -505,7 +562,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     state.loading = true;
     render();
     try {
-      const items = await adapter.list({ ...state.filters });
+      // The priority filter is sent only when one is chosen ("All priorities").
+      const { priority, ...rest } = state.filters;
+      const items = await adapter.list(priority ? { ...rest, priority } : rest);
       if (seq !== state.loadSeq) return false;
       state.issues = items;
       state.loadError = null;
@@ -519,11 +578,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   }
 
   // The board's filters applied to an unfiltered list, with the same rules as
-  // the API (docs/api.md, src/store.js): exact status, and q as a
-  // case-insensitive substring of the title or description.
-  function applyFilters(items, { status = '', q = '' } = {}) {
+  // the API (docs/api.md, src/store.js): exact status, exact priority, and q
+  // as a case-insensitive substring of the title or description.
+  function applyFilters(items, { status = '', priority = '', q = '' } = {}) {
     const needle = q ? q.toLowerCase() : '';
     return items.filter(issue => (!status || issue.status === status)
+      && (!priority || issue.priority === priority)
       && (!needle || issue.title.toLowerCase().includes(needle)
         || (issue.description || '').toLowerCase().includes(needle)));
   }
@@ -564,7 +624,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     : ' The board below was loaded again after this check and may show newer values.');
   const quoteText = text => (text ? `“${text}”` : '(empty)');
   function issueSummary(issue) {
-    return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}, description ${quoteText(issue.description)}`;
+    const priority = PRIORITIES.includes(issue.priority) ? `, priority ${PRIORITY_LABELS[issue.priority]}` : '';
+    return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}${priority}, description ${quoteText(issue.description)}`;
   }
 
   // --- create ---------------------------------------------------------------------
@@ -576,27 +637,30 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     // Snapshot exactly what was submitted. The fields stay editable while the
     // request is in flight, so on success we only clear the form if the user has
     // not started a new draft in the meantime; a changed draft is never cleared.
-    const submitted = { title: newTitle.value, description: newDescription.value };
+    const submitted = { title: newTitle.value, description: newDescription.value, priority: newPriority.value };
     const { errors, value } = validateIssueInput(submitted);
     setFieldError(newTitle, newTitleError, errors.title);
     setFieldError(newDescription, newDescriptionError, errors.description);
-    if (errors.title || errors.description) {
-      (errors.title ? newTitle : newDescription).focus();
+    if (errors.priority) showBox(createError, createError, errors.priority);
+    if (errors.title || errors.description || errors.priority) {
+      (errors.title ? newTitle : errors.description ? newDescription : newPriority).focus();
       return;
     }
-    const draftUnchanged = () => newTitle.value === submitted.title && newDescription.value === submitted.description;
+    const draftUnchanged = () => newTitle.value === submitted.title && newDescription.value === submitted.description
+      && newPriority.value === submitted.priority;
     creating = true;
     createButton.disabled = true;
     createButton.textContent = 'Saving…';
     createForm.setAttribute('aria-busy', 'true');
     showBox(createPending, createPending, `Saving “${value.title}”… You can keep typing your next issue; it will not be cleared.`);
     try {
-      const input = { title: value.title, description: value.description ?? '' };
+      const input = { title: value.title, description: value.description ?? '', priority: value.priority };
       // Only a reply that shows what was submitted counts as saved.
       const created = confirmSaved(await adapter.create(input), expectedCreate(input));
       if (draftUnchanged()) {
         newTitle.value = '';
         newDescription.value = '';
+        newPriority.value = DEFAULT_PRIORITY;
         announce(`Issue created: ${created.title}`);
       } else {
         announce(`Issue created: ${created.title}. Your new draft was kept.`);
@@ -609,12 +673,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         // and never create it again automatically (docs/api.md: a blind re-post
         // can duplicate). Look for a matching issue and let the user decide.
         const kept = unchanged ? 'Your text is kept.' : 'Your newer draft was left unchanged.';
-        const input = { title: value.title, description: value.description ?? '' };
+        const input = { title: value.title, description: value.description ?? '', priority: value.priority };
         showBox(createPending, createPending, `Checking the server for “${value.title}”…`);
         const obs = await observe();
         let check;
         if (obs.error) check = `The server could not be checked either: ${describe(obs.error)} Look for it on the board before creating it again.`;
         else {
+          // Any issue with the same text may be this one (a teammate may also
+          // have changed its priority since), so priority does not narrow it.
           const matches = obs.items.filter(item => item.title === input.title && item.description === input.description);
           check = matches.length > 0
             ? `When checked just now, the server showed ${matches.length === 1 ? 'an issue' : `${matches.length} issues`} with this title and description.${boardNote(obs)} It may be yours or a teammate’s; creating it again could add a duplicate.`
@@ -690,10 +756,16 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // decided by what they did after the send, never by comparing with the old
   // seed. The whole stale form is never compared against a newer server copy,
   // so a teammate's change to a field the user did not touch is never sent back.
-  const FIELDS = ['title', 'description', 'status'];
-  const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status' };
-  const fieldInputs = { title: editTitle, description: editDescription, status: editStatus };
-  const serverValue = (issue, field) => (field === 'description' ? issue.description || '' : issue[field]);
+  const FIELDS = ['title', 'description', 'status', 'priority'];
+  const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status', priority: 'Priority' };
+  const fieldInputs = { title: editTitle, description: editDescription, status: editStatus, priority: editPriority };
+  // A record without priority (a server that predates it) seeds the control
+  // with the default; priority is then sent only if the user changes it.
+  const serverValue = (issue, field) => {
+    if (field === 'description') return issue.description || '';
+    if (field === 'priority') return PRIORITIES.includes(issue.priority) ? issue.priority : DEFAULT_PRIORITY;
+    return issue[field];
+  };
   // Titles are stored trimmed (contract), so they are compared trimmed.
   const sameValue = (field, a, b) => (field === 'title' ? String(a).trim() === String(b).trim() : a === b);
   const editedFields = () => FIELDS.filter(field => edit.uncertain.has(field)
@@ -789,7 +861,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     editAdopt.hidden = true;
     edit.serverIssue = null;
   }
-  const editFields = [editTitle, editDescription, editStatus];
+  const editFields = [editTitle, editDescription, editStatus, editPriority];
 
   function setEditBusy(busy, label) {
     edit.saving = busy;
@@ -900,8 +972,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     const { errors, value } = validateIssueInput(patch, { partial: true });
     setFieldError(editTitle, editTitleError, errors.title);
     setFieldError(editDescription, editDescriptionError, errors.description);
-    if (errors.title || errors.description) {
-      (errors.title ? editTitle : editDescription).focus();
+    if (errors.priority) showBox(editError, editError, errors.priority);
+    if (errors.title || errors.description || errors.priority) {
+      (errors.title ? editTitle : errors.description ? editDescription : editPriority).focus();
       return;
     }
     // The seeds of the submitted fields at send time, to describe a later check.
@@ -960,6 +1033,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   });
   filterSelect.addEventListener('change', () => {
     state.filters.status = filterSelect.value;
+    load();
+  });
+  priorityFilter.addEventListener('change', () => {
+    state.filters.priority = priorityFilter.value;
     load();
   });
   retryButton.addEventListener('click', () => load());
