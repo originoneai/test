@@ -6,7 +6,7 @@
 // temp DATA_DIR; no live data is touched.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server.js';
@@ -354,6 +354,163 @@ test('concurrent priority patches serialize; no torn or lost state', async () =>
     assert.equal(stored.issues[0].priority, listed.body.items[0].priority, 'disk matches the served value');
     assert.deepEqual(await readdir(tracker.dataDir), ['issues.json'], 'no temp files left behind');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Six-field legacy board compatibility (second-use feedback)
+// ---------------------------------------------------------------------------
+
+// Case-unique pre-priority fixture for the HTTP surface, separate from the
+// store-level and UI-level legacy namespaces.
+const LEGACY_API_ID_A = 'c2d4e6f8-1a3b-4c5d-9e7f-2a4b6c8d0e2f';
+const LEGACY_API_ID_B = 'c2d4e6f8-1a3b-4c5d-9e7f-2a4b6c8d0e30';
+const legacyApiBytes = () =>
+  JSON.stringify({
+    issues: [
+      {
+        id: LEGACY_API_ID_A,
+        title: 'Api legacy open card',
+        description: 'old text',
+        status: 'open',
+        createdAt: '2024-02-29T08:00:00Z',
+        updatedAt: '2024-02-29T09:30:00Z',
+      },
+      {
+        id: LEGACY_API_ID_B,
+        title: 'Api legacy doing card',
+        description: '',
+        status: 'in_progress',
+        createdAt: '2026-02-28T12:34:56Z',
+        updatedAt: '2026-02-28T12:34:56.250Z',
+      },
+    ],
+  });
+
+test('opening and searching a legacy board serves Normal cards and never rewrites the file', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'priority-api-legacy-'));
+  const bytes = legacyApiBytes();
+  await writeFile(join(dataDir, 'issues.json'), bytes, 'utf8');
+  const tracker = await bootTracker(dataDir);
+  try {
+    const opened = await tracker.list();
+    assert.equal(opened.status, 200, 'a legacy board opens, it is not treated as corrupt');
+    assert.deepEqual(
+      opened.body.items.map((issue) => [issue.title, issue.priority]),
+      [
+        ['Api legacy doing card', 'normal'],
+        ['Api legacy open card', 'normal'],
+      ],
+      'legacy cards appear as Normal, newest first',
+    );
+    assert.deepEqual(
+      Object.keys(opened.body.items[0]).sort(),
+      ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+      'served records expose the full contract shape',
+    );
+
+    const filtered = await tracker.list('?priority=normal&status=open');
+    assert.deepEqual(filtered.body.items.map((issue) => issue.title), ['Api legacy open card']);
+    const searched = await tracker.list('?priority=normal&q=legacy');
+    assert.equal(searched.body.items.length, 2, 'search composes with the defaulted priority');
+    const noneUrgent = await tracker.list('?priority=urgent');
+    assert.deepEqual(noneUrgent.body.items, [], 'an urgent filter is honestly empty, not an error');
+
+    assert.equal(await readFile(tracker.storePath, 'utf8'), bytes, 'opening, filtering and searching rewrote nothing');
+    assert.deepEqual(await readdir(dataDir), ['issues.json'], 'reads left no temp files');
+  } finally {
+    await tracker.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('the first HTTP save upgrades the legacy file and the upgrade survives a restart', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'priority-api-legacy-'));
+  await writeFile(join(dataDir, 'issues.json'), legacyApiBytes(), 'utf8');
+  const first = await bootTracker(dataDir);
+  try {
+    const patched = await first.patchIssue(LEGACY_API_ID_B, { title: 'Api legacy doing card, renamed' });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.body.priority, 'normal', 'the saved legacy card keeps Normal');
+    assert.equal(patched.body.title, 'Api legacy doing card, renamed');
+
+    const stored = JSON.parse(await readFile(first.storePath, 'utf8'));
+    assert.equal(stored.issues.length, 2);
+    for (const issue of stored.issues) {
+      assert.deepEqual(
+        Object.keys(issue).sort(),
+        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+        'the successful save upgraded every record to the seven-field shape',
+      );
+    }
+    const untouched = stored.issues.find((issue) => issue.id === LEGACY_API_ID_A);
+    assert.equal(untouched.updatedAt, '2024-02-29T09:30:00Z', 'the untouched legacy record keeps its timestamps');
+  } finally {
+    await first.stop();
+  }
+
+  const second = await bootTracker(dataDir);
+  try {
+    const reopened = await second.list();
+    assert.deepEqual(
+      reopened.body.items.map((issue) => issue.priority),
+      ['normal', 'normal'],
+      'the upgrade is retained after a restart',
+    );
+
+    const rechosen = await second.patchIssue(LEGACY_API_ID_A, { priority: 'high' });
+    assert.equal(rechosen.status, 200);
+    assert.equal(rechosen.body.priority, 'high', 'a selected priority is accepted on an upgraded record');
+    const highOnly = await second.list('?priority=high');
+    assert.deepEqual(highOnly.body.items.map((issue) => issue.id), [LEGACY_API_ID_A]);
+    const stillNormal = await second.list('?priority=normal');
+    assert.deepEqual(stillNormal.body.items.map((issue) => issue.id), [LEGACY_API_ID_B]);
+  } finally {
+    await second.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('a damaged legacy-shaped file fails visibly over HTTP and is never rewritten', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'priority-api-legacy-'));
+  // One valid legacy record beside one invalid one: mixed-invalid data.
+  const bytes = JSON.stringify({
+    issues: [
+      {
+        id: LEGACY_API_ID_A,
+        title: 'Api legacy open card',
+        description: 'old text',
+        status: 'open',
+        createdAt: '2024-02-29T08:00:00Z',
+        updatedAt: '2024-02-29T09:30:00Z',
+      },
+      {
+        id: LEGACY_API_ID_B,
+        title: 'Damaged card',
+        description: '',
+        status: 'closed',
+        createdAt: '2026-02-28T12:34:56Z',
+        updatedAt: '2026-02-28T12:34:56.250Z',
+      },
+    ],
+  });
+  await writeFile(join(dataDir, 'issues.json'), bytes, 'utf8');
+  const tracker = await bootTracker(dataDir);
+  try {
+    const listed = await tracker.list();
+    assert.equal(listed.status, 500, 'a damaged file is reported, never shown as an empty board');
+    assertErrorBody(listed.body);
+    assert.equal(listed.body.error.code, 'STORAGE_ERROR');
+
+    const created = await tracker.postIssue({ title: 'Should not persist' });
+    assert.equal(created.status, 500);
+    assert.equal(created.body.error.code, 'STORAGE_ERROR');
+
+    assert.equal(await readFile(tracker.storePath, 'utf8'), bytes, 'the damaged file is untouched');
+    assert.deepEqual(await readdir(dataDir), ['issues.json'], 'no temp files left behind');
+  } finally {
+    await tracker.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 process.on('exit', () => {

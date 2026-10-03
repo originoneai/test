@@ -1,8 +1,9 @@
 // Direct IssueStore coverage for the four-level issue priority: on-disk
 // shape, write guards, corruption refusal, atomic and failed writes,
-// concurrency and reload across instances. Six-field legacy records are
-// deliberately not asserted here; their unresolved compatibility failure
-// stays visible in test/api.test.js until the legacy upgrade ships.
+// concurrency and reload across instances. The second-use compatibility
+// section pins the six-field pre-priority migration: legacy records read as
+// 'normal' without rewriting the file and upgrade atomically on the next
+// successful write.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -227,5 +228,201 @@ test('priority survives reload in a later store instance', async () => {
     const next = await reloaded.update(created.id, { priority: 'high' });
     assert.equal(next.priority, 'high');
     assert.equal((await new IssueStore(dir).list())[0].priority, 'high', 'and the new value reloads too');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Six-field legacy migration (second-use feedback)
+// ---------------------------------------------------------------------------
+
+// Case-unique pre-priority fixture: exactly the six fields a pre-priority
+// writer persisted, with its own UUID namespace, leap-day instant, mixed
+// timestamp precision and an empty description.
+const LEGACY_ID_A = 'b1a2c3d4-5e6f-4a7b-8c9d-0f1e2a3b4c5d';
+const LEGACY_ID_B = 'b1a2c3d4-5e6f-4a7b-8c9d-0f1e2a3b4c5e';
+const legacyRecord = (overrides = {}) =>
+  ({
+    id: LEGACY_ID_A,
+    title: 'Legacy triage card',
+    description: 'written before priorities existed',
+    status: 'open',
+    createdAt: '2024-02-29T08:00:00Z',
+    updatedAt: '2024-02-29T09:30:00.250Z',
+    ...overrides,
+  });
+const legacyFileBytes = (records) => JSON.stringify({ issues: records });
+
+test('legacy six-field records load as normal and reads never rewrite the file', async () => {
+  await withDir(async (dir) => {
+    const bytes = legacyFileBytes([
+      legacyRecord(),
+      legacyRecord({ id: LEGACY_ID_B, title: 'Second legacy card', description: '', status: 'in_progress' }),
+    ]);
+    await writeFile(storePathOf(dir), bytes, 'utf8');
+
+    const store = new IssueStore(dir);
+    const listed = await store.list();
+    assert.equal(listed.length, 2, 'both legacy records load');
+    assert.ok(listed.every((issue) => issue.priority === 'normal'), 'legacy records read as normal');
+    assert.equal(listed[1].id, LEGACY_ID_A, 'creation order and ids survive');
+    assert.equal(listed[0].status, 'in_progress', 'legacy fields keep their values');
+
+    const filtered = await store.list({ priority: 'normal' });
+    assert.equal(filtered.length, 2, 'the defaulted normal composes with the priority filter');
+    const none = await store.list({ priority: 'urgent' });
+    assert.equal(none.length, 0, 'an urgent filter is honestly empty for legacy data');
+    const searched = await store.list({ query: 'legacy' });
+    assert.equal(searched.length, 2, 'legacy text stays searchable');
+
+    assert.equal(await readFile(storePathOf(dir), 'utf8'), bytes, 'reads and filters leave the file byte-identical');
+    assert.deepEqual(await readdir(dir), ['issues.json'], 'reads leave no temp files');
+
+    // A fresh instance reads the same untouched bytes again.
+    const again = new IssueStore(dir);
+    assert.deepEqual(
+      (await again.list()).map((issue) => issue.priority),
+      ['normal', 'normal'],
+      'a second reader still sees the legacy records as normal',
+    );
+    assert.equal(await readFile(storePathOf(dir), 'utf8'), bytes, 'repeated reads still rewrite nothing');
+  });
+});
+
+test('a mixed valid file of legacy and seven-field records loads each correctly', async () => {
+  await withDir(async (dir) => {
+    await writeFile(
+      storePathOf(dir),
+      legacyFileBytes([
+        legacyRecord(),
+        priorityRecord({ id: '55555555-5555-4555-8555-55555555557a', priority: 'urgent' }),
+        legacyRecord({ id: LEGACY_ID_B, title: 'Second legacy card', description: '', status: 'done' }),
+      ]),
+      'utf8',
+    );
+    const store = new IssueStore(dir);
+    const listed = await store.list(); // newest first: file order reversed
+    assert.deepEqual(
+      listed.map((issue) => [issue.id, issue.priority]),
+      [
+        [LEGACY_ID_B, 'normal'],
+        ['55555555-5555-4555-8555-55555555557a', 'urgent'],
+        [LEGACY_ID_A, 'normal'],
+      ],
+      'each record keeps its own shape: legacy defaults to normal, modern keeps its value',
+    );
+    const onlyUrgent = await store.list({ priority: 'urgent' });
+    assert.deepEqual(onlyUrgent.map((issue) => issue.id), ['55555555-5555-4555-8555-55555555557a']);
+  });
+});
+
+test('the next successful write upgrades every legacy record atomically and keeps untouched timestamps', async () => {
+  await withDir(async (dir) => {
+    const bytes = legacyFileBytes([
+      legacyRecord(),
+      legacyRecord({ id: LEGACY_ID_B, title: 'Second legacy card', description: '', status: 'in_progress' }),
+    ]);
+    await writeFile(storePathOf(dir), bytes, 'utf8');
+
+    const store = new IssueStore(dir);
+    await store.update(LEGACY_ID_B, { title: 'Second legacy card, renamed' });
+
+    const stored = JSON.parse(await readFile(storePathOf(dir), 'utf8'));
+    assert.equal(stored.issues.length, 2, 'the upgrade loses no record');
+    for (const issue of stored.issues) {
+      assert.deepEqual(
+        Object.keys(issue).sort(),
+        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+        'every record now persists in the seven-field shape',
+      );
+    }
+    assert.deepEqual(
+      stored.issues.map((issue) => issue.priority),
+      ['normal', 'normal'],
+      'both legacy records upgraded to normal in the same single write',
+    );
+    const untouched = stored.issues.find((issue) => issue.id === LEGACY_ID_A);
+    assert.equal(untouched.createdAt, '2024-02-29T08:00:00Z', 'the untouched record keeps createdAt');
+    assert.equal(untouched.updatedAt, '2024-02-29T09:30:00.250Z', 'the migration never bumps updatedAt');
+    assert.equal(untouched.title, 'Legacy triage card', 'and keeps its content');
+
+    // The upgrade is durable: a fresh instance serves the seven-field file.
+    const reloaded = new IssueStore(dir);
+    assert.deepEqual(
+      (await reloaded.list({ priority: 'normal' })).map((issue) => issue.id),
+      [LEGACY_ID_B, LEGACY_ID_A],
+      'a later instance reloads the upgraded records as normal, newest first',
+    );
+  });
+});
+
+test('a failed write against a legacy file leaves it byte-identical and still usable', { skip: isRoot }, async () => {
+  await withDir(async (dir) => {
+    const bytes = legacyFileBytes([legacyRecord()]);
+    await writeFile(storePathOf(dir), bytes, 'utf8');
+
+    const store = new IssueStore(dir);
+    await chmod(dir, 0o555);
+    try {
+      await assert.rejects(store.update(LEGACY_ID_A, { priority: 'urgent' }), (err) => {
+        assert.ok(err instanceof StoreError);
+        assert.equal(err.code, 'STORE_ERROR');
+        return true;
+      });
+      await assert.rejects(store.create({ title: 'Lost', priority: 'low' }), StoreError);
+      assert.deepEqual(
+        (await store.list()).map((issue) => [issue.title, issue.priority]),
+        [['Legacy triage card', 'normal']],
+        'readers keep seeing the legacy record as normal after the failed write',
+      );
+    } finally {
+      await chmod(dir, 0o755);
+    }
+
+    assert.equal(await readFile(storePathOf(dir), 'utf8'), bytes, 'the failed write changed no bytes');
+    assert.equal(JSON.parse(bytes).issues[0].updatedAt, '2024-02-29T09:30:00.250Z', 'the failed write left updatedAt untouched');
+    assert.deepEqual(await readdir(dir), ['issues.json'], 'the failed write left no temp file');
+
+    // Recovery: the next successful write upgrades the still-legacy file and
+    // advances updatedAt, as every successful update must.
+    await store.update(LEGACY_ID_A, { priority: 'high' });
+    const stored = JSON.parse(await readFile(storePathOf(dir), 'utf8'));
+    assert.deepEqual(
+      Object.keys(stored.issues[0]).sort(),
+      ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+      'the first successful write after the failure performs the upgrade',
+    );
+    assert.equal(stored.issues[0].priority, 'high', 'the chosen priority wins over the normal default');
+    assert.equal(stored.issues[0].createdAt, '2024-02-29T08:00:00Z', 'createdAt is preserved across the upgrade');
+    assert.ok(
+      Date.parse(stored.issues[0].updatedAt) > Date.parse('2024-02-29T09:30:00.250Z'),
+      'the successful recovery update advances updatedAt',
+    );
+  });
+});
+
+test('corrupt or mixed-invalid legacy-shaped data is still refused and never rewritten', async () => {
+  await withDir(async (dir) => {
+    const badFiles = [
+      ['legacy record with an unknown field', legacyFileBytes([legacyRecord({ assignee: 'zoe' })])],
+      ['legacy record missing a second field', legacyFileBytes([
+        { id: LEGACY_ID_A, title: 'Short', description: '', status: 'open', createdAt: '2024-02-29T08:00:00Z' },
+      ])],
+      ['legacy record with a bad status', legacyFileBytes([legacyRecord({ status: 'closed' })])],
+      ['legacy record with a bad title', legacyFileBytes([legacyRecord({ title: ' padded ' })])],
+      ['valid legacy record beside a corrupt one', legacyFileBytes([legacyRecord(), 'not even an object'])],
+    ];
+    for (const [label, content] of badFiles) {
+      await writeFile(storePathOf(dir), content, 'utf8');
+      const store = new IssueStore(dir);
+      await assert.rejects(store.list(), (err) => {
+        assert.ok(err instanceof StoreError, label);
+        assert.equal(err.code, 'STORE_ERROR', label);
+        assert.ok(err.message.includes('Corrupt issue store'), label);
+        return true;
+      }, label);
+      await assert.rejects(store.create({ title: 'Nope' }), StoreError, label);
+      assert.equal(await readFile(storePathOf(dir), 'utf8'), content, 'refusal rewrites nothing: ' + label);
+      assert.deepEqual(await readdir(dir), ['issues.json'], 'refusal leaves no temp files: ' + label);
+    }
   });
 });

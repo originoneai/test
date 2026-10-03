@@ -8,7 +8,7 @@
 // not provide.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server.js';
@@ -754,6 +754,138 @@ test('changing a card out of the active priority filter removes the card and kee
     active === board.root || elementsOf(board.root).includes(active),
     'focus lands on a connected element inside the board',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Combined API/UI flow over a legacy board (second-use feedback)
+// ---------------------------------------------------------------------------
+
+// Case-unique pre-priority fixture for the mounted-board journey; its own
+// UUID namespace. Titles avoid priority words so badge matches are honest.
+const LEGACY_UI_ID_A = 'e5d7c9b1-7a6f-4e8d-8c7a-2f4a6b8d0f3a';
+const LEGACY_UI_ID_B = 'e5d7c9b1-7a6f-4e8d-8c7a-2f4a6b8d0f3b';
+
+// Boot the real server over a pre-seeded six-field file, then mount the real
+// board with the real HTTP adapter against it: the closest component-level
+// stand-in for the later integrated browser run.
+async function withLiveLegacyServer(run) {
+  const dataDir = await mkdtemp(join(tmpdir(), 'priority-ui-legacy-'));
+  await writeFile(
+    join(dataDir, 'issues.json'),
+    JSON.stringify({
+      issues: [
+        {
+          id: LEGACY_UI_ID_A,
+          title: 'Mounted legacy review card',
+          description: 'pre-priority text',
+          status: 'open',
+          createdAt: '2024-02-29T08:00:00Z',
+          updatedAt: '2024-02-29T09:30:00Z',
+        },
+        {
+          id: LEGACY_UI_ID_B,
+          title: 'Mounted legacy drafting card',
+          description: '',
+          status: 'in_progress',
+          createdAt: '2026-02-28T12:34:56Z',
+          updatedAt: '2026-02-28T12:34:56.250Z',
+        },
+      ],
+    }),
+    'utf8',
+  );
+  process.env.DATA_DIR = dataDir;
+  resetApiStore();
+  const server = createServer();
+  try {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const adapter = createHttpAdapter({ base: 'http://127.0.0.1:' + server.address().port });
+    await run({ adapter, dataDir });
+  } finally {
+    await new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections();
+    });
+    await rm(dataDir, { recursive: true, force: true });
+    resetApiStore();
+    delete process.env.DATA_DIR;
+  }
+}
+
+test('a board mounted over a live legacy file renders Normal cards, filters them, and its first card change upgrades the file', async () => {
+  await withLiveLegacyServer(async ({ adapter, dataDir }) => {
+    const board = await mountBoardWith(adapter);
+    const cards = () => byRole(board.root, 'card');
+
+    assert.equal(cards().length, 2, 'both legacy cards are on the board, not an error state');
+    assert.ok(
+      cards().every((card) => /normal/i.test(card.textContent)),
+      'legacy cards render readable Normal badges',
+    );
+
+    const toolbar = elementsOf(board.root).find((el) => el.getAttribute('role') === 'search');
+    const filter = prioritySelectIn(toolbar);
+    assert.ok(filter, 'the toolbar priority filter is present over legacy data');
+    // The real HTTP adapter loads asynchronously: wait bounded and explicitly
+    // for the board to render the expected state instead of sleeping blindly.
+    const waitFor = async (condition, message) => {
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        if (condition()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error('timed out after 2000ms waiting for ' + message);
+    };
+
+    filter.value = 'urgent';
+    await filter.dispatch('change');
+    await waitFor(() => cards().length === 0, 'the urgent filter to empty the legacy board');
+    assert.equal(cards().length, 0, 'an urgent filter honestly empties the legacy board');
+
+    filter.value = 'normal';
+    await filter.dispatch('change');
+    await waitFor(() => cards().length === 2, 'the normal filter to show both legacy cards');
+    assert.deepEqual(
+      cards().map((card) => card.getAttribute('data-issue-id')).sort(),
+      [LEGACY_UI_ID_A, LEGACY_UI_ID_B].sort(),
+      'the normal filter shows both legacy cards',
+    );
+
+    filter.value = '';
+    await filter.dispatch('change');
+    await waitFor(() => cards().length === 2, 'the cleared filter to show every legacy card');
+    assert.equal(cards().length, 2, 'clearing the filter shows every legacy card again');
+
+    const control = cardPriorityControl(board.root, LEGACY_UI_ID_A);
+    assert.ok(control, 'legacy cards expose the direct priority control');
+    assert.equal(control.value, 'normal', 'the control is seeded with the served Normal default');
+    control.value = 'high';
+    await control.dispatch('change');
+
+    const after = cardPriorityControl(board.root, LEGACY_UI_ID_A);
+    assert.ok(after && after.value === 'high', 'the saved choice renders on the card');
+
+    filter.value = 'high';
+    await filter.dispatch('change');
+    await waitFor(() => cards().length === 1, 'the high filter to show only the changed card');
+    assert.deepEqual(
+      cards().map((card) => card.getAttribute('data-issue-id')),
+      [LEGACY_UI_ID_A],
+      'the newly chosen priority is the only card under the high filter',
+    );
+
+    const raw = JSON.parse(await readFile(join(dataDir, 'issues.json'), 'utf8'));
+    assert.equal(raw.issues.length, 2, 'no record was lost');
+    for (const issue of raw.issues) {
+      assert.deepEqual(
+        Object.keys(issue).sort(),
+        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+        'the card change upgraded every record to the seven-field shape',
+      );
+    }
+    assert.equal(raw.issues.find((issue) => issue.id === LEGACY_UI_ID_A).priority, 'high');
+    assert.equal(raw.issues.find((issue) => issue.id === LEGACY_UI_ID_B).priority, 'normal');
+  });
 });
 
 process.on('exit', () => {

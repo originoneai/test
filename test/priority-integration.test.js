@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -184,6 +184,106 @@ test('unknown-outcome priority save recovers by refresh-and-compare, never blind
       );
     } finally {
       await one.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Six-field legacy journey over the real server and adapter (second feedback)
+// ---------------------------------------------------------------------------
+
+// Case-unique pre-priority fixture for the adapter journey; its own UUID
+// namespace, separate from the store-level and API-level legacy fixtures.
+const LEGACY_INT_ID_A = 'd4c3b2a1-6f5e-4d7c-9b8a-1e3f5a7c9e1f';
+const LEGACY_INT_ID_B = 'd4c3b2a1-6f5e-4d7c-9b8a-1e3f5a7c9e20';
+const SEVEN_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'];
+const legacyIntegrationBytes = () =>
+  JSON.stringify({
+    issues: [
+      {
+        id: LEGACY_INT_ID_A,
+        title: 'Adapter legacy open card',
+        description: 'pre-priority text',
+        status: 'open',
+        createdAt: '2024-02-29T08:00:00Z',
+        updatedAt: '2024-02-29T09:30:00Z',
+      },
+      {
+        id: LEGACY_INT_ID_B,
+        title: 'Adapter legacy doing card',
+        description: '',
+        status: 'in_progress',
+        createdAt: '2026-02-28T12:34:56Z',
+        updatedAt: '2026-02-28T12:34:56.250Z',
+      },
+    ],
+  });
+
+test('legacy journey: the adapter reads a legacy board as Normal and its first save upgrades it', async () => {
+  await withRoot(async (root, dataDir) => {
+    const bytes = legacyIntegrationBytes();
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(join(dataDir, 'issues.json'), bytes, 'utf8');
+    const one = await startTracker(dataDir);
+    try {
+      const adapter = createHttpAdapter({ base: one.base });
+
+      const legacyList = await adapter.list({});
+      assert.deepEqual(
+        legacyList.map((issue) => [issue.title, issue.priority]),
+        [
+          ['Adapter legacy doing card', 'normal'],
+          ['Adapter legacy open card', 'normal'],
+        ],
+        'the board adapter serves legacy records as Normal',
+      );
+      assert.ok(
+        legacyList.every((issue) => SEVEN_FIELDS.every((field) => field in issue)),
+        'served legacy records carry the full contract shape',
+      );
+
+      const onlyNormal = await adapter.list({ priority: 'normal', q: 'adapter' });
+      assert.equal(onlyNormal.length, 2, 'the adapter composes the priority filter with search over legacy data');
+      const noneUrgent = await adapter.list({ priority: 'urgent' });
+      assert.deepEqual(noneUrgent, [], 'an urgent filter over legacy data is honestly empty');
+
+      assert.equal(await readFile(join(dataDir, 'issues.json'), 'utf8'), bytes, 'adapter reads rewrote nothing');
+
+      const saved = await adapter.update(LEGACY_INT_ID_A, { priority: 'low' });
+      assert.equal(saved.priority, 'low', 'the first adapter save accepts a chosen priority');
+    } finally {
+      await one.stop();
+    }
+
+    // The file keeps creation order, so assert by id, never by array position.
+    const raw = JSON.parse(await readFile(join(dataDir, 'issues.json'), 'utf8'));
+    assert.equal(raw.issues.length, 2);
+    for (const issue of raw.issues) {
+      assert.deepEqual(
+        Object.keys(issue).sort(),
+        SEVEN_FIELDS,
+        'the adapter save upgraded every record in one write',
+      );
+    }
+    const savedRecord = raw.issues.find((issue) => issue.id === LEGACY_INT_ID_A);
+    assert.equal(savedRecord.priority, 'low', 'the saved record keeps the chosen priority');
+    assert.ok(
+      Date.parse(savedRecord.updatedAt) > Date.parse('2024-02-29T09:30:00Z'),
+      'the successful save advances the saved record updatedAt',
+    );
+    const untouched = raw.issues.find((issue) => issue.id === LEGACY_INT_ID_B);
+    assert.equal(untouched.priority, 'normal', 'the untouched legacy record upgraded to normal in the same write');
+    assert.equal(untouched.updatedAt, '2026-02-28T12:34:56.250Z', 'the untouched record keeps its timestamps');
+
+    const two = await startTracker(dataDir);
+    try {
+      const adapter = createHttpAdapter({ base: two.base });
+      const lowAfterRestart = await adapter.list({ priority: 'low' });
+      assert.deepEqual(lowAfterRestart.map((issue) => issue.id), [LEGACY_INT_ID_A], 'the chosen priority survives the restart');
+      const normalAfterRestart = await adapter.list({ priority: 'normal' });
+      assert.deepEqual(normalAfterRestart.map((issue) => issue.id), [LEGACY_INT_ID_B], 'and so does the upgraded default');
+    } finally {
+      await two.stop();
     }
   });
 });

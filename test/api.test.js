@@ -471,11 +471,12 @@ test('a corrupt store fails visibly and is never overwritten', async () => {
   );
 });
 
-// Known compatibility gap: six-field records were written before the priority
-// field existed. The loader currently refuses them as corrupt, so this test
-// fails. The planned legacy support shows such records as priority 'normal',
-// never rewrites the file on reads, and upgrades it atomically on the next
-// successful mutation, with the upgrade retained across restarts.
+// Six-field records were written before the priority field existed. Legacy
+// support shows such records as priority 'normal', never rewrites the file on
+// reads, and upgrades it atomically on the next successful mutation, with the
+// upgrade retained across restarts. Dedicated migration coverage lives in
+// test/priority-store.test.js, test/priority-api.test.js and
+// test/priority-ui.test.js.
 test('a store file with valid legacy records stays fully usable', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'issue-api-'));
   const storePath = join(dataDir, 'issues.json');
