@@ -7,7 +7,10 @@
 // to memory. Readers therefore never observe data that is not durable, and a
 // failed write leaves both disk and memory at the previous committed state, so
 // nothing uncommitted can ride along with a later successful write.
-// A corrupt store file is reported, never rewritten.
+// A corrupt store file is reported, never rewritten. Pre-priority records
+// (exactly the legacy six fields) are valid legacy data: they read as
+// 'normal' and are upgraded on disk only by the next successful write,
+// never by a read.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -15,6 +18,7 @@ import { randomUUID } from 'node:crypto';
 const DEFAULT_DATA_DIR = '.data';
 const STORE_FILENAME = 'issues.json';
 const ISSUE_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // exact, sorted
+const LEGACY_ISSUE_FIELDS = ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']; // pre-priority shape, exact, sorted
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
 const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
@@ -183,8 +187,9 @@ export class IssueStore {
     this.issues = this.#parseStore(raw);
   }
 
-  // A store file is only trusted when every record matches the data contract;
-  // anything else is corruption: it is reported and the file is kept as-is, so
+  // A store file is only trusted when every record matches the data contract
+  // or the exact pre-priority legacy shape (no priority field); anything else
+  // is corruption: it is reported and the file is kept as-is, so
   // neither reads nor later successful writes can launder it. Timestamps are
   // not compared against each other: the writer does not guarantee a monotonic
   // clock, and a system clock rollback must not invalidate real data.
@@ -206,14 +211,19 @@ export class IssueStore {
       throw refuse('expected exactly one top-level field "issues" holding an array');
     }
     const seenIds = new Set();
+    const issues = [];
     for (const [index, issue] of parsed.issues.entries()) {
       if (issue === null || typeof issue !== 'object' || Array.isArray(issue)) {
         throw refuse(`item ${index} is not an issue object.`);
       }
       const keys = Object.keys(issue).sort();
-      if (keys.join(',') !== ISSUE_FIELDS.join(',')) {
+      const keyList = keys.join(',');
+      // The only tolerated deviation from the full contract is the exact
+      // pre-priority shape: records written before the priority field existed.
+      const legacy = keyList === LEGACY_ISSUE_FIELDS.join(',');
+      if (!legacy && keyList !== ISSUE_FIELDS.join(',')) {
         throw refuse(
-          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
+          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')} or the legacy fields ${LEGACY_ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
         );
       }
       if (Object.values(issue).some((value) => typeof value !== 'string')) {
@@ -236,14 +246,18 @@ export class IssueStore {
       if (!ISSUE_STATUSES.has(issue.status)) {
         throw refuse(`item ${index} status "${issue.status}" is not one of: open, in_progress, done.`);
       }
-      if (!ISSUE_PRIORITIES.has(issue.priority)) {
+      if (!legacy && !ISSUE_PRIORITIES.has(issue.priority)) {
         throw refuse(`item ${index} priority "${issue.priority}" is not one of: low, normal, high, urgent.`);
       }
       if (!isValidIsoUtc(issue.createdAt) || !isValidIsoUtc(issue.updatedAt)) {
         throw refuse(`item ${index} createdAt/updatedAt must be valid ISO UTC timestamps.`);
       }
+      // Legacy records are upgraded in memory only: reads never touch the
+      // file, and the next successful mutation persists the whole snapshot,
+      // upgrading every legacy record in one atomic write.
+      issues.push(legacy ? { ...issue, priority: 'normal' } : issue);
     }
-    return parsed.issues;
+    return issues;
   }
 
   #enqueue(operation) {
