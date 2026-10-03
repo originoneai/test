@@ -177,34 +177,70 @@ export function expectedCreate(input) {
 // ---------------------------------------------------------------------------
 //
 // A week runs from Monday 00:00 UTC for seven days. Weeks are named by the
-// date of that Monday, "YYYY-MM-DD". Every date here is a UTC calendar date.
+// date of that Monday, "YYYY-MM-DD". Every date here is a UTC calendar date
+// (proleptic Gregorian) written with exactly four year digits, 0000 to 9999.
+//
+// Both dates of a version-1 report (weekStart and weekEndExclusive) must be
+// written that way, so the summary covers the whole weeks from Monday
+// 0000-01-03 (the first Monday of year 0000) to the week of Monday 9999-12-20
+// (ending Sunday 9999-12-26; its end, 9999-12-27, is the last Monday that can
+// still be written). Days outside those weeks belong to weeks the summary
+// cannot name.
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const pad2 = n => String(n).padStart(2, '0');
-const isoDay = date => `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+export const FIRST_WEEK_START = '0000-01-03';
+export const LAST_WEEK_START = '9999-12-20';
+/** "YYYY-MM-DD" (year zero-padded to four digits) for a UTC Date, or null outside the years 0000-9999. */
+const isoDay = date => {
+  const year = date.getUTCFullYear();
+  if (!Number.isInteger(year) || year < 0 || year > 9999) return null;
+  return `${String(year).padStart(4, '0')}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+};
+// A UTC midnight for the given calendar day. Date.UTC would read the years
+// 0-99 as 1900-1999; setUTCFullYear takes the year exactly as given.
+const utcMidnight = (year, monthIndex, day) => {
+  const date = new Date(0);
+  date.setUTCFullYear(year, monthIndex, day);
+  return date;
+};
 
-/** A real calendar date "YYYY-MM-DD" as a UTC Date, or null. */
+/** A real calendar date "YYYY-MM-DD" (years 0000-9999) as a UTC Date, or null. */
 export function parseIsoDate(text) {
   const m = typeof text === 'string' ? ISO_DATE.exec(text) : null;
   if (!m) return null;
-  const date = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  const date = utcMidnight(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   return isoDay(date) === text ? date : null;
 }
 
-/** The UTC Monday ("YYYY-MM-DD") of the week containing `date` (a Date or "YYYY-MM-DD"). */
+/**
+ * The UTC Monday ("YYYY-MM-DD") of the week containing `date` (a Date, a time
+ * value or "YYYY-MM-DD"), or null when there is none or that Monday has no
+ * four-digit year.
+ */
 export function utcWeekStart(date) {
   const day = typeof date === 'string' ? parseIsoDate(date) : new Date(date);
   if (!day || Number.isNaN(day.getTime())) return null;
-  const midnight = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+  const midnight = Math.floor(day.getTime() / DAY_MS) * DAY_MS;
   const sinceMonday = (new Date(midnight).getUTCDay() + 6) % 7;
   return isoDay(new Date(midnight - sinceMonday * DAY_MS));
 }
 
-/** `weekStart` moved by `n` days, as "YYYY-MM-DD". */
+/** `isoDate` moved by `n` days, as "YYYY-MM-DD"; null if the result has no four-digit year. */
 export function addUtcDays(isoDate, n) {
   const day = parseIsoDate(isoDate);
   return day ? isoDay(new Date(day.getTime() + n * DAY_MS)) : null;
+}
+
+/**
+ * True for a UTC Monday whose whole week, including the following Monday
+ * (weekEndExclusive), can be written with four-digit years: FIRST_WEEK_START
+ * to LAST_WEEK_START.
+ */
+export function isSupportedWeek(week) {
+  return typeof week === 'string' && utcWeekStart(week) === week
+    && week >= FIRST_WEEK_START && week <= LAST_WEEK_START;
 }
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -213,7 +249,7 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 export function formatUtcDay(isoDate) {
   const day = parseIsoDate(isoDate);
   if (!day) return String(isoDate ?? '');
-  return `${WEEKDAYS[day.getUTCDay()]} ${day.getUTCDate()} ${MONTHS[day.getUTCMonth()]} ${day.getUTCFullYear()}`;
+  return `${WEEKDAYS[day.getUTCDay()]} ${day.getUTCDate()} ${MONTHS[day.getUTCMonth()]} ${isoDate.slice(0, 4)}`;
 }
 
 const isCount = value => Number.isSafeInteger(value) && value >= 0;
@@ -227,7 +263,7 @@ const hasExactCounts = (obj, keys) => Boolean(obj && typeof obj === 'object' && 
  */
 export function isValidWeeklyReport(data, weekStart) {
   if (!data || typeof data !== 'object' || data.schemaVersion !== 1) return false;
-  if (!parseIsoDate(data.weekStart) || utcWeekStart(data.weekStart) !== data.weekStart) return false;
+  if (!isSupportedWeek(data.weekStart)) return false;
   if (weekStart && data.weekStart !== weekStart) return false;
   if (data.weekEndExclusive !== addUtcDays(data.weekStart, 7)) return false;
   const created = data.created;
@@ -550,6 +586,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const weeklyThis = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-this', text: 'This week' });
   const weeklyNext = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-next', text: 'Next week' });
   const weeklyRange = h(doc, 'p', { id: 'weekly-range', class: 'weekly-range', 'data-role': 'weekly-range' });
+  const weeklyEdge = h(doc, 'p', { id: 'weekly-edge', class: 'hint', 'data-role': 'weekly-edge', hidden: true });
   const weeklyStatus = h(doc, 'p', { class: 'weekly-status', 'data-role': 'weekly-status' });
   const weeklyErrorText = h(doc, 'span', { 'data-role': 'weekly-error-text' });
   const weeklyRetry = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-retry', text: 'Retry' });
@@ -588,6 +625,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     ),
     h(doc, 'div', { class: 'weekly-nav' }, weeklyPrev, weeklyThis, weeklyNext),
     weeklyRange,
+    weeklyEdge,
     weeklyStatus,
     weeklyError,
     weeklyResult,
@@ -1426,11 +1464,31 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
 
   // --- weekly summary behaviour ---------------------------------------------------------
   const weekLabel = week => `${formatUtcDay(week)} to ${formatUtcDay(addUtcDays(week, 6))} (UTC)`;
+  const supportedRange = () => `The weekly summary covers the weeks from ${formatUtcDay(FIRST_WEEK_START)} to ${formatUtcDay(addUtcDays(LAST_WEEK_START, 6))} (UTC), because its dates are written with four-digit years.`;
+  const outOfRange = () => new ApiError('WEEK_OUT_OF_RANGE', `That week is outside the dates it can show. ${supportedRange()}`, 0);
+  // The week each button would select, or null when that week can't be shown
+  // (the button is then disabled, so it never leads to an unsupported week).
+  const weekTargets = () => ({
+    prev: weekly.week && isSupportedWeek(addUtcDays(weekly.week, -7)) ? addUtcDays(weekly.week, -7) : null,
+    next: weekly.week && isSupportedWeek(addUtcDays(weekly.week, 7)) ? addUtcDays(weekly.week, 7) : null,
+    current: isSupportedWeek(utcWeekStart(now())) ? utcWeekStart(now()) : null,
+  });
   function renderWeekly() {
     if (!reports) return;
     const week = weekly.week;
-    weeklyRange.textContent = `Week of ${weekLabel(week)}`;
-    if (weeklyWeek.value !== week && doc.activeElement !== weeklyWeek) weeklyWeek.value = week;
+    const supported = isSupportedWeek(week);
+    weeklyRange.textContent = supported ? `Week of ${weekLabel(week)}` : 'No week selected.';
+    if (supported && weeklyWeek.value !== week && doc.activeElement !== weeklyWeek) weeklyWeek.value = week;
+    const targets = weekTargets();
+    weeklyPrev.disabled = !targets.prev;
+    weeklyNext.disabled = !targets.next;
+    weeklyThis.disabled = !targets.current;
+    const edge = !supported ? ''
+      : week === FIRST_WEEK_START ? `This is the earliest week the summary can show. ${supportedRange()}`
+        : week === LAST_WEEK_START ? `This is the latest week the summary can show. ${supportedRange()}`
+          : '';
+    weeklyEdge.textContent = edge;
+    weeklyEdge.hidden = edge === '';
     // Only a report for the week now selected is ever shown.
     const data = weekly.data && weekly.data.weekStart === week ? weekly.data : null;
     weeklySection.setAttribute('aria-busy', weekly.loading ? 'true' : 'false');
@@ -1471,6 +1529,15 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     if (!reports) return Promise.resolve(false);
     const seq = ++weekly.seq;
     const week = weekly.week;
+    if (!isSupportedWeek(week)) {
+      // Nothing to read (for example a clock outside the supported years).
+      weekly.loading = false;
+      weekly.error = outOfRange();
+      renderWeekly();
+      if (announceResult) announce(`Could not load the weekly summary: ${describe(weekly.error)}`);
+      weekly.pending = Promise.resolve(false);
+      return weekly.pending;
+    }
     weekly.loading = true;
     renderWeekly();
     const run = (async () => {
@@ -1510,9 +1577,15 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   }
   // Week selection and Retry (active once the summary is shown).
   weeklyWeek.addEventListener('change', () => {
-    const week = utcWeekStart(weeklyWeek.value);
-    if (!week) {
+    if (!parseIsoDate(weeklyWeek.value)) {
       setFieldError(weeklyWeek, weeklyWeekError, 'Enter a full date, for example 2026-09-28.');
+      return;
+    }
+    const week = utcWeekStart(weeklyWeek.value);
+    if (!isSupportedWeek(week)) {
+      // The week of that day can't be named with four-digit dates: say so and
+      // keep showing the week already selected.
+      setFieldError(weeklyWeek, weeklyWeekError, `The week of ${weeklyWeek.value} can't be shown. ${supportedRange()}`);
       return;
     }
     if (week === weekly.week && !weekly.error) {
@@ -1523,9 +1596,18 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     }
     selectWeek(week);
   });
-  weeklyPrev.addEventListener('click', () => { selectWeek(addUtcDays(weekly.week, -7)); });
-  weeklyNext.addEventListener('click', () => { selectWeek(addUtcDays(weekly.week, 7)); });
-  weeklyThis.addEventListener('click', () => { selectWeek(utcWeekStart(now())); });
+  // Each button moves only to a week the summary can show; at the first or
+  // last week it is disabled, and focus moves to the week picker rather than
+  // being lost on a button that just became disabled.
+  const moveTo = (button, key) => {
+    const target = weekTargets()[key];
+    if (!target) return;
+    selectWeek(target);
+    if (button.disabled && doc.activeElement === button) weeklyWeek.focus();
+  };
+  weeklyPrev.addEventListener('click', () => { moveTo(weeklyPrev, 'prev'); });
+  weeklyNext.addEventListener('click', () => { moveTo(weeklyNext, 'next'); });
+  weeklyThis.addEventListener('click', () => { moveTo(weeklyThis, 'current'); });
   weeklyRetry.addEventListener('click', () => {
     if (weekly.loading) return;
     loadWeekly({ announceResult: true });

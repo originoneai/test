@@ -8,8 +8,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ApiError, addUtcDays, createHttpAdapter, formatUtcDay, isValidWeeklyReport,
-  mountApp, parseIsoDate, utcWeekStart,
+  ApiError, FIRST_WEEK_START, LAST_WEEK_START, addUtcDays, createHttpAdapter, formatUtcDay,
+  isSupportedWeek, isValidWeeklyReport, mountApp, parseIsoDate, utcWeekStart,
 } from '../public/app.js';
 
 const STATUSES = ['open', 'in_progress', 'done'];
@@ -555,4 +555,215 @@ test('after an unconfirmed change the summary is read again with the board check
   assert.equal(reports.calls.length, reads + 1, 'the summary follows the server check');
   assert.equal(countOf(root, 'priority', 'urgent'), '2', 'and shows what the server now holds');
   assert.equal(countOf(root, 'priority', 'low'), '0');
+});
+
+// ---------------------------------------------------------------------------
+// Four-digit years: low years are real years, and only whole weeks whose
+// dates can be written as YYYY-MM-DD (weekStart and weekEndExclusive) are shown
+// ---------------------------------------------------------------------------
+
+// Public UTC Mondays in low years (Date.UTC would move 0-99 to 1900-1999).
+const LOW_MONDAYS = ['0099-01-05', '0100-01-04', '0999-01-07'];
+const at = (iso) => new Date(iso);
+
+test('low four-digit years parse as themselves, zero-padded, and stay real calendar dates', () => {
+  for (const monday of LOW_MONDAYS) {
+    const date = parseIsoDate(monday);
+    assert.ok(date, `${monday} parses`);
+    assert.equal(date.getUTCFullYear(), Number(monday.slice(0, 4)), `${monday} keeps its year`);
+    assert.equal(date.getUTCDay(), 1, `${monday} is a Monday`);
+    assert.equal(date.toISOString().slice(0, 10), monday, `${monday} is that UTC day`);
+  }
+  assert.equal(parseIsoDate('0000-01-01').getUTCFullYear(), 0, 'year 0000 is accepted');
+  assert.equal(parseIsoDate('0000-01-01').getUTCDay(), 6, '0000-01-01 is a Saturday (proleptic Gregorian)');
+  assert.equal(parseIsoDate('9999-12-31').getUTCDay(), 5, '9999-12-31 is a Friday');
+  assert.ok(parseIsoDate('0004-02-29'), '0004 is a leap year');
+  assert.equal(parseIsoDate('0100-02-29'), null, '0100 is not a leap year');
+  assert.ok(parseIsoDate('0000-02-29'), '0000 is a leap year');
+  assert.equal(parseIsoDate('99-01-05'), null, 'two-digit years are not dates here');
+  assert.equal(parseIsoDate('+010000-01-01'), null, 'expanded years are not accepted');
+  assert.equal(parseIsoDate('10000-01-03'), null, 'five-digit years are not accepted');
+  assert.equal(parseIsoDate('1999-01-05') && parseIsoDate('0099-01-05').getTime() === parseIsoDate('1999-01-05').getTime(), false,
+    '0099 and 1999 are different years');
+  assert.equal(formatUtcDay('0099-01-05'), 'Mon 5 Jan 0099', 'labels keep four year digits');
+  assert.equal(formatUtcDay('0000-01-03'), 'Mon 3 Jan 0000');
+  assert.equal(addUtcDays('0099-12-28', 7), '0100-01-04', 'weeks cross low year ends');
+  assert.equal(addUtcDays('0000-01-03', -7), null, 'no date before year 0000');
+  assert.equal(addUtcDays('9999-12-27', 7), null, 'no date after year 9999');
+});
+
+test('week normalization keeps low years and names no week outside four-digit years', () => {
+  assert.equal(utcWeekStart('0099-01-07'), '0099-01-05');
+  assert.equal(utcWeekStart('0099-01-11'), '0099-01-05', 'Sunday maps to its Monday');
+  assert.equal(utcWeekStart('0100-01-01'), '0099-12-28', 'a week crossing into 0100');
+  assert.equal(utcWeekStart('0100-01-04'), '0100-01-04');
+  assert.equal(utcWeekStart('0999-01-10'), '0999-01-07');
+  assert.equal(utcWeekStart(at('0099-01-11T23:59:59.999Z')), '0099-01-05', 'a Date in a low year');
+  assert.equal(utcWeekStart(at('0099-01-12T00:00:00.000Z')), '0099-01-12');
+  assert.equal(utcWeekStart(at('0099-01-05T00:00:00.000Z').getTime()), '0099-01-05', 'a time value');
+  for (const monday of LOW_MONDAYS) {
+    assert.equal(utcWeekStart(monday), monday, `${monday} is its own week`);
+    assert.equal(isSupportedWeek(monday), true, `${monday} is a supported week`);
+  }
+  // Edges near 0000.
+  assert.equal(utcWeekStart('0000-01-01'), null, 'Saturday 0000-01-01 belongs to a week starting in year -1');
+  assert.equal(utcWeekStart('0000-01-02'), null);
+  assert.equal(utcWeekStart('0000-01-03'), FIRST_WEEK_START);
+  assert.equal(FIRST_WEEK_START, '0000-01-03');
+  assert.equal(isSupportedWeek('0000-01-03'), true);
+  // Edges near 9999.
+  assert.equal(LAST_WEEK_START, '9999-12-20');
+  assert.equal(utcWeekStart('9999-12-26'), LAST_WEEK_START, 'Sunday 9999-12-26 is in the last whole week');
+  assert.equal(isSupportedWeek('9999-12-20'), true, 'its end 9999-12-27 is still four-digit');
+  assert.equal(utcWeekStart('9999-12-31'), '9999-12-27', 'the last days name their Monday');
+  assert.equal(isSupportedWeek('9999-12-27'), false, 'but that week ends in 10000 and is not supported');
+  assert.equal(isSupportedWeek('0000-01-04'), false, 'not a Monday');
+  assert.equal(isSupportedWeek('1999-01-05'), false, '1999-01-05 is a Tuesday');
+  assert.equal(isSupportedWeek(null), false);
+});
+
+test('a report for a low-year week is accepted when it echoes that week; unsupported weeks never are', async () => {
+  const empty = (weekStart, weekEndExclusive) => ({ schemaVersion: 1, weekStart, weekEndExclusive,
+    created: { total: 0, byStatus: { open: 0, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 } } });
+  assert.equal(isValidWeeklyReport(empty('0099-01-05', '0099-01-12'), '0099-01-05'), true);
+  assert.equal(isValidWeeklyReport(empty('0100-01-04', '0100-01-11'), '0100-01-04'), true);
+  assert.equal(isValidWeeklyReport(empty('0999-01-07', '0999-01-14'), '0999-01-07'), true);
+  assert.equal(isValidWeeklyReport(empty('0099-12-28', '0100-01-04'), '0099-12-28'), true, 'end in the next year');
+  assert.equal(isValidWeeklyReport(empty('0000-01-03', '0000-01-10'), '0000-01-03'), true, 'first supported week');
+  assert.equal(isValidWeeklyReport(empty('9999-12-20', '9999-12-27'), '9999-12-20'), true, 'last supported week');
+  assert.equal(isValidWeeklyReport(empty('1999-01-04', '1999-01-11'), '0099-01-05'), false, 'a 1900s echo for a low year is another week');
+  assert.equal(isValidWeeklyReport(empty('99-01-05', '99-01-12'), '0099-01-05'), false, 'unpadded years are not accepted');
+  assert.equal(isValidWeeklyReport(empty('0099-01-05', '99-01-12'), '0099-01-05'), false, 'unpadded end');
+  assert.equal(isValidWeeklyReport(empty('0099-01-05', '1999-01-12'), '0099-01-05'), false, 'end in the wrong century');
+  assert.equal(isValidWeeklyReport(empty('9999-12-27', '10000-01-03'), '9999-12-27'), false, 'a week ending after 9999');
+  assert.equal(isValidWeeklyReport(empty('9999-12-27', '+010000-01-03'), '9999-12-27'), false);
+
+  const calls = [];
+  const api = createHttpAdapter({ fetchImpl: async (url) => { calls.push(url); return jsonResponse(200, empty('0099-01-05', '0099-01-12')); } });
+  assert.deepEqual(await api.weeklyReport('0099-01-05'), empty('0099-01-05', '0099-01-12'), 'the adapter accepts the low-year report');
+  assert.equal(calls[0], '/api/reports/weekly?weekStart=0099-01-05', 'and asks for the zero-padded week');
+  const wrongCentury = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, empty('1999-01-04', '1999-01-11')) });
+  await assert.rejects(wrongCentury.weeklyReport('0099-01-05'), (e) => e.code === 'INVALID_RESPONSE');
+});
+
+test('picking low-year days reads those weeks and shows four-digit labels', async () => {
+  const { root, reports } = await mountSummary();
+  const week = byRole(root, 'weekly-week');
+  for (const [day, monday, label] of [
+    ['0099-01-07', '0099-01-05', 'Week of Mon 5 Jan 0099 to Sun 11 Jan 0099 (UTC)'],
+    ['0100-01-10', '0100-01-04', 'Week of Mon 4 Jan 0100 to Sun 10 Jan 0100 (UTC)'],
+    ['0999-01-07', '0999-01-07', 'Week of Mon 7 Jan 0999 to Sun 13 Jan 0999 (UTC)'],
+  ]) {
+    week.value = day;
+    await week.dispatch('change');
+    assert.equal(byRole(root, 'weekly-week-error').hidden, true, `${day} is accepted`);
+    assert.equal(reports.calls.at(-1), monday, `${day} reads its Monday`);
+    assert.equal(week.value, monday);
+    assert.equal(byRole(root, 'weekly-range').textContent, label);
+    assert.equal(byRole(root, 'weekly-error').hidden, true, 'the low-year report is shown, not rejected');
+    assert.match(byRole(root, 'weekly-status').textContent, /No issues were created in this week/);
+  }
+  // Previous/Next cross the 0099/0100 year end by whole weeks.
+  week.value = '0099-12-30';
+  await week.dispatch('change');
+  await byRole(root, 'weekly-next').dispatch('click');
+  assert.equal(reports.calls.at(-1), '0100-01-04');
+  await byRole(root, 'weekly-prev').dispatch('click');
+  assert.equal(reports.calls.at(-1), '0099-12-28');
+});
+
+test('days whose week cannot be written with four-digit years get a clear message and read nothing', async () => {
+  const { root, reports } = await mountSummary();
+  const week = byRole(root, 'weekly-week');
+  for (const day of ['0000-01-01', '0000-01-02', '9999-12-27', '9999-12-31']) {
+    const before = reports.calls.length;
+    week.value = day;
+    await week.dispatch('change');
+    const error = byRole(root, 'weekly-week-error');
+    assert.equal(error.hidden, false, `${day} is refused`);
+    assert.match(error.textContent, new RegExp(`The week of ${day} can't be shown\\.`));
+    assert.match(error.textContent, /weeks from Mon 3 Jan 0000 to Sun 26 Dec 9999 \(UTC\)/, 'it names the supported range');
+    assert.match(error.textContent, /four-digit years/, 'and why');
+    assert.equal(week.getAttribute('aria-invalid'), 'true');
+    assert.equal(reports.calls.length, before, 'no report is read');
+    assert.equal(byRole(root, 'weekly-range').textContent, 'Week of Mon 28 Sep 2026 to Sun 4 Oct 2026 (UTC)', 'the shown week stays');
+  }
+  for (const day of ['0000-01-03', '9999-12-26']) {
+    week.value = day;
+    await week.dispatch('change');
+    assert.equal(byRole(root, 'weekly-week-error').hidden, true, `${day} is in a supported week`);
+  }
+  assert.equal(reports.calls.at(-1), LAST_WEEK_START);
+});
+
+test('at the first and last supported weeks the boundary buttons are disabled and never leave the range', async () => {
+  const { root, doc, reports } = await mountSummary();
+  const week = byRole(root, 'weekly-week');
+  const prev = byRole(root, 'weekly-prev');
+  const next = byRole(root, 'weekly-next');
+  const edge = byRole(root, 'weekly-edge');
+  assert.equal(prev.disabled, false);
+  assert.equal(next.disabled, false);
+  assert.equal(edge.hidden, true, 'no edge note in ordinary weeks');
+
+  // One week after the first: Previous reaches it, then disables itself.
+  week.value = '0000-01-10';
+  await week.dispatch('change');
+  assert.equal(prev.disabled, false);
+  prev.focus();
+  await prev.dispatch('click');
+  assert.equal(reports.calls.at(-1), FIRST_WEEK_START);
+  assert.equal(prev.disabled, true, 'no previous week before 0000-01-03');
+  assert.equal(next.disabled, false);
+  assert.equal(doc.activeElement, week, 'focus moves to the picker, not lost on a disabled button');
+  assert.equal(edge.hidden, false);
+  assert.match(edge.textContent, /earliest week the summary can show/);
+  const reads = reports.calls.length;
+  await prev.dispatch('click');
+  assert.equal(reports.calls.length, reads, 'a click that slips through still reads nothing');
+  assert.equal(byRole(root, 'weekly-range').textContent, 'Week of Mon 3 Jan 0000 to Sun 9 Jan 0000 (UTC)');
+
+  // One week before the last: Next reaches it, then disables itself.
+  week.value = '9999-12-13';
+  await week.dispatch('change');
+  assert.equal(next.disabled, false);
+  next.focus();
+  await next.dispatch('click');
+  assert.equal(reports.calls.at(-1), LAST_WEEK_START);
+  assert.equal(next.disabled, true, 'no next week whose end is after 9999');
+  assert.equal(prev.disabled, false);
+  assert.equal(doc.activeElement, week);
+  assert.match(edge.textContent, /latest week the summary can show/);
+  await next.dispatch('click');
+  assert.equal(reports.calls.at(-1), LAST_WEEK_START, 'still the last supported week');
+  assert.equal(byRole(root, 'weekly-range').textContent, 'Week of Mon 20 Dec 9999 to Sun 26 Dec 9999 (UTC)');
+  assert.equal(byRole(root, 'weekly-this').disabled, false, 'This week stays available for a supported clock');
+  await byRole(root, 'weekly-this').dispatch('click');
+  assert.equal(reports.calls.at(-1), WEEK);
+  assert.equal(next.disabled, false);
+  assert.equal(edge.hidden, true);
+});
+
+test('This week is disabled when the clock is in a week that cannot be shown, and the summary says why', async () => {
+  // A clock in the last days of 9999: their week ends in year 10000.
+  const late = await mountSummary({ now: at('9999-12-29T12:00:00.000Z') });
+  assert.equal(late.reports.calls.length, 0, 'no report is read for an unsupported week');
+  assert.equal(byRole(late.root, 'weekly-this').disabled, true);
+  assert.equal(byRole(late.root, 'weekly-next').disabled, true);
+  assert.equal(byRole(late.root, 'weekly-prev').disabled, false, 'Previous still reaches the last supported week');
+  assert.equal(byRole(late.root, 'weekly-error').hidden, false);
+  assert.match(byRole(late.root, 'weekly-error-text').textContent, /outside the dates it can show.*four-digit years/);
+  await byRole(late.root, 'weekly-prev').dispatch('click');
+  assert.deepEqual(late.reports.calls, [LAST_WEEK_START]);
+  assert.equal(byRole(late.root, 'weekly-error').hidden, true, 'a supported week reads normally');
+  assert.equal(byRole(late.root, 'weekly-this').disabled, true, 'This week still cannot move into 9999-12-27');
+  await byRole(late.root, 'weekly-this').dispatch('click');
+  assert.deepEqual(late.reports.calls, [LAST_WEEK_START]);
+
+  // A clock in a low year is an ordinary week.
+  const low = await mountSummary({ now: at('0099-01-07T08:00:00.000Z') });
+  assert.deepEqual(low.reports.calls, ['0099-01-05']);
+  assert.equal(byRole(low.root, 'weekly-week').value, '0099-01-05');
+  assert.equal(byRole(low.root, 'weekly-this').disabled, false);
+  assert.equal(byRole(low.root, 'weekly-error').hidden, true);
 });
