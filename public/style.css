@@ -181,6 +181,40 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 .column h2:focus, .empty:focus { outline: 3px solid var(--blue-500); outline-offset: 2px; }
 .card-actions select { min-height: 36px; padding: 4px 8px; flex: 1 1 auto; width: auto; min-width: 0; }
 
+/* Weekly summary (sidebar panel): week picker, range, total and two
+   distributions. Bars are decorative; every count is also written as text. */
+.weekly { margin-top: 16px; }
+.weekly h2:focus { outline: 3px solid var(--blue-500); outline-offset: 2px; }
+.weekly input[type="date"] {
+  width: 100%; min-height: 44px; padding: 8px 10px;
+  border: 1px solid #b7c9e6; border-radius: 8px;
+  background: var(--white); color: var(--text); font: inherit;
+}
+.weekly-nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; }
+.weekly-nav .button { flex: 1 1 auto; }
+.weekly-range { margin: 0 0 8px; color: var(--blue-900); font-size: 0.9rem; font-weight: 600; overflow-wrap: anywhere; }
+.weekly-status { margin: 0 0 8px; color: var(--muted); font-size: 0.9rem; }
+.weekly.is-loading .weekly-status::before {
+  content: ""; display: inline-block; width: 0.9em; height: 0.9em; margin-right: 8px;
+  vertical-align: -0.1em;
+  border: 2px solid var(--blue-100); border-top-color: var(--blue-600); border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .weekly.is-loading .weekly-status::before { animation: none; } }
+.weekly.is-loading .weekly-result { opacity: 0.65; }
+.weekly .notice { margin: 0 0 8px; }
+.weekly-total { margin: 0 0 8px; font-size: 0.95rem; }
+.weekly-total-count { font-size: 1.6rem; font-weight: 700; color: var(--blue-900); margin-right: 4px; }
+.weekly-block h3 { margin: 8px 0 4px; font-size: 0.9rem; color: var(--blue-900); }
+.weekly-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.weekly-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; align-items: center; font-size: 0.875rem; }
+.weekly-count { font-weight: 700; font-variant-numeric: tabular-nums; }
+.weekly-track { grid-column: 1 / -1; height: 6px; border-radius: 999px; background: var(--blue-100); overflow: hidden; }
+.weekly-bar { display: block; height: 100%; width: 0; background: var(--blue-600); }
+.weekly-bar-priority-high { background: #d97706; }
+.weekly-bar-priority-urgent { background: var(--danger); }
+.weekly-bar-priority-low { background: #93b4ec; }
+
 /* Dialog */
 .edit-dialog {
   width: min(560px, calc(100vw - 24px));
@@ -203,5 +237,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 @media (min-width: 1024px) {
   .layout { grid-template-columns: 320px minmax(0, 1fr); align-items: start; }
   .sidebar { position: sticky; top: 16px; }
+  /* The sticky sidebar now also holds the Weekly summary: keep all of it
+     reachable on short screens by letting the sidebar scroll on its own. */
+  .sidebar { max-height: calc(100vh - 32px); overflow-y: auto; }
   .board { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; }
 }
