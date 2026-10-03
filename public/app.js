@@ -27,6 +27,16 @@ export const STATUS_LABELS = { open: 'Open', in_progress: 'In progress', done: '
 export const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
 export const PRIORITY_LABELS = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
 export const DEFAULT_PRIORITY = 'normal';
+
+/**
+ * The priority the board shows and filters by. A record saved before priority
+ * existed carries no priority field; it is treated as Normal on screen only.
+ * The board never writes that value back on its own: a record is changed on
+ * the server only by a save the user makes.
+ */
+export function effectivePriority(issue) {
+  return issue && PRIORITIES.includes(issue.priority) ? issue.priority : DEFAULT_PRIORITY;
+}
 export const TITLE_MAX = 120;
 export const DESCRIPTION_MAX = 4000;
 
@@ -94,8 +104,8 @@ const isIsoTime = value => typeof value === 'string' && value !== '' && !Number.
 /**
  * True when `value` has the issue shape from specs/issue-tracker.md. A priority,
  * when the record carries one, must be one of PRIORITIES. A record without the
- * field (a server that predates priority) stays readable; it shows no badge and
- * can never confirm a save that sent a priority.
+ * field (saved before priority existed) stays readable; it is shown as Normal
+ * (effectivePriority) and can never confirm a save that sent a priority.
  */
 export function isValidIssue(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -263,6 +273,19 @@ function prioritySelect(doc, id, { includeAll = false } = {}) {
   return select;
 }
 
+// The server answers 500 STORAGE_ERROR when its saved issues cannot be read or
+// written (docs/api.md: the store is corrupt or unavailable; it is never
+// rewritten). On a load, that is a data problem the user cannot fix from the
+// board, so the board explains it and how it is recovered.
+function isStorageProblem(error) {
+  return Boolean(error && error.code === 'STORAGE_ERROR' && error.status === 500);
+}
+export const STORAGE_HINT = 'The server could not read its saved issues. The data file may be damaged '
+  + '(for example after a hand edit) or storage may be unavailable. Nothing was changed or deleted: '
+  + 'the server never rewrites a file it cannot read. To recover, ask whoever runs this server to check '
+  + 'its log for the problem it found, keep a copy of the data file (issues.json), then fix it or put back '
+  + 'a good backup and restart the server. Then choose Retry.';
+
 function describe(error) {
   if (error && typeof error.message === 'string' && error.message) return error.message;
   return 'Something went wrong.';
@@ -366,7 +389,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const boardStatus = h(doc, 'p', { class: 'board-status', role: 'status', 'data-role': 'board-status' });
   const loadErrorText = h(doc, 'span', { 'data-role': 'load-error-text' });
   const retryButton = h(doc, 'button', { type: 'button', class: 'button', 'data-role': 'retry', text: 'Retry' });
-  const loadErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'load-error', hidden: true }, loadErrorText, ' ', retryButton);
+  // Extra guidance when the server says its storage cannot be read (docs/api.md:
+  // a corrupt or unavailable store answers 500 STORAGE_ERROR and is never
+  // rewritten). Hidden for other load failures.
+  const loadErrorHint = h(doc, 'p', { class: 'notice-hint', 'data-role': 'load-error-hint', hidden: true });
+  const loadErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'load-error', hidden: true }, loadErrorText, ' ', retryButton, loadErrorHint);
   const actionErrorText = h(doc, 'span', { 'data-role': 'action-error-text' });
   const dismissButton = h(doc, 'button', { type: 'button', class: 'button subtle', text: 'Dismiss' });
   const actionErrorBox = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'action-error', hidden: true }, actionErrorText, ' ', dismissButton);
@@ -460,12 +487,12 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     title.textContent = issue.title;
     const card = h(doc, 'article', { class: 'card', 'data-issue-id': issue.id, 'data-role': 'card' }, title);
     // Readable priority badge: the visible word plus a screen-reader prefix, so
-    // it never relies on colour alone. A record without priority shows none.
-    if (PRIORITIES.includes(issue.priority)) {
-      card.append(h(doc, 'p', { class: `priority-badge priority-${issue.priority}`, 'data-role': 'card-priority', 'data-priority': issue.priority },
-        h(doc, 'span', { class: 'sr-only', text: 'Priority: ' }),
-        PRIORITY_LABELS[issue.priority]), ' ');
-    }
+    // it never relies on colour alone. A record saved before priority existed
+    // shows Normal, like every new issue.
+    const shownPriority = effectivePriority(issue);
+    card.append(h(doc, 'p', { class: `priority-badge priority-${shownPriority}`, 'data-role': 'card-priority', 'data-priority': shownPriority },
+      h(doc, 'span', { class: 'sr-only', text: 'Priority: ' }),
+      PRIORITY_LABELS[shownPriority]), ' ');
     if (issue.description) {
       const desc = h(doc, 'p', { class: 'card-description', 'data-role': 'card-description' });
       desc.textContent = issue.description;
@@ -505,7 +532,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     control.setAttribute('data-role', 'card-priority-control');
     control.setAttribute('data-issue-id', id);
     control.setAttribute('aria-describedby', stateId);
-    const shown = PRIORITIES.includes(issue.priority) ? issue.priority : DEFAULT_PRIORITY;
+    const shown = effectivePriority(issue);
     // While a save is in flight the control shows the value being saved; in
     // every other state it shows the value the server last reported.
     control.value = save && (save.state === 'saving' || save.state === 'checking') ? save.target : shown;
@@ -626,9 +653,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     board.setAttribute('aria-busy', state.loading ? 'true' : 'false');
     board.classList.toggle('is-loading', state.loading);
     const keptList = state.loadError && state.issues.length > 0;
+    const storageProblem = isStorageProblem(state.loadError);
     showBox(loadErrorBox, loadErrorText, state.loadError
       ? `Could not load issues: ${describe(state.loadError)} ${keptList ? 'The board still shows the last list that loaded.' : 'The list was not updated.'} Try again.`
       : '');
+    showBox(loadErrorHint, loadErrorHint, storageProblem ? STORAGE_HINT : '');
+    // With nothing loaded, an unreadable store is not an empty board: the
+    // columns are hidden so zero counts cannot read as "no issues".
+    board.hidden = storageProblem && state.issues.length === 0;
     const groups = groupByStatus(state.issues);
     cardControls.clear();
     for (const status of STATUSES) {
@@ -644,7 +676,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       empty.hidden = items.length > 0 || state.loading || Boolean(state.loadError);
     }
     if (state.loading) boardStatus.textContent = 'Loading issues…';
-    else if (state.loadError) boardStatus.textContent = state.issues.length > 0 ? 'Issues could not be refreshed. Showing the last list that loaded.' : 'Issues could not be loaded.';
+    else if (state.loadError) {
+      boardStatus.textContent = state.issues.length > 0
+        ? 'Issues could not be refreshed. Showing the last list that loaded.'
+        : storageProblem ? 'Issues could not be loaded: the server cannot read its saved issues.' : 'Issues could not be loaded.';
+    }
     else if (state.issues.length === 0) boardStatus.textContent = filtersActive() ? 'No issues match your search.' : 'No issues yet. Create the first one.';
     else boardStatus.textContent = `${state.issues.length} ${state.issues.length === 1 ? 'issue' : 'issues'} shown.`;
     boardStatus.classList.toggle('is-loading', state.loading);
@@ -684,7 +720,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   function applyFilters(items, { status = '', priority = '', q = '' } = {}) {
     const needle = q ? q.toLowerCase() : '';
     return items.filter(issue => (!status || issue.status === status)
-      && (!priority || issue.priority === priority)
+      && (!priority || effectivePriority(issue) === priority)
       && (!needle || issue.title.toLowerCase().includes(needle)
         || (issue.description || '').toLowerCase().includes(needle)));
   }
@@ -725,6 +761,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     : ' The board below was loaded again after this check and may show newer values.');
   const quoteText = text => (text ? `“${text}”` : '(empty)');
   function issueSummary(issue) {
+    // Records without a priority field are summarised without one, so the
+    // comparison only shows what the server actually returned.
     const priority = PRIORITIES.includes(issue.priority) ? `, priority ${PRIORITY_LABELS[issue.priority]}` : '';
     return `title ${quoteText(issue.title)}, status ${STATUS_LABELS[issue.status] ?? issue.status}${priority}, description ${quoteText(issue.description)}`;
   }
@@ -874,7 +912,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     }
     if (!current) return;
     const title = current.title;
-    const previous = PRIORITIES.includes(current.priority) ? current.priority : DEFAULT_PRIORITY;
+    const previous = effectivePriority(current);
     if (!retry && next === previous) {
       // Choosing the value already saved clears an old failed state, sends nothing.
       if (pending) { prioritySaves.delete(id); render(); }
@@ -927,8 +965,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
           entry = { state: 'saved', message: `Saved: ${label} (checked with the server).` };
           message = `${lead} When checked just now, the server showed ${label}.${boardNote(obs)} Nothing more needs sending.`;
         } else {
-          const shown = PRIORITIES.includes(now.priority) ? priorityName(now.priority) : 'no priority';
-          const whose = now.priority === previous ? 'the priority from before' : 'a different priority (possibly a teammate’s change)';
+          const shown = priorityName(effectivePriority(now));
+          const whose = effectivePriority(now) === previous ? 'the priority from before' : 'a different priority (possibly a teammate’s change)';
           entry = { state: 'unknown', message: `Not confirmed. The server shows ${shown}, ${whose}. Retry sends ${label} again.` };
           message = `${lead} When checked just now, the server showed ${shown}, ${whose}.${boardNote(obs)} Retry sends ${label} again.`;
         }
@@ -976,11 +1014,11 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const FIELDS = ['title', 'description', 'status', 'priority'];
   const FIELD_LABELS = { title: 'Title', description: 'Description', status: 'Status', priority: 'Priority' };
   const fieldInputs = { title: editTitle, description: editDescription, status: editStatus, priority: editPriority };
-  // A record without priority (a server that predates it) seeds the control
-  // with the default; priority is then sent only if the user changes it.
+  // A record without priority (saved before priority existed) seeds the
+  // control with Normal; priority is then sent only if the user changes it.
   const serverValue = (issue, field) => {
     if (field === 'description') return issue.description || '';
-    if (field === 'priority') return PRIORITIES.includes(issue.priority) ? issue.priority : DEFAULT_PRIORITY;
+    if (field === 'priority') return effectivePriority(issue);
     return issue[field];
   };
   // Titles are stored trimmed (contract), so they are compared trimmed.
