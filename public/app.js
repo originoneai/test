@@ -9,6 +9,7 @@
 //   list({ status, priority, q }) -> Promise<Issue[]>          (GET   /api/issues)
 //   create({ title, description, priority }) -> Promise<Issue> (POST  /api/issues)
 //   update(id, patch) -> Promise<Issue>              (PATCH /api/issues/:id)
+//   weeklyReport(weekStart) -> Promise<WeeklyReport>  (GET   /api/reports/weekly)
 // Failures reject with ApiError { code, message, status, outcomeUnknown }.
 // outcomeUnknown is true when no trustworthy answer came back (the connection
 // failed, the response could not be read as the contract shape, or a save
@@ -172,6 +173,107 @@ export function expectedCreate(input) {
 }
 
 // ---------------------------------------------------------------------------
+// Weekly summary (GET /api/reports/weekly, version 1)
+// ---------------------------------------------------------------------------
+//
+// A week runs from Monday 00:00 UTC for seven days. Weeks are named by the
+// date of that Monday, "YYYY-MM-DD". Every date here is a UTC calendar date
+// (proleptic Gregorian) written with exactly four year digits, 0000 to 9999.
+//
+// Both dates of a version-1 report (weekStart and weekEndExclusive) must be
+// written that way, so the summary covers the whole weeks from Monday
+// 0000-01-03 (the first Monday of year 0000) to the week of Monday 9999-12-20
+// (ending Sunday 9999-12-26; its end, 9999-12-27, is the last Monday that can
+// still be written). Days outside those weeks belong to weeks the summary
+// cannot name.
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const pad2 = n => String(n).padStart(2, '0');
+export const FIRST_WEEK_START = '0000-01-03';
+export const LAST_WEEK_START = '9999-12-20';
+/** "YYYY-MM-DD" (year zero-padded to four digits) for a UTC Date, or null outside the years 0000-9999. */
+const isoDay = date => {
+  const year = date.getUTCFullYear();
+  if (!Number.isInteger(year) || year < 0 || year > 9999) return null;
+  return `${String(year).padStart(4, '0')}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+};
+// A UTC midnight for the given calendar day. Date.UTC would read the years
+// 0-99 as 1900-1999; setUTCFullYear takes the year exactly as given.
+const utcMidnight = (year, monthIndex, day) => {
+  const date = new Date(0);
+  date.setUTCFullYear(year, monthIndex, day);
+  return date;
+};
+
+/** A real calendar date "YYYY-MM-DD" (years 0000-9999) as a UTC Date, or null. */
+export function parseIsoDate(text) {
+  const m = typeof text === 'string' ? ISO_DATE.exec(text) : null;
+  if (!m) return null;
+  const date = utcMidnight(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return isoDay(date) === text ? date : null;
+}
+
+/**
+ * The UTC Monday ("YYYY-MM-DD") of the week containing `date` (a Date, a time
+ * value or "YYYY-MM-DD"), or null when there is none or that Monday has no
+ * four-digit year.
+ */
+export function utcWeekStart(date) {
+  const day = typeof date === 'string' ? parseIsoDate(date) : new Date(date);
+  if (!day || Number.isNaN(day.getTime())) return null;
+  const midnight = Math.floor(day.getTime() / DAY_MS) * DAY_MS;
+  const sinceMonday = (new Date(midnight).getUTCDay() + 6) % 7;
+  return isoDay(new Date(midnight - sinceMonday * DAY_MS));
+}
+
+/** `isoDate` moved by `n` days, as "YYYY-MM-DD"; null if the result has no four-digit year. */
+export function addUtcDays(isoDate, n) {
+  const day = parseIsoDate(isoDate);
+  return day ? isoDay(new Date(day.getTime() + n * DAY_MS)) : null;
+}
+
+/**
+ * True for a UTC Monday whose whole week, including the following Monday
+ * (weekEndExclusive), can be written with four-digit years: FIRST_WEEK_START
+ * to LAST_WEEK_START.
+ */
+export function isSupportedWeek(week) {
+  return typeof week === 'string' && utcWeekStart(week) === week
+    && week >= FIRST_WEEK_START && week <= LAST_WEEK_START;
+}
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+/** "Mon 28 Sep 2026" for a UTC calendar date (the same in every browser). */
+export function formatUtcDay(isoDate) {
+  const day = parseIsoDate(isoDate);
+  if (!day) return String(isoDate ?? '');
+  return `${WEEKDAYS[day.getUTCDay()]} ${day.getUTCDate()} ${MONTHS[day.getUTCMonth()]} ${isoDate.slice(0, 4)}`;
+}
+
+const isCount = value => Number.isSafeInteger(value) && value >= 0;
+const hasExactCounts = (obj, keys) => Boolean(obj && typeof obj === 'object' && !Array.isArray(obj))
+  && keys.every(key => isCount(obj[key]));
+
+/**
+ * A version-1 weekly report for `weekStart`: schemaVersion 1, the requested
+ * week, weekEndExclusive seven days later, and a count for every status and
+ * every priority (zeros included) that add up to the total.
+ */
+export function isValidWeeklyReport(data, weekStart) {
+  if (!data || typeof data !== 'object' || data.schemaVersion !== 1) return false;
+  if (!isSupportedWeek(data.weekStart)) return false;
+  if (weekStart && data.weekStart !== weekStart) return false;
+  if (data.weekEndExclusive !== addUtcDays(data.weekStart, 7)) return false;
+  const created = data.created;
+  if (!created || typeof created !== 'object' || !isCount(created.total)) return false;
+  if (!hasExactCounts(created.byStatus, STATUSES) || !hasExactCounts(created.byPriority, PRIORITIES)) return false;
+  const sum = (obj, keys) => keys.reduce((total, key) => total + obj[key], 0);
+  return sum(created.byStatus, STATUSES) === created.total && sum(created.byPriority, PRIORITIES) === created.total;
+}
+
+// ---------------------------------------------------------------------------
 // Live API adapter
 // ---------------------------------------------------------------------------
 
@@ -230,6 +332,14 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
     create(input) { return issueFrom('POST', '/api/issues', input, { expected: expectedCreate(input) }); },
     update(id, patch) {
       return issueFrom('PATCH', '/api/issues/' + encodeURIComponent(id), patch, { id, expected: patch });
+    },
+    // The weekly summary of issues created in the UTC week starting `weekStart`
+    // (a Monday, "YYYY-MM-DD"). Only a well-formed version-1 report for that
+    // week is returned; anything else is an error.
+    async weeklyReport(weekStart) {
+      const { data, status } = await request('GET', '/api/reports/weekly?weekStart=' + encodeURIComponent(weekStart));
+      if (!isValidWeeklyReport(data, weekStart)) throw unreadable(status);
+      return data;
     },
   };
 }
@@ -299,9 +409,13 @@ function formatTime(iso) {
 
 /**
  * Mount the board into `root`. Returns a small handle for tests and integration.
- * options: { adapter, doc, searchDelayMs }
+ * options: { adapter, doc, searchDelayMs, reports, now }
+ *   reports: an object with weeklyReport(weekStart) (the HTTP adapter has one).
+ *     When given, the board shows a Weekly summary; without it there is none.
+ *     handle.showWeeklySummary(reports) adds it to a board mounted without one.
+ *   now: the current time, for the default (current UTC) week.
  */
-export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayMs = 200 } = {}) {
+export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayMs = 200, reports: reportSource = null, now = () => new Date() } = {}) {
   if (!adapter) throw new Error('mountApp requires an adapter');
   const state = { issues: [], filters: { status: '', priority: '', q: '' }, loading: false, loadError: null, loadSeq: 0 };
   // Controls of the cards on screen, per issue id, and each column's order, so
@@ -459,11 +573,70 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // uncertain: fields of a save whose outcome is unknown and not yet observed.
   const edit = { issue: null, seed: null, placed: null, uncertain: new Set(), trigger: null, saving: false, open: false, unconfirmed: null, serverIssue: null };
 
+  // --- weekly summary -----------------------------------------------------------
+  // Issues created in one UTC week, by their current status and priority. It
+  // reads its own report from the server, so the board's search and filters
+  // never change it; board changes refresh it (refreshWeekly).
+  let reports = null;
+  const weekly = { week: null, seq: 0, loading: false, data: null, error: null, pending: Promise.resolve(), userAsked: false };
+  const weeklyHeading = h(doc, 'h2', { id: 'weekly-heading', tabindex: '-1', 'data-role': 'weekly-heading', text: 'Weekly summary' });
+  const weeklyWeek = h(doc, 'input', { id: 'weekly-week', type: 'date', 'data-role': 'weekly-week', 'aria-describedby': 'weekly-week-hint weekly-range weekly-week-error' });
+  const weeklyWeekError = h(doc, 'p', { id: 'weekly-week-error', class: 'field-error', 'data-role': 'weekly-week-error', hidden: true });
+  const weeklyPrev = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-prev', text: 'Previous week' });
+  const weeklyThis = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-this', text: 'This week' });
+  const weeklyNext = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-next', text: 'Next week' });
+  const weeklyRange = h(doc, 'p', { id: 'weekly-range', class: 'weekly-range', 'data-role': 'weekly-range' });
+  const weeklyEdge = h(doc, 'p', { id: 'weekly-edge', class: 'hint', 'data-role': 'weekly-edge', hidden: true });
+  const weeklyStatus = h(doc, 'p', { class: 'weekly-status', 'data-role': 'weekly-status' });
+  const weeklyErrorText = h(doc, 'span', { 'data-role': 'weekly-error-text' });
+  const weeklyRetry = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-retry', text: 'Retry' });
+  const weeklyError = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'weekly-error', hidden: true }, weeklyErrorText, ' ', weeklyRetry);
+  const weeklyTotal = h(doc, 'span', { class: 'weekly-total-count', 'data-role': 'weekly-total' });
+  const weeklyTotalLabel = h(doc, 'span', { 'data-role': 'weekly-total-label' });
+  const distribution = (key, title, keys, labels) => {
+    const headingId = `weekly-${key}-heading`;
+    const counts = {};
+    const bars = {};
+    const items = keys.map(k => {
+      counts[k] = h(doc, 'span', { class: 'weekly-count', 'data-role': `weekly-${key}-${k}` });
+      bars[k] = h(doc, 'span', { class: `weekly-bar weekly-bar-${key}-${k}` });
+      return h(doc, 'li', { class: 'weekly-row' },
+        h(doc, 'span', { class: 'weekly-label', text: labels[k] }), counts[k],
+        h(doc, 'span', { class: 'weekly-track', 'aria-hidden': 'true' }, bars[k]));
+    });
+    const block = h(doc, 'div', { class: 'weekly-block' },
+      h(doc, 'h3', { id: headingId, text: title }),
+      h(doc, 'ul', { class: 'weekly-list', 'aria-labelledby': headingId, 'data-role': `weekly-by-${key}` }, items));
+    return { block, counts, bars };
+  };
+  const byStatus = distribution('status', 'By current status', STATUSES, STATUS_LABELS);
+  const byPriority = distribution('priority', 'By current priority', PRIORITIES, PRIORITY_LABELS);
+  const weeklyResult = h(doc, 'div', { class: 'weekly-result', 'data-role': 'weekly-result', hidden: true },
+    h(doc, 'p', { class: 'weekly-total' }, weeklyTotal, ' ', weeklyTotalLabel),
+    byStatus.block, byPriority.block);
+  const weeklySection = h(doc, 'section', { class: 'panel weekly', 'aria-labelledby': 'weekly-heading', 'aria-busy': 'false', 'data-role': 'weekly' },
+    weeklyHeading,
+    h(doc, 'p', { class: 'hint', text: 'Issues created in the chosen week, counted by their current status and priority. The board’s search and filters do not change it.' }),
+    h(doc, 'div', { class: 'field' },
+      h(doc, 'label', { for: 'weekly-week', text: 'Week (UTC)' }),
+      weeklyWeek,
+      h(doc, 'p', { id: 'weekly-week-hint', class: 'hint', text: 'Pick any day; its Monday-to-Sunday week in UTC is shown.' }),
+      weeklyWeekError,
+    ),
+    h(doc, 'div', { class: 'weekly-nav' }, weeklyPrev, weeklyThis, weeklyNext),
+    weeklyRange,
+    weeklyEdge,
+    weeklyStatus,
+    weeklyError,
+    weeklyResult,
+  );
+
+  const sidebar = h(doc, 'aside', { class: 'sidebar' }, createForm);
   root.replaceChildren(
     header,
     live,
     h(doc, 'div', { class: 'layout' },
-      h(doc, 'aside', { class: 'sidebar' }, createForm),
+      sidebar,
       h(doc, 'div', { class: 'main' }, toolbar, loadErrorBox, actionErrorBox, priorityNotice, boardStatus, board),
     ),
     dialog,
@@ -745,6 +918,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       result = { error };
     }
     result.boardShowsIt = seq === state.loadSeq;
+    // An unknown outcome may still have changed the server: the summary follows.
+    refreshWeekly();
     if (result.boardShowsIt) {
       if (result.error) state.loadError = result.error;
       else {
@@ -804,6 +979,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       } else {
         announce(`Issue created: ${created.title}. Your new draft was kept.`);
       }
+      refreshWeekly();
       await load();
     } catch (error) {
       const unchanged = draftUnchanged();
@@ -850,6 +1026,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     showBox(actionErrorBox, actionErrorText, '');
     try {
       confirmSaved(await adapter.update(issue.id, { status: next }), { status: next }, { id: issue.id });
+      refreshWeekly();
       await load();
       restoreCardFocus(issue.id, 'card-edit', { prefix: `Moved “${issue.title}” to ${STATUS_LABELS[next]}.` });
     } catch (error) {
@@ -869,6 +1046,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         restoreCardFocus(issue.id, 'card-status');
       } else if (error?.code === 'NOT_FOUND') {
         showBox(actionErrorBox, actionErrorText, `Could not change the status of “${issue.title}”: the server no longer has this issue. The board was refreshed.`);
+        refreshWeekly();
         await load();
         restoreCardFocus(issue.id, 'card-edit', { gone: `The server no longer has “${issue.title}”.` });
       } else {
@@ -939,6 +1117,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       // Show the confirmed record at once, then reload with the current filters.
       state.issues = state.issues.map(item => (item.id === id ? saved : item));
       priorityFocusMove = null;
+      refreshWeekly();
       await load();
       if (onBoard(id)) announcePriority(id, `Priority of “${title}” saved: ${label}.`);
       else {
@@ -982,6 +1161,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         prioritySaves.delete(id);
         showBox(actionErrorBox, actionErrorText, `Could not change the priority of “${title}”: the server no longer has this issue. The board was refreshed.`);
         priorityFocusMove = null;
+        refreshWeekly();
         await load();
         announcePriority(id, `Could not change the priority of “${title}”: the server no longer has this issue.`);
       } else {
@@ -1255,6 +1435,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         await checkEdit();
       } else if (error?.code === 'NOT_FOUND') {
         showBox(editError, editError, `Could not save: the server no longer has this issue. Your changes are kept here so you can copy them. The board was refreshed.`);
+        refreshWeekly();
         await load();
       } else {
         showBox(editError, editError, `Could not save: ${describe(error)} Your changes are kept so you can try again.`);
@@ -1268,6 +1449,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     syncFromServer(updated);
     setEditBusy(true, 'Refreshing…');
     showBox(editNotice, editNotice, `Saved “${updated.title}”. Refreshing the board… Anything you change now stays here.`);
+    refreshWeekly();
     await load();
     setEditBusy(false);
     if (!edit.open || edit.issue !== updated) return;
@@ -1279,6 +1461,166 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     showBox(editNotice, editNotice, `Saved “${updated.title}”. Your newer edits (${fieldList(remaining)}) are still here and have not been saved. Choose Save changes to save them.`);
     if (!editFields.includes(doc.activeElement)) editSave.focus();
   });
+
+  // --- weekly summary behaviour ---------------------------------------------------------
+  const weekLabel = week => `${formatUtcDay(week)} to ${formatUtcDay(addUtcDays(week, 6))} (UTC)`;
+  const supportedRange = () => `The weekly summary covers the weeks from ${formatUtcDay(FIRST_WEEK_START)} to ${formatUtcDay(addUtcDays(LAST_WEEK_START, 6))} (UTC), because its dates are written with four-digit years.`;
+  const outOfRange = () => new ApiError('WEEK_OUT_OF_RANGE', `That week is outside the dates it can show. ${supportedRange()}`, 0);
+  // The week each button would select, or null when that week can't be shown
+  // (the button is then disabled, so it never leads to an unsupported week).
+  const weekTargets = () => ({
+    prev: weekly.week && isSupportedWeek(addUtcDays(weekly.week, -7)) ? addUtcDays(weekly.week, -7) : null,
+    next: weekly.week && isSupportedWeek(addUtcDays(weekly.week, 7)) ? addUtcDays(weekly.week, 7) : null,
+    current: isSupportedWeek(utcWeekStart(now())) ? utcWeekStart(now()) : null,
+  });
+  function renderWeekly() {
+    if (!reports) return;
+    const week = weekly.week;
+    const supported = isSupportedWeek(week);
+    weeklyRange.textContent = supported ? `Week of ${weekLabel(week)}` : 'No week selected.';
+    if (supported && weeklyWeek.value !== week && doc.activeElement !== weeklyWeek) weeklyWeek.value = week;
+    const targets = weekTargets();
+    weeklyPrev.disabled = !targets.prev;
+    weeklyNext.disabled = !targets.next;
+    weeklyThis.disabled = !targets.current;
+    const edge = !supported ? ''
+      : week === FIRST_WEEK_START ? `This is the earliest week the summary can show. ${supportedRange()}`
+        : week === LAST_WEEK_START ? `This is the latest week the summary can show. ${supportedRange()}`
+          : '';
+    weeklyEdge.textContent = edge;
+    weeklyEdge.hidden = edge === '';
+    // Only a report for the week now selected is ever shown.
+    const data = weekly.data && weekly.data.weekStart === week ? weekly.data : null;
+    weeklySection.setAttribute('aria-busy', weekly.loading ? 'true' : 'false');
+    weeklySection.classList.toggle('is-loading', weekly.loading);
+    weeklyRetry.setAttribute('aria-disabled', weekly.loading ? 'true' : 'false');
+    weeklyRetry.textContent = weekly.loading ? 'Retrying…' : 'Retry';
+    showBox(weeklyError, weeklyErrorText, weekly.error
+      ? `Could not load the weekly summary: ${describe(weekly.error)} ${data ? 'Showing the last summary that loaded for this week.' : ''}`.trim()
+      : '');
+    if (weekly.loading) weeklyStatus.textContent = data ? 'Updating the summary…' : 'Loading the summary…';
+    else if (weekly.error) weeklyStatus.textContent = data ? '' : 'The summary for this week is not available right now.';
+    else if (data && data.created.total === 0) weeklyStatus.textContent = 'No issues were created in this week.';
+    else weeklyStatus.textContent = '';
+    weeklyStatus.hidden = weeklyStatus.textContent === '';
+    weeklyResult.hidden = !data || data.created.total === 0;
+    if (!data) return;
+    const { total, byStatus: statusCounts, byPriority: priorityCounts } = data.created;
+    weeklyTotal.textContent = String(total);
+    weeklyTotalLabel.textContent = total === 1 ? 'issue created in this week' : 'issues created in this week';
+    const fill = (part, counts) => {
+      for (const [key, el] of Object.entries(part.counts)) el.textContent = String(counts[key]);
+      for (const [key, el] of Object.entries(part.bars)) if (el.style) el.style.width = `${total ? Math.round((counts[key] / total) * 100) : 0}%`;
+    };
+    fill(byStatus, statusCounts);
+    fill(byPriority, priorityCounts);
+  }
+  function weeklySummaryText(data) {
+    const t = data.created.total;
+    if (t === 0) return `No issues were created in the week of ${weekLabel(data.weekStart)}.`;
+    const parts = STATUSES.map(k => `${STATUS_LABELS[k]} ${data.created.byStatus[k]}`).join(', ');
+    const prios = PRIORITIES.map(k => `${PRIORITY_LABELS[k]} ${data.created.byPriority[k]}`).join(', ');
+    return `${t} ${t === 1 ? 'issue' : 'issues'} created in the week of ${weekLabel(data.weekStart)}. Status: ${parts}. Priority: ${prios}.`;
+  }
+  // Read the report for the selected week. A reply for an older request (an
+  // earlier week, or an earlier read of this week) never replaces a newer one.
+  // announce: say the result (only for loads the user asked for).
+  function loadWeekly({ announceResult = false } = {}) {
+    if (!reports) return Promise.resolve(false);
+    const seq = ++weekly.seq;
+    const week = weekly.week;
+    if (!isSupportedWeek(week)) {
+      // Nothing to read (for example a clock outside the supported years).
+      weekly.loading = false;
+      weekly.error = outOfRange();
+      renderWeekly();
+      if (announceResult) announce(`Could not load the weekly summary: ${describe(weekly.error)}`);
+      weekly.pending = Promise.resolve(false);
+      return weekly.pending;
+    }
+    weekly.loading = true;
+    renderWeekly();
+    const run = (async () => {
+      let data = null;
+      let error = null;
+      try {
+        data = await reports.weeklyReport(week);
+        if (!isValidWeeklyReport(data, week)) {
+          throw new ApiError('INVALID_RESPONSE', 'The server sent a response the board could not read.', 200, { outcomeUnknown: true });
+        }
+      } catch (err) {
+        error = err;
+      }
+      if (seq !== weekly.seq) return false;
+      weekly.loading = false;
+      if (error) weekly.error = error;
+      else { weekly.data = data; weekly.error = null; }
+      const retryHadFocus = doc.activeElement === weeklyRetry;
+      renderWeekly();
+      if (!error && retryHadFocus) weeklyHeading.focus();
+      if (announceResult) {
+        announce(error ? `Could not load the weekly summary: ${describe(error)}` : weeklySummaryText(data));
+      }
+      return !error;
+    })();
+    weekly.pending = run;
+    return run;
+  }
+  // Something on the board may have changed on the server: read the selected
+  // week again. It never touches drafts, filters or focus.
+  function refreshWeekly() { if (reports) loadWeekly(); }
+  function selectWeek(week, { announceResult = true } = {}) {
+    setFieldError(weeklyWeek, weeklyWeekError, '');
+    weekly.week = week;
+    weeklyWeek.value = week;
+    return loadWeekly({ announceResult });
+  }
+  // Week selection and Retry (active once the summary is shown).
+  weeklyWeek.addEventListener('change', () => {
+    if (!parseIsoDate(weeklyWeek.value)) {
+      setFieldError(weeklyWeek, weeklyWeekError, 'Enter a full date, for example 2026-09-28.');
+      return;
+    }
+    const week = utcWeekStart(weeklyWeek.value);
+    if (!isSupportedWeek(week)) {
+      // The week of that day can't be named with four-digit dates: say so and
+      // keep showing the week already selected.
+      setFieldError(weeklyWeek, weeklyWeekError, `The week of ${weeklyWeek.value} can't be shown. ${supportedRange()}`);
+      return;
+    }
+    if (week === weekly.week && !weekly.error) {
+      // Another day of the week already shown: name its Monday, read nothing.
+      setFieldError(weeklyWeek, weeklyWeekError, '');
+      weeklyWeek.value = week;
+      return;
+    }
+    selectWeek(week);
+  });
+  // Each button moves only to a week the summary can show; at the first or
+  // last week it is disabled, and focus moves to the week picker rather than
+  // being lost on a button that just became disabled.
+  const moveTo = (button, key) => {
+    const target = weekTargets()[key];
+    if (!target) return;
+    selectWeek(target);
+    if (button.disabled && doc.activeElement === button) weeklyWeek.focus();
+  };
+  weeklyPrev.addEventListener('click', () => { moveTo(weeklyPrev, 'prev'); });
+  weeklyNext.addEventListener('click', () => { moveTo(weeklyNext, 'next'); });
+  weeklyThis.addEventListener('click', () => { moveTo(weeklyThis, 'current'); });
+  weeklyRetry.addEventListener('click', () => {
+    if (weekly.loading) return;
+    loadWeekly({ announceResult: true });
+  });
+
+  // Show the Weekly summary for the current UTC week and read its report.
+  function showWeeklySummary(source) {
+    if (reports || !source || typeof source.weeklyReport !== 'function') return Promise.resolve(false);
+    reports = source;
+    weekly.week = utcWeekStart(now());
+    sidebar.append(weeklySection);
+    return loadWeekly();
+  }
 
   // --- filters -------------------------------------------------------------------------
   searchInput.addEventListener('input', () => {
@@ -1299,6 +1641,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   retryButton.addEventListener('click', () => load());
   refreshButton.addEventListener('click', async () => {
     if (state.loading) return;
+    refreshWeekly();
     // Announce only when this request's result is the one on the board; a
     // search or filter started meanwhile supersedes it and reports itself.
     if (await load()) announce(`Board refreshed. ${boardStatus.textContent}`);
@@ -1306,7 +1649,9 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   dismissButton.addEventListener('click', () => showBox(actionErrorBox, actionErrorText, ''));
 
   const ready = load();
-  return { state, ready, reload: load, adapter };
+  showWeeklySummary(reportSource);
+  return { state, ready, reload: load, adapter, showWeeklySummary,
+    weekly: { state: weekly, idle: () => weekly.pending, reload: () => loadWeekly() } };
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,6 +1661,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
 if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   const root = document.getElementById('app');
   if (root) {
-    mountApp(root, { adapter: createHttpAdapter(), doc: document });
+    // The board, then its Weekly summary (GET /api/reports/weekly).
+    const board = mountApp(root, { adapter: createHttpAdapter(), doc: document });
+    board.showWeeklySummary(createHttpAdapter());
   }
 }
