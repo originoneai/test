@@ -493,3 +493,369 @@ test('match finds a whole-file import and survives a restart', async () => {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// R2: the external_ref column and duplicate external-reference handling.
+// Repeated batch imports of the same history must flag duplicates inside one
+// file and against already imported issues, require an explicit
+// skip-or-import decision per flagged row, never overwrite an existing issue,
+// and still commit at most once per importKey and decision.
+// ---------------------------------------------------------------------------
+const REF_CSV = 'title,description,status,priority,external_ref\nOld one,,open,low,OPS-1\nOld two,,done,urgent,OPS-2\n';
+const DUP_IN_FILE = 'title,external_ref\nFirst,OPS-9\nSecond,OPS-9\nThird,OPS-8\n';
+const LATER_FILE = 'title,external_ref\nFresh,OPS-7\nOld again,OPS-1\n';
+const precheck = (t, payload) =>
+  t.request('/api/imports/precheck', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+const matchBody = (t, payload) =>
+  t.request('/api/imports/match', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+
+test('a file with an external_ref column imports rows that retain the old-system reference', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const res = await t.commit({ importKey: key, csv: REF_CSV });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 2);
+    const items = (await t.list()).body.items;
+    const byRef = Object.fromEntries(items.map((issue) => [issue.externalRef, issue]));
+    assert.equal(byRef['OPS-1'].title, 'Old one');
+    assert.equal(byRef['OPS-2'].status, 'done');
+    // A manually created issue keeps the exact legacy resource shape.
+    await t.request('/api/issues', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Manual' }) });
+    const manual = (await t.list()).body.items.find((issue) => issue.title === 'Manual');
+    assert.equal('externalRef' in manual, false);
+    // The stored whole-file record keeps the exact four-field shape.
+    const stored = JSON.parse(await readFile(t.storePath, 'utf8'));
+    assert.deepEqual(Object.keys(stored.imports[0]).sort(), ['createdAt', 'digest', 'importKey', 'issueIds']);
+    // The same request replays once.
+    const again = await t.commit({ importKey: key, csv: REF_CSV });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.replayed, true);
+    assert.equal((await t.list()).body.items.length, 3);
+  }));
+
+test('duplicate external references inside one file need an explicit decision', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const res = await t.commit({ importKey: key, csv: DUP_IN_FILE });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'IMPORT_DUPLICATES_UNDECIDED');
+    const duplicates = res.body.error.details.duplicates;
+    assert.deepEqual(duplicates.map((entry) => entry.line), [2, 3]);
+    for (const entry of duplicates) {
+      assert.equal(entry.externalRef, 'OPS-9');
+      assert.equal(entry.kind, 'in_file');
+    }
+    assert.equal((await t.list()).body.items.length, 0);
+    assert.equal((await t.lookup(key)).status, 404);
+  }));
+
+test('skipping a duplicate imports the rest and records the skipped line with its reason', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const res = await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: { 2: 'import', 3: 'skip' } });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 2);
+    assert.deepEqual(res.body.import.excludedRows.map((row) => row.line), [3]);
+    assert.equal(res.body.import.excludedRows[0].problems[0].column, 'external_ref');
+    assert.match(res.body.import.excludedRows[0].problems[0].reason, /OPS-9/);
+    assert.match(res.body.import.excludedRows[0].problems[0].reason, /skipped by your choice/);
+    const items = (await t.list()).body.items;
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-9').length, 1);
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-8').length, 1);
+    assert.deepEqual((await t.lookup(key)).body.import, res.body.import);
+  }));
+
+test('an external reference already imported is flagged with the earlier issue and never overwritten', () =>
+  withTracker(async (t) => {
+    await t.commit({ importKey: randomUUID(), csv: REF_CSV });
+    const earlier = (await t.list()).body.items.find((issue) => issue.externalRef === 'OPS-1');
+    const key = randomUUID();
+    const undecided = await t.commit({ importKey: key, csv: LATER_FILE });
+    assert.equal(undecided.status, 400);
+    assert.equal(undecided.body.error.code, 'IMPORT_DUPLICATES_UNDECIDED');
+    const entry = undecided.body.error.details.duplicates.find((dup) => dup.externalRef === 'OPS-1');
+    assert.equal(entry.line, 3);
+    assert.equal(entry.kind, 'already_imported');
+    assert.equal(entry.issueId, earlier.id);
+    const res = await t.commit({ importKey: key, csv: LATER_FILE, duplicateDecisions: { 2: 'import', 3: 'skip' } });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 1);
+    const items = (await t.list()).body.items;
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-1').length, 1);
+    const unchanged = items.find((issue) => issue.id === earlier.id);
+    assert.equal(unchanged.updatedAt, earlier.updatedAt);
+    assert.equal(unchanged.title, earlier.title);
+  }));
+
+test('importing a duplicate anyway is an explicit second copy, never an update', () =>
+  withTracker(async (t) => {
+    await t.commit({ importKey: randomUUID(), csv: REF_CSV });
+    const earlier = (await t.list()).body.items.find((issue) => issue.externalRef === 'OPS-1');
+    const res = await t.commit({ importKey: randomUUID(), csv: LATER_FILE, duplicateDecisions: { 2: 'import', 3: 'import' } });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 2);
+    const items = (await t.list()).body.items;
+    const withRef = items.filter((issue) => issue.externalRef === 'OPS-1');
+    assert.equal(withRef.length, 2);
+    assert.notEqual(withRef[0].id, withRef[1].id);
+    assert.equal(items.find((issue) => issue.id === earlier.id).updatedAt, earlier.updatedAt);
+  }));
+
+test('the same key replays the same decision; a different decision is a conflict', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const decisions = { 2: 'import', 3: 'skip' };
+    await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: decisions });
+    const again = await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: decisions });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.replayed, true);
+    assert.equal((await t.list()).body.items.length, 2);
+    const conflict = await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: { 2: 'import', 3: 'import' } });
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.body.error.code, 'IMPORT_CONFLICT');
+    assert.equal((await t.list()).body.items.length, 2);
+  }));
+
+test('match answers for ref-carrying files with the same content and decisions', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const committed = await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: { 2: 'import', 3: 'skip' } });
+    const storeBefore = await readFile(t.storePath, 'utf8');
+    const found = await matchBody(t, { csv: DUP_IN_FILE, duplicateDecisions: { 2: 'import', 3: 'skip' } });
+    assert.equal(found.status, 200);
+    assert.deepEqual(found.body.matches, [committed.body.import]);
+    // Without the decisions the digest names a different choice: no match,
+    // never a history-dependent rejection. Nothing is written either way.
+    const withoutDecisions = await matchBody(t, { csv: DUP_IN_FILE });
+    assert.equal(withoutDecisions.status, 200);
+    assert.deepEqual(withoutDecisions.body, { matches: [] });
+    const otherChoice = await matchBody(t, { csv: DUP_IN_FILE, duplicateDecisions: { 2: 'skip', 3: 'import' } });
+    assert.deepEqual(otherChoice.body, { matches: [] });
+    assert.equal(await readFile(t.storePath, 'utf8'), storeBefore);
+  }));
+
+test('decisions for rows that are not duplicates are ignored and still replay', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const res = await t.commit({ importKey: key, csv: REF_CSV, duplicateDecisions: { 2: 'skip' } });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 2); // the stray decision changed nothing
+    assert.deepEqual(res.body.import.excludedRows, []);
+    const items = (await t.list()).body.items;
+    assert.equal(items.length, 2);
+    // The same request — stray decision included — replays the same digest.
+    const again = await t.commit({ importKey: key, csv: REF_CSV, duplicateDecisions: { 2: 'skip' } });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.replayed, true);
+    assert.equal((await t.list()).body.items.length, 2);
+  }));
+
+test('duplicate external references on multi-digit lines are decided by their exact numbers', () =>
+  withTracker(async (t) => {
+    // OPS-DUP repeats on physical lines 10 and 100; every other row keeps a
+    // unique reference of its own (including line 9).
+    const rows = ['title,external_ref'];
+    for (let i = 2; i <= 100; i += 1) rows.push(i === 10 || i === 100 ? `Row ${i},OPS-DUP` : `Row ${i},OPS-${i}`);
+    const csv = rows.join('\n') + '\n';
+    const undecided = await t.commit({ importKey: randomUUID(), csv });
+    assert.equal(undecided.status, 400);
+    assert.equal(undecided.body.error.code, 'IMPORT_DUPLICATES_UNDECIDED');
+    assert.deepEqual(undecided.body.error.details.duplicates.map((entry) => entry.line), [10, 100]);
+    for (const entry of undecided.body.error.details.duplicates) assert.equal(entry.externalRef, 'OPS-DUP');
+    const res = await t.commit({ importKey: randomUUID(), csv, duplicateDecisions: { 10: 'import', 100: 'skip' } });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 98); // 99 rows, one skipped
+    assert.deepEqual(res.body.import.excludedRows.map((row) => row.line), [100]);
+    const items = (await t.list()).body.items;
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-DUP').length, 1);
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-9').length, 1); // line 9 is its own unique row
+  }));
+
+test('a reference shared with an invalid row does not block the healthy row', () =>
+  withTracker(async (t) => {
+    // Line 2 has no title and carries OPS-5; line 3 is healthy with the same
+    // reference. Only lines that could ever be imported count as duplicates,
+    // so the healthy row commits through the valid-rows choice with no
+    // decision, stores exactly once, and the invalid row stays out.
+    const csv = 'title,external_ref\n,OPS-5\nHealthy,OPS-5\n';
+    const res = await t.commit({ importKey: randomUUID(), csv, mode: 'valid_rows', excludedLines: [2] });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 1);
+    assert.deepEqual(res.body.import.excludedRows.map((row) => row.line), [2]);
+    assert.equal(res.body.import.excludedRows[0].problems[0].column, 'title');
+    const items = (await t.list()).body.items;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].title, 'Healthy');
+    assert.equal(items[0].externalRef, 'OPS-5');
+    // A second healthy row with the same reference IS a real duplicate now.
+    const again = await t.commit({ importKey: randomUUID(), csv: 'title,external_ref\nAgain,OPS-5\n' });
+    assert.equal(again.status, 400);
+    assert.equal(again.body.error.code, 'IMPORT_DUPLICATES_UNDECIDED');
+  }));
+
+test('a replay and a match never depend on later imported history', () =>
+  withTracker(async (t) => {
+    // Baseline: the reference is unique when this import lands, so it needs
+    // no decisions at all.
+    const key = randomUUID();
+    const baseline = await t.commit({ importKey: key, csv: REF_CSV });
+    assert.equal(baseline.status, 201);
+    // Later, another file explicitly imports OPS-1 again.
+    const later = await t.commit({ importKey: randomUUID(), csv: LATER_FILE, duplicateDecisions: { 2: 'import', 3: 'import' } });
+    assert.equal(later.status, 201);
+    // Replaying the original request — no decisions, same key and file —
+    // must still answer from the stored record, and matching it must still
+    // find it: which references exist right now changes neither answer.
+    const replay = await t.commit({ importKey: key, csv: REF_CSV });
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.replayed, true);
+    assert.deepEqual(replay.body.import, baseline.body.import);
+    const found = await matchBody(t, { csv: REF_CSV });
+    assert.equal(found.status, 200);
+    assert.deepEqual(found.body.matches, [baseline.body.import]);
+    // A NEW import of the now-taken reference still has to decide explicitly.
+    const fresh = await t.commit({ importKey: randomUUID(), csv: 'title,external_ref\nThird copy,OPS-1\n' });
+    assert.equal(fresh.status, 400);
+    assert.equal(fresh.body.error.code, 'IMPORT_DUPLICATES_UNDECIDED');
+    assert.equal(fresh.body.error.details.duplicates[0].line, 2);
+    assert.equal((await t.list()).body.items.length, 4); // nothing was added by any of the above
+  }));
+
+test('concurrent first commits of one ref-carrying key create exactly one batch', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const decisions = { 2: 'import', 3: 'skip' };
+    const results = await Promise.all([1, 2, 3, 4].map(() => t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: decisions })));
+    assert.deepEqual(
+      results.map((r) => r.status).sort(),
+      [200, 200, 200, 201],
+    );
+    const items = (await t.list()).body.items;
+    assert.equal(items.length, 2);
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-9').length, 1);
+  }));
+
+test('precheck reports exactly the duplicates a commit would decide, and none for invalid rows', () =>
+  withTracker(async (t) => {
+    await t.commit({ importKey: randomUUID(), csv: REF_CSV });
+    const earlier = (await t.list()).body.items.find((issue) => issue.externalRef === 'OPS-1');
+    // Line 2 has no title (invalid); lines 3 and 4 share OPS-5; line 5 reuses OPS-1.
+    const csv = 'title,external_ref\n,OPS-5\nFirst,OPS-5\nSecond,OPS-5\nOld again,OPS-1\n';
+    const res = await precheck(t, { csv });
+    assert.equal(res.status, 200);
+    assert.deepEqual(
+      res.body.duplicates.map((entry) => [entry.line, entry.externalRef, entry.kind]),
+      [
+        [3, 'OPS-5', 'in_file'],
+        [4, 'OPS-5', 'in_file'],
+        [5, 'OPS-1', 'already_imported'],
+      ],
+    );
+    assert.equal(res.body.duplicates[0].lines.length, 2);
+    assert.equal(res.body.duplicates[2].issueId, earlier.id);
+    // the invalid line 2 shares OPS-5 but can never be imported: no flag for it
+    assert.equal(res.body.duplicates.some((entry) => entry.line === 2), false);
+  }));
+
+test('skipping every importable row saves nothing', () =>
+  withTracker(async (t) => {
+    await t.commit({ importKey: randomUUID(), csv: REF_CSV });
+    const res = await t.commit({ importKey: randomUUID(), csv: 'title,external_ref\nOld again,OPS-1\n', duplicateDecisions: { 2: 'skip' } });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'IMPORT_INVALID');
+    assert.match(res.body.error.message, /nothing was saved/i);
+    assert.equal((await t.list()).body.items.length, 2);
+  }));
+
+test('valid_rows combines excluded invalid rows and skipped duplicates', () =>
+  withTracker(async (t) => {
+    // Lines: 2 and 3 share OPS-5; line 4 has no title; line 5 is clean.
+    const csv = 'title,external_ref,status\nA,OPS-5,open\nB,OPS-5,open\n,OPS-6,open\nC,,open\n';
+    const res = await t.commit({
+      importKey: randomUUID(),
+      csv,
+      mode: 'valid_rows',
+      excludedLines: [4],
+      duplicateDecisions: { 2: 'import', 3: 'skip' },
+    });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.import.issueCount, 2);
+    assert.deepEqual(res.body.import.excludedRows.map((row) => row.line), [3, 4]);
+    assert.equal(res.body.import.excludedRows[0].problems[0].column, 'external_ref');
+    assert.equal(res.body.import.excludedRows[1].problems[0].column, 'title');
+    const items = (await t.list()).body.items;
+    assert.deepEqual(items.map((issue) => issue.title).sort(), ['A', 'C']);
+    assert.equal(items.find((issue) => issue.title === 'A').externalRef, 'OPS-5');
+  }));
+
+test('precheck lists in-file and already-imported duplicates without writing', () =>
+  withTracker(async (t) => {
+    await t.commit({ importKey: randomUUID(), csv: REF_CSV });
+    const earlier = (await t.list()).body.items.find((issue) => issue.externalRef === 'OPS-1');
+    const storeBefore = await readFile(t.storePath, 'utf8');
+    const history = await precheck(t, { csv: LATER_FILE });
+    assert.equal(history.status, 200);
+    assert.equal(history.body.duplicates.length, 1);
+    assert.deepEqual(history.body.duplicates[0], { line: 3, externalRef: 'OPS-1', kind: 'already_imported', issueId: earlier.id, createdAt: earlier.createdAt });
+    const inFile = await precheck(t, { csv: DUP_IN_FILE });
+    assert.equal(inFile.status, 200);
+    assert.deepEqual(
+      inFile.body.duplicates.map((entry) => [entry.line, entry.externalRef, entry.kind]),
+      [
+        [2, 'OPS-9', 'in_file'],
+        [3, 'OPS-9', 'in_file'],
+      ],
+    );
+    const clean = await precheck(t, { csv: 'title,external_ref\nNew,OPS-42\n' });
+    assert.deepEqual(clean.body, { duplicates: [] });
+    assert.equal((await precheck(t, { csv: REF_CSV, extra: 1 })).status, 400);
+    assert.equal((await t.request('/api/imports/precheck')).status, 405);
+    assert.equal(await readFile(t.storePath, 'utf8'), storeBefore);
+  }));
+
+test('the lookup 404 message keeps the not-yet-confirmed meaning', () =>
+  withTracker(async (t) => {
+    const res = await t.lookup(randomUUID());
+    assert.equal(res.status, 404);
+    assert.equal(res.body.error.code, 'IMPORT_NOT_FOUND');
+    assert.match(res.body.error.message, /No committed import is stored under this importKey yet/);
+    assert.match(res.body.error.message, /may still be in flight/);
+    assert.match(res.body.error.message, /does not prove that nothing was saved/);
+    assert.doesNotMatch(res.body.error.message, /nothing was saved under it/i); // the old absolute claim is gone
+  }));
+
+test('a ref-carrying import with a skipped duplicate survives a restart', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'import-dup-restart-'));
+  let t = null;
+  try {
+    const key = randomUUID();
+    t = await boot(dataDir);
+    const first = await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: { 2: 'import', 3: 'skip' } });
+    assert.equal(first.status, 201);
+    await t.close();
+    t = null;
+    t = await boot(dataDir);
+    const lookup = await t.lookup(key);
+    assert.equal(lookup.status, 200);
+    assert.deepEqual(lookup.body.import, first.body.import);
+    const replay = await t.commit({ importKey: key, csv: DUP_IN_FILE, duplicateDecisions: { 2: 'import', 3: 'skip' } });
+    assert.equal(replay.body.replayed, true);
+    const items = (await t.list()).body.items;
+    assert.equal(items.filter((issue) => issue.externalRef === 'OPS-9').length, 1);
+    await t.close();
+    t = null;
+  } finally {
+    if (t) await t.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('an oversized external reference is a row problem naming the column', () =>
+  withTracker(async (t) => {
+    const csv = 'title,external_ref\nA,' + 'x'.repeat(101) + '\n';
+    const res = await t.commit({ importKey: randomUUID(), csv });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'IMPORT_INVALID');
+    assert.equal(res.body.error.details.rowErrors[0].problems[0].column, 'external_ref');
+    assert.equal((await t.list()).body.items.length, 0);
+  }));

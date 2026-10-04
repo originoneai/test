@@ -1,7 +1,8 @@
 // Issue API for TEST-API; implements the contract in specs/issue-tracker.md
 // and specs/weekly-delivery-summary.md.
 // Routes: GET/POST /api/issues, PATCH /api/issues/:id, GET /api/reports/weekly,
-// POST /api/imports, POST /api/imports/match, GET /api/imports/:importKey (specs/historical-issue-import.md);
+// POST /api/imports, POST /api/imports/match, POST /api/imports/precheck,
+// GET /api/imports/:importKey (specs/historical-issue-import.md);
 // other methods get 405.
 import { createHash } from 'node:crypto';
 import { IssueStore } from './store.js';
@@ -475,31 +476,93 @@ function toImportResource(record, replayed) {
   };
 }
 
-// The digest identifies the normalized batch (what would be stored), so the
-// same file re-sent after a lost acknowledgement — even re-saved with CRLF
-// or a BOM — is recognized as the same import. A whole-file import keeps its
-// original digest; a valid-rows import also binds the mode and the exact
-// excluded lines, so the same key can never be replayed as a different
-// choice (that is refused as IMPORT_CONFLICT).
-function importDigest(rows, excludedLines = null) {
-  const tuples = rows.map((row) => [row.title, row.description, row.status, row.priority]);
-  const material = excludedLines === null ? tuples : ['valid_rows', tuples, excludedLines];
-  return createHash('sha256').update(JSON.stringify(material)).digest('hex');
+// The digest identifies the exact committed choice. For files without
+// external references it stays byte-identical to the original scheme
+// (normalized rows, plus mode and excluded lines for a valid-rows import), so
+// imports committed before references existed still replay. A file that
+// carries references — or any explicit duplicate decision — instead binds the
+// pre-skip rows, the excluded lines and the whole decision map, so the digest
+// never depends on which references happen to exist at request time: the same
+// key, file and decisions always replay, and a different decision is always
+// a conflict.
+function importDigest(rows, excludedLines = null, decisions = null) {
+  const hasRefs = rows.some((row) => row.externalRef);
+  const tuples = rows.map((row) =>
+    hasRefs ? [row.title, row.description, row.status, row.priority, row.externalRef || ''] : [row.title, row.description, row.status, row.priority],
+  );
+  if (!hasRefs && !decisions) {
+    return createHash('sha256').update(JSON.stringify(excludedLines === null ? tuples : ['valid_rows', tuples, excludedLines])).digest('hex');
+  }
+  return createHash('sha256')
+    .update(JSON.stringify(['external_ref', excludedLines === null ? null : excludedLines, tuples, decisions || {}]))
+    .digest('hex');
 }
 
 const rowProblemList = (rows) =>
   rows.map((row) => ({ line: row.line, errors: row.errors, problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })) }));
+
+// duplicateDecisions maps every flagged data line to "skip" | "import".
+// Returns {ok:false} after sending the refusal, or {ok:true, value} where
+// value is null when the field was absent.
+function parseDuplicateDecisions(value, res) {
+  if (value === undefined) return { ok: true, value: null };
+  if (!isPlainObject(value)) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'duplicateDecisions must be an object mapping duplicate external_ref line numbers to "skip" or "import".');
+    return { ok: false };
+  }
+  for (const [rawLine, choice] of Object.entries(value)) {
+    if (!/^[1-9]\d*$/.test(rawLine) || !Number.isSafeInteger(Number(rawLine)) || Number(rawLine) < 2 || (choice !== 'skip' && choice !== 'import')) {
+      sendError(res, 400, 'VALIDATION_ERROR', 'duplicateDecisions keys must be data line numbers and each value must be "skip" or "import".');
+      return { ok: false };
+    }
+  }
+  return { ok: true, value };
+}
+
+// Which rows of a validated file carry a duplicate external reference:
+// repeated inside the file or already present on an imported issue — counted
+// only among rows that could ever be imported (rows without problems), like
+// the batch a commit would store. Advisory only — the preview uses it to ask
+// for skip-or-import decisions. The commit path never consults it: the store
+// re-decides duplicates against its durable snapshot inside the serialized
+// write queue, so replay, conflict and duplicate outcomes can never race
+// this read.
+async function collectDuplicateFlags(validation) {
+  const importable = validation.rows.filter((row) => row.errors.length === 0);
+  const flags = new Map();
+  for (const group of validation.duplicates) {
+    for (const line of group.lines) flags.set(line, { line, externalRef: group.externalRef, kind: 'in_file', lines: group.lines });
+  }
+  const refs = [...new Set(importable.map((row) => row.issue.externalRef).filter(Boolean))];
+  if (refs.length > 0) {
+    const existing = await getStore().listByExternalRefs(refs);
+    const firstByRef = new Map();
+    for (const issue of existing) if (!firstByRef.has(issue.externalRef)) firstByRef.set(issue.externalRef, issue);
+    for (const row of importable) {
+      const ref = row.issue.externalRef;
+      const earlier = ref ? firstByRef.get(ref) : undefined;
+      if (earlier && !flags.has(row.line)) {
+        flags.set(row.line, { line: row.line, externalRef: ref, kind: 'already_imported', issueId: earlier.id, createdAt: earlier.createdAt });
+      }
+    }
+  }
+  return flags;
+}
 
 // Commit: the server re-parses and re-validates the CSV itself. By default
 // (mode "all") any file or row problem rejects the entire batch before
 // anything is written. Only an explicit mode "valid_rows" — with the exact
 // excluded lines the user saw — commits the valid subset, atomically, and
 // records which lines were left out and why. File-level problems (limits,
-// columns, parse errors) always reject everything.
+// columns, parse errors) always reject everything. Duplicate external
+// references are decided by the store inside its serialized write queue; the
+// commit path below never reads imported history, so a same-key replay and a
+// read-only match depend only on the request's own digest.
 // Parses and validates a commit (or match) request exactly as a commit
-// would. Sends the refusal and returns null, or returns the batch that a
-// commit would store: {importKey, rows, excludedRows} where excludedRows is
-// null for a whole-file import.
+// would, without touching the store. Sends the refusal and returns null, or
+// returns the resolved batch: {importKey?, digest, rows (importable,
+// pre-skip, with line and externalRef), invalidExcluded (null |
+// [{line, problems}]), decisions (object | null)}.
 async function resolveImportRequest(req, res, { withKey }) {
   const parsed = await parseJsonBody(req, res, IMPORT_BODY_LIMIT_BYTES);
   if (!parsed) return null;
@@ -508,7 +571,7 @@ async function resolveImportRequest(req, res, { withKey }) {
     sendError(res, 400, 'VALIDATION_ERROR', 'Request body must be a JSON object.');
     return null;
   }
-  if (rejectUnknownFields(res, body, withKey ? ['importKey', 'csv', 'mode', 'excludedLines'] : ['csv', 'mode', 'excludedLines'])) return null;
+  if (rejectUnknownFields(res, body, withKey ? ['importKey', 'csv', 'mode', 'excludedLines', 'duplicateDecisions'] : ['csv', 'mode', 'excludedLines', 'duplicateDecisions'])) return null;
   if (withKey && !isImportKey(body.importKey)) {
     sendError(res, 400, 'VALIDATION_ERROR', 'importKey is required and must be a UUID chosen by the client for this import.');
     return null;
@@ -517,6 +580,8 @@ async function resolveImportRequest(req, res, { withKey }) {
     sendError(res, 400, 'VALIDATION_ERROR', 'csv is required and must be the file text.');
     return null;
   }
+  const decisions = parseDuplicateDecisions(body.duplicateDecisions, res);
+  if (!decisions.ok) return null;
   const mode = body.mode === undefined ? 'all' : body.mode;
   if (mode !== 'all' && mode !== 'valid_rows') {
     sendError(res, 400, 'VALIDATION_ERROR', 'mode must be "all" (the default) or "valid_rows".');
@@ -538,6 +603,8 @@ async function resolveImportRequest(req, res, { withKey }) {
   const validation = validateImportCsv(body.csv);
   const invalidRows = validation.rows.filter((row) => row.errors.length > 0);
   const limits = `limits: ${MAX_CSV_BYTES} bytes, ${MAX_IMPORT_ROWS} issues`;
+  let importable;
+  let invalidExcluded;
   if (mode === 'all') {
     if (!validation.valid) {
       sendError(res, 400, 'IMPORT_INVALID', `The file cannot be imported; nothing was saved (${limits}).`, {
@@ -546,79 +613,129 @@ async function resolveImportRequest(req, res, { withKey }) {
       });
       return null;
     }
-    return { importKey: body.importKey, rows: validation.rows.map((row) => row.issue), excludedRows: null };
+    importable = validation.rows;
+    invalidExcluded = null;
+  } else {
+    if (validation.fileErrors.length > 0) {
+      sendError(res, 400, 'IMPORT_INVALID', `The file cannot be imported; nothing was saved (${limits}).`, {
+        fileErrors: validation.fileErrors,
+        rowErrors: [],
+      });
+      return null;
+    }
+    const selection = validRowsSelection(validation);
+    if (!selection) {
+      sendError(
+        res,
+        400,
+        'IMPORT_INVALID',
+        invalidRows.length === 0
+          ? 'Every row is valid; import the whole file (mode "all") instead. Nothing was saved.'
+          : 'No row of this file can be imported; nothing was saved.',
+        { fileErrors: [], rowErrors: rowProblemList(invalidRows) },
+      );
+      return null;
+    }
+    if (JSON.stringify(selection.excludedLines) !== JSON.stringify(body.excludedLines)) {
+      sendError(
+        res,
+        400,
+        'IMPORT_PREVIEW_MISMATCH',
+        'The rows the server would exclude differ from the preview you confirmed; nothing was saved. Choose the file again to see a fresh preview.',
+        { excludedLines: selection.excludedLines, rowErrors: rowProblemList(selection.excluded) },
+      );
+      return null;
+    }
+    importable = selection.valid;
+    invalidExcluded = selection.excluded;
   }
-  if (validation.fileErrors.length > 0) {
-    sendError(res, 400, 'IMPORT_INVALID', `The file cannot be imported; nothing was saved (${limits}).`, {
-      fileErrors: validation.fileErrors,
-      rowErrors: [],
-    });
-    return null;
-  }
-  const selection = validRowsSelection(validation);
-  if (!selection) {
-    sendError(
-      res,
-      400,
-      'IMPORT_INVALID',
-      invalidRows.length === 0
-        ? 'Every row is valid; import the whole file (mode "all") instead. Nothing was saved.'
-        : 'No row of this file can be imported; nothing was saved.',
-      { fileErrors: [], rowErrors: rowProblemList(invalidRows) },
-    );
-    return null;
-  }
-  if (JSON.stringify(selection.excludedLines) !== JSON.stringify(body.excludedLines)) {
-    sendError(
-      res,
-      400,
-      'IMPORT_PREVIEW_MISMATCH',
-      'The rows the server would exclude differ from the preview you confirmed; nothing was saved. Choose the file again to see a fresh preview.',
-      { excludedLines: selection.excludedLines, rowErrors: rowProblemList(selection.excluded) },
-    );
-    return null;
-  }
+  const hasRefs = validation.rows.some((row) => row.issue.externalRef);
+  const rows = importable.map((row) => {
+    const { title, description, status, priority } = row.issue;
+    return row.issue.externalRef ? { line: row.line, title, description, status, priority, externalRef: row.issue.externalRef } : { line: row.line, title, description, status, priority };
+  });
+  const decisionMap = hasRefs ? decisions.value || {} : null;
+  const invalidLines = invalidExcluded === null ? null : invalidExcluded.map((row) => row.line);
   return {
-    importKey: body.importKey,
-    rows: selection.valid.map((row) => row.issue),
-    excludedRows: selection.excluded.map((row) => ({ line: row.line, problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })) })),
+    ...(withKey ? { importKey: body.importKey } : {}),
+    digest: importDigest(rows, invalidLines, decisionMap),
+    rows,
+    invalidExcluded: invalidExcluded === null ? null : invalidExcluded.map((row) => ({ line: row.line, problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })) })),
+    decisions: decisionMap,
   };
 }
 
 async function commitImport(req, res) {
   const batch = await resolveImportRequest(req, res, { withKey: true });
   if (!batch) return;
-  await commitRows(res, batch.importKey, batch.rows, batch.excludedRows);
-}
-
-const batchDigest = (batch) => importDigest(batch.rows, batch.excludedRows === null ? null : batch.excludedRows.map((row) => row.line));
-
-// Match: "was this exact content already imported?" Read-only. The request
-// is validated like a commit and matched by the same digest (normalized
-// rows, plus mode and excluded lines for a valid-rows import), so a page
-// that lost a commit response can tell an already-imported file apart from
-// a new one without guessing. Returns every committed import with that
-// digest, oldest first, each with its stored skipped rows.
-async function matchImport(req, res) {
-  const batch = await resolveImportRequest(req, res, { withKey: false });
-  if (!batch) return;
-  const records = await getStore().findImportsByDigest(batchDigest(batch));
-  sendJson(res, 200, { matches: records.map((record) => toImportResource(record, false).import) });
-}
-
-async function commitRows(res, importKey, rows, excludedRows) {
-  const digest = batchDigest({ rows, excludedRows });
   let outcome;
   try {
-    outcome = await getStore().importBatch(importKey, digest, rows, excludedRows === null ? null : { mode: 'valid_rows', excludedRows });
+    outcome = await getStore().importBatch(
+      batch.importKey,
+      batch.digest,
+      batch.rows,
+      batch.invalidExcluded === null ? null : { mode: 'valid_rows', excludedRows: batch.invalidExcluded },
+      batch.decisions,
+    );
   } catch (err) {
     if (err && err.code === 'IMPORT_CONFLICT') {
       sendError(res, 409, 'IMPORT_CONFLICT', 'This importKey was already used for a different file or a different choice of rows; choose the file again to start a new import.');
       return;
     }
+    if (err && err.code === 'IMPORT_DUPLICATES_UNDECIDED') {
+      sendError(res, 400, 'IMPORT_DUPLICATES_UNDECIDED', 'The file repeats or reuses external reference(s); each duplicate row needs an explicit skip-or-import decision before anything is saved. Nothing was saved.', err.details);
+      return;
+    }
+    if (err && err.code === 'IMPORT_INVALID') {
+      sendError(res, 400, 'IMPORT_INVALID', err.message, { fileErrors: [], rowErrors: [] });
+      return;
+    }
     throw err;
   }
   sendJson(res, outcome.replayed ? 200 : 201, toImportResource(outcome.record, outcome.replayed));
+}
+
+// Match: "was this exact content already imported?" Read-only. The request
+// is validated like a commit and matched by the same digest (normalized
+// rows, plus mode, excluded lines and duplicate decisions where they apply),
+// so a page that lost a commit response can tell an already-imported file
+// apart from a new one without guessing. The answer comes from the stored
+// records alone — never from which references happen to exist right now —
+// and duplicates without decisions simply match nothing. Returns every
+// committed import with that digest, oldest first, each with its stored
+// skipped rows.
+async function matchImport(req, res) {
+  const batch = await resolveImportRequest(req, res, { withKey: false });
+  if (!batch) return;
+  const records = await getStore().findImportsByDigest(batch.digest);
+  sendJson(res, 200, { matches: records.map((record) => toImportResource(record, false).import) });
+}
+
+// Precheck: "which rows of this file carry a duplicate external reference?"
+// Read-only, exactly what a commit would flag — repeats inside the file and
+// references already present on imported issues — so a preview can collect an
+// explicit skip-or-import decision per flagged row. A file a commit would
+// refuse for other reasons has nothing checkable and answers empty.
+async function precheckImport(req, res) {
+  const parsed = await parseJsonBody(req, res, IMPORT_BODY_LIMIT_BYTES);
+  if (!parsed) return;
+  const body = parsed.value;
+  if (!isPlainObject(body)) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'Request body must be a JSON object.');
+    return;
+  }
+  if (rejectUnknownFields(res, body, ['csv'])) return;
+  if (typeof body.csv !== 'string') {
+    sendError(res, 400, 'VALIDATION_ERROR', 'csv is required and must be the file text.');
+    return;
+  }
+  const validation = validateImportCsv(body.csv);
+  if (validation.fileErrors.length > 0 || validation.rows.length === 0) {
+    sendJson(res, 200, { duplicates: [] });
+    return;
+  }
+  const flags = await collectDuplicateFlags(validation);
+  sendJson(res, 200, { duplicates: [...flags.values()].sort((a, b) => a.line - b.line) });
 }
 
 async function lookupImport(res, rawKey) {
@@ -634,7 +751,15 @@ async function lookupImport(res, rawKey) {
   }
   const record = await getStore().getImport(key);
   if (!record) {
-    sendError(res, 404, 'IMPORT_NOT_FOUND', 'No committed import has this importKey; nothing was saved under it.');
+    // A missing record is not proof that nothing was saved: a commit of this
+    // key may still be in flight and not visible yet. Re-checking later is
+    // always safe, and retrying the same commit applies it at most once.
+    sendError(
+      res,
+      404,
+      'IMPORT_NOT_FOUND',
+      'No committed import is stored under this importKey yet. This does not prove that nothing was saved: a commit of this key may still be in flight. Check again shortly, or send the same commit again — the same importKey and rows commit at most once.',
+    );
     return;
   }
   sendJson(res, 200, toImportResource(record, false));
@@ -688,6 +813,15 @@ export async function handleApi(req, res) {
       }
       res.setHeader('Allow', 'POST');
       sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/imports/match.`);
+      return;
+    }
+    if (url.pathname === '/api/imports/precheck') {
+      if (req.method === 'POST') {
+        await precheckImport(req, res);
+        return;
+      }
+      res.setHeader('Allow', 'POST');
+      sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/imports/precheck.`);
       return;
     }
     const importMatch = url.pathname.match(/^\/api\/imports\/([^/]+)$/);
