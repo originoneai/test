@@ -84,7 +84,7 @@ const sharedStorage = () => {
   };
 };
 
-function setup(responses = [], { storage, matches } = {}) {
+function setup(responses = [], { storage, matches, prechecks } = {}) {
   const calls = [];
   const client = {
     commit: async (importKey, csv, options = {}) => {
@@ -103,9 +103,16 @@ function setup(responses = [], { storage, matches } = {}) {
       return matches.shift();
     };
   }
+  // Optional server-side duplicate-external-reference precheck.
+  if (prechecks) {
+    client.precheck = async (csv) => {
+      calls.push({ kind: 'precheck', csv });
+      return prechecks.shift();
+    };
+  }
   const imported = [];
   const root = new FakeElement('main');
-  mountImportPanel(root, {
+  const panel = mountImportPanel(root, {
     client,
     doc,
     onImported: (record) => imported.push(record),
@@ -116,7 +123,7 @@ function setup(responses = [], { storage, matches } = {}) {
     one('import-file').files = [fakeFile(name, text)];
     await one('import-file').fire('change');
   };
-  return { root, one, choose, calls, imported };
+  return { root, one, choose, calls, imported, panel };
 }
 
 const VALID = '\uFEFFtitle,description,status,priority\r\n中文标题,"带逗号, 和\r\n换行",done,urgent\r\nSecond,,,\r\n';
@@ -797,4 +804,277 @@ test('Check pending results also closes the matching preview with its confirmed 
   assert.equal(second.one('import-preview').hidden, true);
   assert.equal(second.one('import-check').hidden, true);
   assert.match(second.one('import-errors').textContent, /Line 3, column title: title is required\./);
+});
+
+// ---------------------------------------------------------------------------
+// R2: the external_ref column. Duplicate external references inside one file
+// and against already imported issues are flagged in the preview; every
+// flagged row needs an explicit skip-or-import decision before anything can
+// be sent, the server independently re-checks and refuses undecided duplicate
+// rows before any write, and skipped duplicates come back listed with their
+// reasons.
+// ---------------------------------------------------------------------------
+const REF_FILE = 'title,status,external_ref\nFirst,open,OPS-9\nSecond,open,OPS-9\nThird,open,OPS-8\n';
+const decide = async (ui, line, choice) => {
+  const select = ui.root.role('import-row-decision').find((node) => node.attributes['data-line'] === String(line));
+  select.value = choice;
+  await select.fire('change');
+};
+
+test('duplicate external references inside one file are flagged with an explicit per-row decision', async () => {
+  const ui = setup();
+  await ui.choose('dup.csv', REF_FILE);
+  const decisions = ui.root.role('import-row-decision');
+  assert.deepEqual(decisions.map((node) => node.attributes['data-line']), ['2', '3']);
+  assert.equal(ui.one('import-confirm').disabled, true);
+  const results = ui.root.role('import-row-outcome').map((cell) => cell.textContent);
+  assert.match(results[0], /duplicate/i);
+  assert.match(results[0], /decide/i);
+  assert.equal(results[2], 'Will be imported'); // the unique reference is unaffected
+  await ui.one('import-confirm').fire('click');
+  assert.equal(ui.calls.length, 0);
+});
+
+test('deciding skip and import sends the exact decision map and shows the skipped duplicate', async () => {
+  const skipped = {
+    outcome: 'ok',
+    status: 201,
+    body: {
+      import: {
+        importKey: 'k', status: 'committed', mode: 'valid_rows', createdAt: 't', issueCount: 2, issueIds: [],
+        excludedRows: [{ line: 3, problems: [{ column: 'external_ref', reason: 'external_ref "OPS-9" appears on lines 2, 3 of this file; this row was skipped by your choice.' }] }],
+      },
+      replayed: false,
+    },
+  };
+  const ui = setup([skipped]);
+  await ui.choose('dup.csv', REF_FILE);
+  await decide(ui, 2, 'import');
+  assert.equal(ui.one('import-confirm').disabled, true); // one decision is not enough
+  await decide(ui, 3, 'skip');
+  assert.equal(ui.one('import-confirm').disabled, false);
+  assert.equal(ui.one('import-confirm').textContent, 'Import 2 issues');
+  await ui.one('import-confirm').fire('click');
+  assert.equal(ui.calls.length, 1);
+  assert.deepEqual(ui.calls[0].options, { duplicateDecisions: { 2: 'import', 3: 'skip' } });
+  assert.match(ui.one('import-status').textContent, /Skipped 1 row with problems \(line 3\)/);
+  assert.match(ui.one('import-errors').textContent, /Line 3, column external_ref/);
+  assert.equal(ui.imported.length, 1);
+});
+
+test('rows already imported are flagged from the server precheck', async () => {
+  const ui = setup(
+    [{ outcome: 'ok', status: 201, body: { import: { importKey: 'k', status: 'committed', createdAt: 't', issueCount: 1, issueIds: [], excludedRows: [] }, replayed: false } }],
+    { prechecks: [{ outcome: 'ok', duplicates: [{ line: 2, externalRef: 'OPS-1', kind: 'already_imported', issueId: 'earlier', createdAt: 't0' }] }] },
+  );
+  await ui.choose('later.csv', 'title,external_ref\nOld again,OPS-1\nFresh,OPS-7\n');
+  assert.deepEqual(ui.calls.map((call) => call.kind), ['precheck']);
+  assert.equal(ui.calls[0].csv, 'title,external_ref\nOld again,OPS-1\nFresh,OPS-7\n');
+  assert.deepEqual(ui.root.role('import-row-decision').map((node) => node.attributes['data-line']), ['2']);
+  assert.match(ui.root.role('import-row-outcome')[0].textContent, /already imported/i);
+  await decide(ui, 2, 'skip');
+  assert.equal(ui.one('import-confirm').disabled, false);
+  await ui.one('import-confirm').fire('click');
+  assert.deepEqual(ui.calls[1].options, { duplicateDecisions: { 2: 'skip' } });
+  assert.equal(ui.imported.length, 1);
+});
+
+test('every flagged row must be decided before importing', async () => {
+  const ui = setup();
+  await ui.choose('dup.csv', REF_FILE);
+  await decide(ui, 2, 'skip');
+  assert.equal(ui.one('import-confirm').disabled, true);
+  await decide(ui, 3, 'skip');
+  assert.equal(ui.one('import-confirm').disabled, false); // the unique OPS-8 row remains importable
+  await decide(ui, 3, 'import');
+  await decide(ui, 2, 'import');
+  assert.equal(ui.one('import-confirm').disabled, false);
+  // a file whose every row is a duplicate imports nothing once both are skipped
+  const all = setup();
+  await all.choose('all-dup.csv', 'title,external_ref\nA,OPS-9\nB,OPS-9\n');
+  await decide(all, 2, 'skip');
+  assert.equal(all.one('import-confirm').disabled, true);
+  await decide(all, 3, 'skip');
+  assert.equal(all.one('import-confirm').disabled, true);
+  await all.one('import-confirm').fire('click');
+  assert.equal(all.calls.length, 0);
+});
+
+test('when the precheck cannot answer, the panel says so and the server stays the guard', async () => {
+  const ui = setup(
+    [{ outcome: 'ok', status: 201, body: { import: { importKey: 'k', status: 'committed', createdAt: 't', issueCount: 1, issueIds: [], excludedRows: [] }, replayed: false } }],
+    { prechecks: [{ outcome: 'unknown' }] },
+  );
+  await ui.choose('later.csv', 'title,external_ref\nFresh,OPS-7\n');
+  assert.match(ui.one('import-status').textContent, /unavailable/i);
+  assert.equal(ui.one('import-confirm').disabled, false); // no in-file duplicate is provable
+  await ui.one('import-confirm').fire('click');
+  assert.deepEqual(ui.calls[1].options, {}); // the server re-checks duplicates and refuses undecided ones before any write
+});
+
+test('an undecided-duplicate refusal distinguishes a first send from an unconfirmed retry', async () => {
+  const undecided = {
+    outcome: 'rejected',
+    status: 400,
+    body: {
+      error: {
+        code: 'IMPORT_DUPLICATES_UNDECIDED',
+        message: 'The file repeats or reuses external reference(s).',
+        details: { duplicates: [{ line: 2, externalRef: 'OPS-1', kind: 'already_imported', issueId: 'i', createdAt: 't0', reason: 'external_ref "OPS-1" was already imported (issue i); decide skip or import.' }] },
+      },
+    },
+  };
+  // First send of a fresh key: a definite refusal — nothing was saved.
+  const first = setup([undecided], { storage: sharedStorage(), prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await first.choose('r.csv', 'title,external_ref\nOld,OPS-1\n');
+  await first.one('import-confirm').fire('click');
+  assert.match(first.one('import-status').textContent, /Nothing was saved; choose the file again/);
+  assert.match(first.one('import-errors').textContent, /Line 2, column external_ref/);
+  assert.equal(first.one('import-recovery').hidden, true);
+  // Retry after an unknown outcome: the earlier send may already be committed.
+  const retry = setup([{ outcome: 'unknown' }, undecided], { storage: sharedStorage(), prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await retry.choose('r.csv', 'title,external_ref\nOld,OPS-1\n');
+  await retry.one('import-confirm').fire('click');
+  await retry.one('import-confirm').fire('click');
+  assert.match(retry.one('import-status').textContent, /earlier unconfirmed send stays recorded/);
+  assert.equal(retry.one('import-check').hidden, false);
+  assert.equal(retry.one('import-recovery').hidden, false);
+});
+
+test('the valid-rows choice is frozen while its send is unconfirmed', async () => {
+  const ui = setup([{ outcome: 'unknown' }, { outcome: 'ok', ...subsetOk(2, [3, 5], true) }], { storage: sharedStorage() });
+  await ui.choose('mixed.csv', MIXED);
+  await toggle(ui, true);
+  await ui.one('import-confirm').fire('click');
+  assert.equal(ui.one('import-status').textContent, 'Result unknown.');
+  // Flipping the checkbox must not redefine the pending import's choice.
+  ui.one('import-valid-only').checked = false;
+  await ui.one('import-valid-only').fire('change');
+  assert.equal(ui.one('import-valid-only').checked, true);
+  assert.equal(ui.one('import-valid-only').disabled, true);
+  await ui.one('import-confirm').fire('click');
+  assert.deepEqual(ui.calls[1].options, ui.calls[0].options); // the same choice retries
+  assert.match(ui.one('import-status').textContent, /Already imported earlier/);
+});
+
+test('mixed skip totals count invalid rows and skipped duplicates together', async () => {
+  // Lines 2 and 3 share OPS-5; line 5 has no title; line 4 is clean.
+  const csv = 'title,external_ref\nA,OPS-5\nB,OPS-5\nC,OPS-6\n,OPS-7\n';
+  const skipped = {
+    outcome: 'ok',
+    status: 201,
+    body: {
+      import: {
+        importKey: 'k', status: 'committed', mode: 'valid_rows', createdAt: 't', issueCount: 2, issueIds: [],
+        excludedRows: [
+          { line: 3, problems: [{ column: 'external_ref', reason: 'external_ref "OPS-5" appears on lines 2, 3 of this file; this row was skipped by your choice.' }] },
+          { line: 5, problems: [{ column: 'title', reason: 'title is required.' }] },
+        ],
+      },
+      replayed: false,
+    },
+  };
+  const ui = setup([skipped], { prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await ui.choose('mixed-dup.csv', csv);
+  await toggle(ui, true);
+  await decide(ui, 2, 'import');
+  await decide(ui, 3, 'skip');
+  assert.equal(ui.one('import-confirm').disabled, false);
+  assert.equal(ui.one('import-confirm').textContent, 'Import 2 valid rows, skip 2'); // 1 invalid + 1 skipped duplicate
+  await ui.one('import-confirm').fire('click');
+  assert.deepEqual(ui.calls[1].options, { mode: 'valid_rows', excludedLines: [5], duplicateDecisions: { 2: 'import', 3: 'skip' } });
+  assert.match(ui.one('import-status').textContent, /Skipped 2 rows with problems \(lines 3, 5\)/);
+});
+
+test('a ref file without duplicates sends the unchanged default request', async () => {
+  const ui = setup([okResponse(2)], { prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await ui.choose('clean.csv', 'title,external_ref\nOne,OPS-1\nTwo,OPS-2\n');
+  assert.equal(ui.root.role('import-row-decision').length, 0);
+  assert.equal(ui.one('import-confirm').disabled, false);
+  await ui.one('import-confirm').fire('click');
+  assert.deepEqual(ui.calls[1].options, {});
+});
+
+test('a programmatic preview() call also applies the precheck answer', async () => {
+  const ui = setup([], {
+    prechecks: [{ outcome: 'ok', duplicates: [{ line: 2, externalRef: 'OPS-1', kind: 'already_imported', issueId: 'earlier', createdAt: 't0' }] }],
+  });
+  // No file input involved: the module's own returned preview API, guarded
+  // exactly like a file-selection preview.
+  await ui.panel.preview('title,external_ref\nOld again,OPS-1\nFresh,OPS-2\n', 'later.csv');
+  assert.deepEqual(ui.calls.map((call) => call.kind), ['precheck']);
+  assert.deepEqual(ui.root.role('import-row-decision').map((node) => node.attributes['data-line']), ['2']);
+  assert.match(ui.root.role('import-row-outcome')[0].textContent, /already imported/i);
+  assert.equal(ui.one('import-confirm').disabled, true); // the flagged row still needs a decision
+});
+
+test('duplicate decision controls render enabled on a ready preview', async () => {
+  const ui = setup([], { prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await ui.choose('dup.csv', REF_FILE);
+  const decisions = ui.root.role('import-row-decision');
+  assert.equal(decisions.length, 2);
+  for (const select of decisions) assert.equal(select.disabled, false, 'a completed file preview must offer enabled decision controls');
+  assert.equal(ui.one('import-confirm').disabled, true); // …while a duplicate row is still undecided
+});
+
+test('decision controls really become disabled once a commit is sent', async () => {
+  const ui = setup([{ outcome: 'unknown' }], { storage: sharedStorage(), prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await ui.choose('dup.csv', REF_FILE);
+  await decide(ui, 2, 'import');
+  await decide(ui, 3, 'skip');
+  const before = ui.root.role('import-row-decision');
+  assert.equal(before.every((select) => select.disabled === false), true);
+  await ui.one('import-confirm').fire('click');
+  const during = ui.root.role('import-row-decision');
+  assert.equal(during.length, 2);
+  for (const select of during) assert.equal(select.disabled, true, 'the sent intent stays visibly frozen while the outcome is unknown');
+  // A forced change on the disabled control neither sticks nor resends anything.
+  during[0].value = 'skip';
+  await during[0].fire('change');
+  assert.equal(during[0].value, 'import'); // the captured decision is unchanged
+  assert.equal(ui.calls.filter((call) => call.kind === 'commit').length, 1);
+});
+
+test('an invalid row sharing a reference never flags the healthy row', async () => {
+  // Line 2 has no title and carries OPS-5; line 3 is healthy with the same
+  // reference. Only lines that could ever be imported count as duplicates,
+  // so line 3 imports through the valid-rows choice with no decision at all.
+  const csv = 'title,external_ref\n,OPS-5\nHealthy,OPS-5\n';
+  const ok = {
+    outcome: 'ok',
+    status: 201,
+    body: { import: { importKey: 'k', status: 'committed', mode: 'valid_rows', createdAt: 't', issueCount: 1, issueIds: [], excludedRows: [{ line: 2, problems: [{ column: 'title', reason: 'title is required.' }] }] }, replayed: false },
+  };
+  const ui = setup([ok], { prechecks: [{ outcome: 'ok', duplicates: [] }] });
+  await ui.choose('mixed-ref.csv', csv);
+  assert.equal(ui.root.role('import-row-decision').length, 0); // no duplicate to decide
+  await toggle(ui, true);
+  assert.equal(ui.one('import-confirm').disabled, false);
+  await ui.one('import-confirm').fire('click');
+  assert.deepEqual(ui.calls[1].options, { mode: 'valid_rows', excludedLines: [2] }); // no duplicateDecisions
+  assert.match(ui.one('import-status').textContent, /Imported 1 issue/);
+});
+
+test('the HTTP client sends duplicateDecisions and precheck bodies exactly', async () => {
+  const requests = [];
+  const client = csvImport.createImportClient({
+    fetchImpl: async (url, options) => {
+      requests.push({ url, body: JSON.parse(options.body) });
+      if (url === '/api/imports/precheck') return { ok: true, status: 200, json: async () => ({ duplicates: [] }) };
+      return { ok: true, status: 201, json: async () => okResponse(1).body };
+    },
+  });
+  assert.deepEqual(await client.precheck(REF_FILE), { outcome: 'ok', status: 200, duplicates: [] });
+  // a body without a duplicates list proves nothing and stays unknown
+  const malformed = csvImport.createImportClient({
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ matches: [] }) }),
+  });
+  assert.deepEqual(await malformed.precheck(REF_FILE), { outcome: 'unknown', status: 200 });
+  await client.commit('k1', 'title\nA\n', { duplicateDecisions: { 3: 'skip' } });
+  await client.commit('k2', 'title\nB\n');
+  assert.deepEqual(requests, [
+    { url: '/api/imports/precheck', body: { csv: REF_FILE } },
+    { url: '/api/imports', body: { importKey: 'k1', csv: 'title\nA\n', duplicateDecisions: { 3: 'skip' } } },
+    { url: '/api/imports', body: { importKey: 'k2', csv: 'title\nB\n' } },
+  ]);
 });

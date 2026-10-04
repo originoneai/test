@@ -36,6 +36,13 @@
 // carries mode "valid_rows" and excludedRows [{line, problems: [{column,
 // reason}]}]: the rows that were left out and why, so the result can always
 // show what was not imported. Whole-file records keep the four-field shape.
+// A row from a CSV external_ref column also stores its old-system externalRef
+// on the created issue (an extra exact record field). Duplicate external
+// references are finally decided HERE, inside the serialized write queue
+// against the durable snapshot: an API-level precheck can race another
+// import, so the store itself refuses rows whose reference repeats in the
+// batch or already exists unless the caller passed an explicit skip-or-import
+// decision for every flagged line, and applies the skips atomically.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -43,12 +50,14 @@ import { randomUUID } from 'node:crypto';
 const DEFAULT_DATA_DIR = '.data';
 const STORE_FILENAME = 'issues.json';
 const ISSUE_FIELDS = ['completions', 'createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // exact, sorted
+const ISSUE_FIELDS_REF = ['completions', 'createdAt', 'description', 'externalRef', 'id', 'priority', 'status', 'title', 'updatedAt']; // with the imported old-system reference, exact, sorted
 const LEGACY_PRIORITY_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // pre-completions shape, exact, sorted
 const LEGACY_ISSUE_FIELDS = ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']; // pre-priority shape, exact, sorted
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
 const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
+const EXTERNAL_REF_MAX = 100;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ISO_UTC_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?Z$/;
 
@@ -170,6 +179,15 @@ function guardPriority(priority) {
   }
 }
 
+// Only a CSV import ever sets an external reference, and only a non-empty
+// trimmed one is worth storing; every other issue keeps the exact legacy
+// record shape.
+function guardExternalRef(externalRef) {
+  if (typeof externalRef !== 'string' || externalRef !== externalRef.trim() || externalRef.length < 1 || externalRef.length > EXTERNAL_REF_MAX) {
+    throw writeGuard(`externalRef must be a trimmed string of 1-${EXTERNAL_REF_MAX} characters.`);
+  }
+}
+
 export class IssueStore {
   constructor(dataDir = process.env.DATA_DIR || DEFAULT_DATA_DIR) {
     this.dataDir = resolve(dataDir);
@@ -274,6 +292,19 @@ export class IssueStore {
     return this.imports.filter((candidate) => candidate.digest === digest).map(copyImport);
   }
 
+  // Issues carrying any of the given old-system external references — the
+  // duplicate check against already imported history. Read-only; ids in
+  // excludeIds (the retrying import's own earlier issues) are skipped so a
+  // replay of the same importKey never flags its own rows.
+  async listByExternalRefs(refs, excludeIds = new Set()) {
+    await this.#ensureLoaded();
+    const wanted = new Set(refs);
+    const excluded = excludeIds instanceof Set ? excludeIds : new Set(excludeIds);
+    return this.issues
+      .filter((issue) => issue.externalRef !== undefined && wanted.has(issue.externalRef) && !excluded.has(issue.id))
+      .map((issue) => ({ id: issue.id, title: issue.title, createdAt: issue.createdAt, externalRef: issue.externalRef }));
+  }
+
   // Commits a whole, already-validated batch atomically. The same importKey
   // with the same digest returns the stored record (replayed: true) and writes
   // nothing; the same key with a different digest is refused. Ids, timestamps
@@ -283,7 +314,11 @@ export class IssueStore {
   // `subset` is null for a whole-file import, or {mode: 'valid_rows',
   // excludedRows} when the user explicitly imported only the valid rows; the
   // excluded rows are stored with the record in the same atomic write.
-  async importBatch(importKey, digest, rows, subset = null) {
+  // `duplicateDecisions` (null when no external references are involved) maps
+  // flagged data lines to the caller's explicit 'skip' | 'import' choice; the
+  // store re-decides duplicates against its durable snapshot inside the
+  // serialized queue and refuses undecided ones before any write.
+  async importBatch(importKey, digest, rows, subset = null, duplicateDecisions = null) {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
       if (typeof importKey !== 'string' || !UUID_PATTERN.test(importKey)) throw writeGuard('importKey must be a UUID.');
@@ -302,31 +337,125 @@ export class IssueStore {
       if (subset !== null && (!isPlainObject(subset) || subset.mode !== 'valid_rows' || !isExcludedRows(subset.excludedRows))) {
         throw writeGuard('a valid-rows import must list its excluded rows with their problems.');
       }
+      if (duplicateDecisions !== null && !isPlainObject(duplicateDecisions)) {
+        throw writeGuard('duplicate decisions must be an object mapping line numbers to "skip" or "import".');
+      }
+      const decided = new Map();
+      for (const [rawLine, choice] of Object.entries(duplicateDecisions ?? {})) {
+        if (!/^[1-9]\d*$/.test(rawLine) || !Number.isSafeInteger(Number(rawLine)) || Number(rawLine) < 2) {
+          throw writeGuard('duplicate decision keys must be data line numbers (integers above the header).');
+        }
+        if (choice !== 'skip' && choice !== 'import') throw writeGuard('duplicate decisions must be "skip" or "import".');
+        decided.set(Number(rawLine), choice);
+      }
+      // Rows keep their exact legacy shape when nothing needs a line; a row
+      // that carries an old-system reference must name its data line so its
+      // duplicate decision can be applied, and lines must be unique.
+      const seenLines = new Set();
+      const hasRefs = rows.some((row) => isPlainObject(row) && typeof row.externalRef === 'string' && row.externalRef !== '');
+      for (const row of rows) {
+        if (!isPlainObject(row)) throw writeGuard('an imported row must be a plain object.');
+        if ('line' in row) {
+          if (!Number.isSafeInteger(row.line) || row.line <= 1) throw writeGuard('an imported row line must be an integer above the header.');
+          if (seenLines.has(row.line)) throw writeGuard(`line ${row.line} appears twice in one import batch.`);
+          seenLines.add(row.line);
+        } else if (row.externalRef !== undefined) {
+          throw writeGuard('a row with an external_ref must name its data line.');
+        }
+        if (row.externalRef !== undefined && (typeof row.externalRef !== 'string' || row.externalRef === '')) {
+          throw writeGuard('externalRef, when present, must be a non-empty string.');
+        }
+      }
+      // The durable duplicate re-decision, serialized with the write: any
+      // reference repeating in this batch or already on an existing issue is
+      // flagged, and a flagged line without an explicit decision refuses the
+      // whole batch — a missing decision map never bypasses detection.
+      const refLines = new Map(); // externalRef -> the lines of this batch carrying it
+      for (const row of rows) {
+        if (typeof row.externalRef !== 'string' || row.externalRef === '') continue;
+        if (!refLines.has(row.externalRef)) refLines.set(row.externalRef, []);
+        refLines.get(row.externalRef).push(row.line);
+      }
+      let excludedRows = subset === null ? [] : subset.excludedRows.map((row) => ({ line: row.line, problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })) }));
+      const skippedLines = new Set();
+      if (hasRefs) {
+        const undecided = [];
+        for (const row of rows) {
+          if (typeof row.externalRef !== 'string' || row.externalRef === '') continue;
+          const lines = refLines.get(row.externalRef);
+          const earlier = this.issues.find((issue) => issue.externalRef === row.externalRef);
+          if (!earlier && lines.length < 2) continue;
+          const choice = decided.get(row.line);
+          if (choice === 'skip') {
+            skippedLines.add(row.line);
+            excludedRows.push({
+              line: row.line,
+              problems: [
+                earlier
+                  ? { column: 'external_ref', reason: `external_ref "${row.externalRef}" was already imported (issue ${earlier.id}, created ${earlier.createdAt}); this row was skipped by your choice and the existing issue was not changed.` }
+                  : { column: 'external_ref', reason: `external_ref "${row.externalRef}" appears on lines ${lines.join(', ')} of this file; this row was skipped by your choice.` },
+              ],
+            });
+          } else if (choice !== 'import') {
+            undecided.push(
+              earlier
+                ? { line: row.line, externalRef: row.externalRef, kind: 'already_imported', issueId: earlier.id, createdAt: earlier.createdAt, reason: `external_ref "${row.externalRef}" was already imported (issue ${earlier.id}, created ${earlier.createdAt}); it needs an explicit skip-or-import decision and never overwrites the existing issue.` }
+                : { line: row.line, externalRef: row.externalRef, kind: 'in_file', lines: lines.slice().sort((a, b) => a - b), reason: `external_ref "${row.externalRef}" appears on lines ${lines.join(', ')} of this file; each duplicate row needs an explicit skip-or-import decision.` },
+            );
+          }
+        }
+        if (undecided.length > 0) {
+          const err = new StoreError('Duplicate external references still need an explicit skip-or-import decision.');
+          err.code = 'IMPORT_DUPLICATES_UNDECIDED';
+          err.details = { duplicates: undecided.sort((a, b) => a.line - b.line) };
+          throw err;
+        }
+      }
       const now = new Date().toISOString();
-      const created = rows.map((row) => {
-        const keys = Object.keys(row).sort().join(',');
-        if (keys !== 'description,priority,status,title') throw writeGuard('imported rows carry only title, description, status and priority.');
-        guardTitle(row.title);
-        guardDescription(row.description);
-        guardStatus(row.status);
-        guardPriority(row.priority);
-        return {
-          id: randomUUID(),
-          title: row.title,
-          description: row.description,
-          status: row.status,
-          priority: row.priority,
-          createdAt: now,
-          updatedAt: now,
-          completions: row.status === 'done' ? [{ at: now, priority: row.priority }] : [],
-        };
-      });
+      const created = rows
+        .filter((row) => row.line === undefined || !skippedLines.has(row.line))
+        .map((row) => {
+          const keys = Object.keys(row).sort().join(',');
+          if (
+            keys !== 'description,priority,status,title' &&
+            keys !== 'description,externalRef,priority,status,title' &&
+            keys !== 'description,line,priority,status,title' &&
+            keys !== 'description,externalRef,line,priority,status,title'
+          ) {
+            throw writeGuard('imported rows carry only title, description, status, priority, their line and (from a CSV external_ref column) externalRef.');
+          }
+          guardTitle(row.title);
+          guardDescription(row.description);
+          guardStatus(row.status);
+          guardPriority(row.priority);
+          if ('externalRef' in row) guardExternalRef(row.externalRef);
+          return {
+            id: randomUUID(),
+            title: row.title,
+            description: row.description,
+            status: row.status,
+            priority: row.priority,
+            ...('externalRef' in row ? { externalRef: row.externalRef } : {}),
+            createdAt: now,
+            updatedAt: now,
+            completions: row.status === 'done' ? [{ at: now, priority: row.priority }] : [],
+          };
+        });
+      if (created.length < 1) {
+        const err = new StoreError('Every importable row was skipped; nothing was saved.');
+        err.code = 'IMPORT_INVALID';
+        throw err;
+      }
+      if (excludedRows.length > 0) excludedRows = excludedRows.sort((a, b) => a.line - b.line);
+      if (excludedRows.length > 0 && !isExcludedRows(excludedRows)) {
+        throw writeGuard('the excluded rows of an import must be distinct ascending lines with their problems.');
+      }
       const record = copyImport({
         importKey: key,
         digest,
         createdAt: now,
         issueIds: created.map((issue) => issue.id),
-        ...(subset === null ? {} : { mode: 'valid_rows', excludedRows: subset.excludedRows }),
+        ...(excludedRows.length > 0 ? { mode: 'valid_rows', excludedRows } : {}),
       });
       const issues = [...this.issues, ...created];
       const imports = [...this.imports, record];
@@ -407,13 +536,14 @@ export class IssueStore {
       const keyList = keys.join(',');
       // The only tolerated deviations from the full contract are the exact
       // older shapes: records written before the priority field existed and
-      // before completion history existed.
+      // before completion history existed. Records that also carry the CSV
+      // external_ref keep the otherwise exact full shape plus externalRef.
       const legacyPriority = keyList === LEGACY_PRIORITY_FIELDS.join(',');
       const legacySix = keyList === LEGACY_ISSUE_FIELDS.join(',');
       const legacy = legacyPriority || legacySix;
-      if (!legacy && keyList !== ISSUE_FIELDS.join(',')) {
+      if (!legacy && keyList !== ISSUE_FIELDS.join(',') && keyList !== ISSUE_FIELDS_REF.join(',')) {
         throw refuse(
-          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')}, the legacy fields ${LEGACY_PRIORITY_FIELDS.join(', ')} or the legacy fields ${LEGACY_ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
+          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')}, the fields with externalRef, the legacy fields ${LEGACY_PRIORITY_FIELDS.join(', ')} or the legacy fields ${LEGACY_ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
         );
       }
       for (const [key, value] of Object.entries(issue)) {
@@ -424,6 +554,9 @@ export class IssueStore {
         } else if (typeof value !== 'string') {
           throw refuse(`item ${index} has a non-string field.`);
         }
+      }
+      if ('externalRef' in issue && (issue.externalRef !== issue.externalRef.trim() || issue.externalRef.length < 1 || issue.externalRef.length > EXTERNAL_REF_MAX)) {
+        throw refuse(`item ${index} externalRef must be trimmed and 1-${EXTERNAL_REF_MAX} characters.`);
       }
       if (!UUID_PATTERN.test(issue.id)) {
         throw refuse(`item ${index} id is not a UUID.`);

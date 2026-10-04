@@ -33,13 +33,15 @@ operational detail an integrating client needs.
 | `description` | Optional string, default `""`, at most 4000 characters. |
 | `status` | `open` \| `in_progress` \| `done` (case sensitive). New issues start `open`; status is not accepted on create. |
 | `priority` | `low` \| `normal` \| `high` \| `urgent` (case sensitive). New issues default `normal`. Records written before the priority field existed (exactly the legacy six-field shape) read as `normal` and are upgraded on disk only by the next successful write, never by a read. |
+| `externalRef` | Optional string, 1–100 characters after trimming. Only a historical CSV import with an `external_ref` column ever sets it — the old system's reference, kept on the imported issue so repeated imports of the same history can be recognized. Never accepted on `POST`/`PATCH` input; issues created or edited through the issue API never carry it. Records without it keep the exact seven-field legacy shape. |
 | `createdAt` / `updatedAt` | ISO UTC (`Z`) instants taken from the server's wall clock. `createdAt` never changes. `updatedAt` is regenerated at each accepted update: usually later, but **not guaranteed to advance** — same-millisecond updates can tie and a clock rollback can set it earlier. Do not use it for ordering or conflict detection. |
 
-Exactly these seven fields are ever returned; unknown fields in input are
-rejected, so a client can detect its own typos. The server additionally keeps
-an internal append-only `completions` history per issue (see storage below);
-it is not part of the issue resource and reaches clients only through the
-weekly report.
+These seven fields are always present; imported issues with an old-system
+reference additionally carry `externalRef` (an eighth field), so a client can
+detect its own typos on input: unknown fields in input are rejected. The
+server additionally keeps an internal append-only `completions` history per
+issue (see storage below); it is not part of the issue resource and reaches
+clients only through the weekly report.
 
 ## Endpoints
 
@@ -175,6 +177,27 @@ Optional fields select **what** is imported:
   whole file. A file in which every row is valid, or none is, cannot use
   this mode (`400 IMPORT_INVALID`; import a valid file with the default).
   `excludedLines` without `mode: "valid_rows"` → `400 VALIDATION_ERROR`.
+- `"duplicateDecisions": {"3": "skip", "10": "import"}` — the explicit
+  per-row decision for every row whose `external_ref` is a duplicate: it
+  repeats inside this file, or an earlier import already brought that
+  reference in. Each flagged line must be decided `"skip"` or `"import"`
+  before anything is saved; a commit without a decision for a flagged line is
+  refused whole with `400 IMPORT_DUPLICATES_UNDECIDED` (nothing written) and
+  `error.details.duplicates` listing every flagged line with its reference,
+  whether it repeats in the file (`kind: "in_file"`, with the group's lines)
+  or was already imported (`kind: "already_imported"`, with the existing
+  issue's id and createdAt). A skipped duplicate is not saved; an
+  "import anyway" duplicate becomes a second, explicit copy — an existing
+  issue is never updated or overwritten by an import. Decisions are bound
+  into the import digest: the same key, file and decisions always replay the
+  stored outcome, and the same key with a different decision is a `409
+  IMPORT_CONFLICT`. A decision naming a line that is not flagged is ignored
+  (it cannot exclude a healthy row), but it still binds the digest.
+
+The duplicate decision is final inside the store's serialized write queue: if
+another import commits the same reference between the preview and this commit,
+the store itself refuses the undecided duplicate before anything is written —
+the same honest `IMPORT_DUPLICATES_UNDECIDED` refusal with the flag list.
 
 Any other body field is refused (`400 VALIDATION_ERROR`). The server parses
 and validates the CSV itself with the same module the page previews with
@@ -183,16 +206,20 @@ and validates the CSV itself with the same module the page previews with
 **CSV format.** UTF-8 (an optional BOM is ignored); RFC 4180 quoting — quoted
 fields may contain commas, line breaks (stored as `\n`) and `""` for a literal
 quote. The first row is a header naming a subset of exactly `title`,
-`description`, `status`, `priority` in any order (case-insensitive); `title`
-is required. Any other column — credentials, `id`, timestamps,
-`completions` or anything unknown — rejects the whole file: ids, timestamps
-and completion history are always server-owned. Per row: `title` is trimmed
-and must be 1–120 characters; `description` (default empty) at most 4000;
-`status` one of `open`, `in_progress`, `done` (empty → `open`); `priority` one
-of `low`, `normal`, `high`, `urgent` (empty → `normal`). Each row must have as
-many fields as the header. **Limits:** at most 262144 bytes of CSV text and
-500 data rows; a larger file is refused, never truncated. A header-only or
-empty file is refused.
+`description`, `status`, `priority` and `external_ref` in any order
+(case-insensitive); `title` is required. Any other column — credentials,
+`id`, timestamps, `completions` or anything unknown — rejects the whole file:
+ids, timestamps and completion history are always server-owned. `external_ref`
+is the optional old-system reference of a historical issue (trimmed, at most
+100 characters; empty means "no reference"), stored on the imported issue so
+repeated imports of the same history can be recognized and their duplicates
+decided explicitly. Per row: `title` is trimmed and must be 1–120 characters;
+`description` (default empty) at most 4000; `status` one of `open`,
+`in_progress`, `done` (empty → `open`); `priority` one of `low`, `normal`,
+`high`, `urgent` (empty → `normal`). Each row must have as many fields as the
+header. **Limits:** at most 262144 bytes of CSV text and 500 data rows; a
+larger file is refused, never truncated. A header-only or empty file is
+refused.
 
 **Responses.**
 
@@ -200,9 +227,11 @@ empty file is refused.
   server-assigned id and one shared server timestamp (CSV files never carry
   dates); a row arriving as `done` gets the same `{at, priority}` completion
   snapshot as a create in `done`, so it counts in the weekly report for that
-  day. `mode` says which choice was committed; `excludedRows` lists the rows
-  left out by a `valid_rows` import with their problems (always `[]` for
-  `all`):
+  day. An imported row with an `external_ref` keeps it on its issue.
+  `mode` says which choice was committed; `excludedRows` lists every row left
+  out by the import — the invalid rows of a `valid_rows` choice and the
+  duplicates the user chose to skip, each with its problems/reason — and is
+  always `[]` when nothing was excluded:
   ```json
   { "import": { "importKey": "…", "status": "committed", "mode": "valid_rows",
                 "createdAt": "…Z", "issueCount": 6, "issueIds": ["…", "…"],
@@ -211,13 +240,15 @@ empty file is refused.
     "replayed": false }
   ```
 - `200` with `"replayed": true` — this `importKey` was already committed for
-  the same normalized rows and the same choice (mode and excluded lines) —
-  re-sent after a lost acknowledgement, even if the file was re-saved with
-  other line endings or a BOM. The stored outcome is
+  the same normalized rows and the same choice (mode, excluded lines and
+  duplicate decisions) — re-sent after a lost acknowledgement, even if the
+  file was re-saved with other line endings or a BOM, and no matter which
+  references other imports brought in since. The stored outcome is
   returned unchanged; **nothing is created again.**
 - `400 IMPORT_INVALID` — with the default mode: the file or at least one row
   is invalid. **Nothing is written**, not even the valid rows. With
-  `valid_rows`: a file-level problem, or no row (or every row) is valid.
+  `valid_rows`: a file-level problem, or no row (or every row) is valid, or
+  every importable row was skipped as a duplicate.
   `error.details` lists every problem:
   `{"fileErrors": ["…"], "rowErrors": [{"line": 9, "errors": ["title is required."], "problems": [{"column": "title", "reason": "title is required."}]}]}`
   where `line` is the physical line in the file where that record starts and
@@ -227,6 +258,12 @@ empty file is refused.
   `excludedLines` that differ from the server's validation. Nothing is
   written; `error.details` carries the server's `excludedLines` and
   `rowErrors`. Choose the file again and confirm a fresh preview.
+- `400 IMPORT_DUPLICATES_UNDECIDED` — a duplicate external reference has no
+  explicit skip-or-import decision. **Nothing is written**; `error.details`
+  carries `duplicates`, one entry per flagged line (line, `externalRef`,
+  `kind` `"in_file"` with the group's `lines`, or `"already_imported"` with
+  the existing issue's `issueId` and `createdAt`, plus a human-readable
+  `reason`). Decide every flagged row and send the commit again.
 - `409 IMPORT_CONFLICT` — the `importKey` was already used for different rows
   or a different choice of rows. Nothing is written; start a new import with
   a new key.
@@ -247,21 +284,24 @@ unknown can find out whether it landed. `404 IMPORT_NOT_FOUND` means no record
 is stored under the key at that moment; it is not proof that nothing was ever
 saved, because a commit of that key may still be in flight and not visible
 yet. Re-checking later is always safe, and retrying the commit with the same
-key and identical rows commits at most once: it returns the stored result if
-the import already landed, or commits it once if no result exists yet. A key
-that is not a UUID → `400 VALIDATION_ERROR`. Results are durable across
-restarts.
+key and the same rows and decisions commits at most once: it returns the
+stored result if the import already landed, or commits it once if no result
+exists yet. A key that is not a UUID → `400 VALIDATION_ERROR`. Results are
+durable across restarts.
 
 ### `POST /api/imports/match` — was this exact content already imported?
 
-Read-only. Body `{"csv", "mode"?, "excludedLines"?}` — the same fields and
-validation as a commit, without `importKey`. The server computes the same
-digest a commit would store (normalized rows; for `valid_rows` also the mode
-and the exact excluded lines) and answers `200 {"matches": [...]}` with every
+Read-only. Body `{"csv", "mode"?, "excludedLines"?, "duplicateDecisions"?}` —
+the same fields and validation as a commit, without `importKey`. The server
+computes the same digest a commit would store (normalized rows; for
+`valid_rows` also the mode and the exact excluded lines; for reference-carrying
+files the whole decision map) and answers `200 {"matches": [...]}` with every
 committed import of that digest, oldest first, each in the commit-response
-`import` shape including its stored `excludedRows`. `matches: []` only means no
-such import is stored at that moment (a commit may still be in flight). A
-request a commit would refuse is refused the same way (`400 IMPORT_INVALID`,
+`import` shape including its stored `excludedRows`. The answer comes from the
+stored records alone — which references exist in the imported history right
+now never changes it — and `matches: []` only means no such choice is stored
+(a commit may still be in flight). A request a commit would refuse for other
+reasons is refused the same way (`400 IMPORT_INVALID`,
 `IMPORT_PREVIEW_MISMATCH`, `VALIDATION_ERROR` for unknown fields). Nothing is
 ever written.
 
@@ -273,20 +313,42 @@ was saved; if the check cannot answer, an unconfirmed earlier send stays
 lists each confirmed import's skipped lines and reasons from the stored
 `excludedRows`, exactly like a normal success.
 
+### `POST /api/imports/precheck` — which rows are duplicate external references?
+
+Read-only. Body `{"csv"}` (1 MiB limit, like a commit). The server validates
+the file exactly as a commit would and answers `200 {"duplicates": [...]}` —
+one entry per row whose non-empty `external_ref` repeats inside the file or
+already exists on an imported issue:
+
+```json
+{ "duplicates": [
+    { "line": 3, "externalRef": "OPS-9", "kind": "in_file", "lines": [2, 3] },
+    { "line": 5, "externalRef": "OPS-1", "kind": "already_imported",
+      "issueId": "0f1e…", "createdAt": "2026-10-04T…Z" } ] }
+```
+
+A file a commit would refuse for other reasons (limits, columns, parse
+errors) has nothing checkable and answers `{"duplicates": []}`. The answer is
+advisory for a preview — the commit path never consults it; the store decides
+duplicates authoritatively inside its serialized write queue — so a reference
+another import commits between the precheck and the commit is still caught
+and refused undecided before anything is written. Nothing is ever written
+here.
+
 ### Everything else
 
 - Unsupported methods on known paths → `405` with an `Allow` header.
 - Unknown `/api/...` paths → `404`.
 - Request bodies are capped at 16 KiB (declared or streamed) → `413` above,
-  except `POST /api/imports` and `POST /api/imports/match`, which are capped
-  at 1 MiB.
+  except `POST /api/imports`, `POST /api/imports/match` and
+  `POST /api/imports/precheck`, which are capped at 1 MiB.
 
 ## Error model
 
 Every error body is `{"error":{"code":"...","message":"..."}}` — a stable
 machine-readable `code` plus a human-readable `message`, never a stack trace.
-`IMPORT_INVALID` and `IMPORT_PREVIEW_MISMATCH` additionally carry
-`error.details` (see `POST /api/imports`).
+`IMPORT_INVALID`, `IMPORT_PREVIEW_MISMATCH` and `IMPORT_DUPLICATES_UNDECIDED`
+additionally carry `error.details` (see `POST /api/imports`).
 
 | Status | Code | Meaning for the client |
 | --- | --- | --- |
@@ -295,8 +357,9 @@ machine-readable `code` plus a human-readable `message`, never a stack trace.
 | 400 | `INVALID_URL` | Malformed request URL. |
 | 400 | `IMPORT_INVALID` | The CSV import was refused as a whole; `details` lists file and row problems. Nothing was written. |
 | 400 | `IMPORT_PREVIEW_MISMATCH` | A valid-rows import named different excluded lines than the server found. Nothing was written. |
-| 404 | `IMPORT_NOT_FOUND` | No committed import has this key. |
-| 409 | `IMPORT_CONFLICT` | The import key was already used for different rows. Nothing was written. |
+| 400 | `IMPORT_DUPLICATES_UNDECIDED` | A duplicate external reference has no explicit skip-or-import decision; `details.duplicates` lists them. Nothing was written. |
+| 404 | `IMPORT_NOT_FOUND` | No committed import is stored under this key **yet** — not proof nothing was saved (the commit may still be in flight). |
+| 409 | `IMPORT_CONFLICT` | The import key was already used for different rows or a different choice. Nothing was written. |
 | 404 | `NOT_FOUND` | Unknown resource or issue id. Refresh the list before acting on it. |
 | 405 | `METHOD_NOT_ALLOWED` | Wrong verb; `Allow` lists what the path supports. |
 | 413 | `PAYLOAD_TOO_LARGE` | Body over 16 KiB. Split or shorten the text. |
@@ -403,18 +466,24 @@ until then, so stores that never imported keep the exact format above):
 }
 ```
 
-A record of an explicit valid-rows import additionally carries
+A record of an explicit valid-rows import — or of any import that left rows
+out, including duplicates the user chose to skip — additionally carries
 `"mode": "valid_rows"` and `"excludedRows": [{"line": 9, "problems":
 [{"column": "title", "reason": "title is required."}]}]` (non-empty,
-ascending lines; `column` may be `null`); its digest also covers the mode
-and the excluded lines. Whole-file records keep the four-field shape.
+ascending lines; `column` may be `null`); its digest also covers the mode,
+the excluded lines and, for reference-carrying files, the whole duplicate
+decision map. Imports that excluded nothing keep the four-field shape, and
+files without an `external_ref` column keep the exact original digest scheme,
+so pre-existing imports replay unchanged.
 
 On load each import record must have exactly these fields, a unique key,
 and list only existing issue ids not claimed by another import; anything else
 is reported as a corrupt store like any other corruption.
 
-Each record carries exactly the seven public fields plus the server-owned
-`completions` list: an append-only history of completion events, one appended
+Each record carries the seven public fields plus the server-owned
+`completions` list — and, only for issues imported from an `external_ref`
+column, the extra `externalRef` field. `completions` is an append-only
+history of completion events, one appended
 **atomically with the accepting mutation** whenever an issue arrives in
 `done` — created directly as `done`, or accepted as a transition from another
 status. A simultaneous status+priority change is captured in one event.
@@ -442,8 +511,9 @@ the server refuses it as corrupt. Backups can be made by copying the file
 while the server is stopped, or at any time — a snapshot mid-rename can never
 be torn because of the atomic write.
 
-**Compatible shapes and migration.** The loader accepts three exact record
-shapes: the current eight-field form (with `completions`), the pre-completions
+**Compatible shapes and migration.** The loader accepts four exact record
+shapes: the current eight-field form (with `completions`), that form plus
+`externalRef` (imported from an `external_ref` column), the pre-completions
 seven-field form (with `priority`), and the pre-priority six-field legacy
 form. Records without a `completions` list read as *no recorded events* while
 keeping every stored value untouched — for an issue that is already `done`
@@ -511,7 +581,12 @@ exclusively — there is no fixture mode and no offline fallback:
   valid-rows mode (exact excluded lines, stale-preview refusal, atomic
   subset, replay/conflict, restart durability, failed writes, corrupt
   records) and the panel (preview, opt-in choice, cancel, unknown-outcome
-  recovery across reloads).
+  recovery across reloads). The external-ref regressions cover the optional
+  `external_ref` column, duplicates inside one file and against imported
+  history (including multi-digit line numbers), the explicit skip-or-import
+  decision bound into the digest, never overwriting an existing issue,
+  replay/conflict of different decisions, the read-only precheck, and the
+  not-yet-confirmed wording of the lookup's 404.
 - `test/storage.test.js` — the store directly: on-disk format, reload,
   corruption refusal, write guards with boundary acceptance, serialization,
   failed-write recovery.
