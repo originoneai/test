@@ -97,7 +97,7 @@ function assertValidationError(body) {
 
 function zeroReport(weekStart, weekEndExclusive, completedTimingUnknown = 0) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     weekStart,
     weekEndExclusive,
     created: {
@@ -108,6 +108,7 @@ function zeroReport(weekStart, weekEndExclusive, completedTimingUnknown = 0) {
     completed: {
       total: 0,
       byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+      priorityUnknown: 0,
       createdThisWeek: 0,
       createdEarlier: 0,
       repeatCompletions: 0,
@@ -192,7 +193,7 @@ test('explicit weekStart tallies only that week using current stored status and 
       const response = await tracker.report('?weekStart=2026-09-28');
       assert.equal(response.status, 200);
       assert.deepEqual(response.body, {
-        schemaVersion: 2,
+        schemaVersion: 3,
         weekStart: '2026-09-28',
         weekEndExclusive: '2026-10-05',
         created: {
@@ -206,6 +207,7 @@ test('explicit weekStart tallies only that week using current stored status and 
         completed: {
           total: 0,
           byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+          priorityUnknown: 0,
           createdThisWeek: 0,
           createdEarlier: 0,
           repeatCompletions: 0,
@@ -255,6 +257,7 @@ test('later mutations move an issue between buckets; updatedAt is never used', a
     assert.deepEqual(response.body.completed, {
       total: 1,
       byPriority: { low: 0, normal: 0, high: 0, urgent: 1 },
+      priorityUnknown: 0,
       createdThisWeek: 1,
       createdEarlier: 0,
       repeatCompletions: 0,
@@ -368,11 +371,13 @@ test('completed counts distinct issues once with extra same-week events separate
       const response = await tracker.report('?weekStart=2026-09-28');
       assert.equal(response.status, 200);
       assert.deepEqual(response.body.completed, {
-        // Issue 1 was completed twice inside the week: one task, one repeat.
-        // Issue 2 completed once, created inside the week. Issues 5 and 6
-        // hold events exactly outside the boundaries and count for nothing.
+        // Issue 1 was completed twice inside the week: one task, one repeat,
+        // bucketed by its first (high) snapshot. Issue 2 completed once,
+        // created inside the week. Issues 5 and 6 hold events exactly outside
+        // the boundaries and count for nothing.
         total: 2,
         byPriority: { low: 0, normal: 0, high: 1, urgent: 1 },
+        priorityUnknown: 0,
         createdThisWeek: 1,
         createdEarlier: 1,
         repeatCompletions: 1,
@@ -388,13 +393,13 @@ test('completed counts distinct issues once with extra same-week events separate
     },
     [
       // Created in an earlier week, completed twice inside the selected week.
-      issue({ slot: 1, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'high', completions: ['2026-09-28T00:00:00.000Z', '2026-09-30T10:00:00.000Z'] }),
+      issue({ slot: 1, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'urgent', completions: [{ at: '2026-09-28T00:00:00.000Z', priority: 'high' }, { at: '2026-09-30T10:00:00.000Z', priority: 'urgent' }] }),
       // Created and completed inside the week, currently done.
-      issue({ slot: 2, createdAt: '2026-09-29T09:00:00.000Z', status: 'done', priority: 'urgent', completions: ['2026-10-04T23:59:59.999Z'] }),
+      issue({ slot: 2, createdAt: '2026-09-29T09:00:00.000Z', status: 'done', priority: 'urgent', completions: [{ at: '2026-10-04T23:59:59.999Z', priority: 'urgent' }] }),
       // Completion event exactly before the week starts: outside.
-      issue({ slot: 5, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'low', completions: ['2026-09-27T23:59:59.999Z'] }),
+      issue({ slot: 5, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'low', completions: [{ at: '2026-09-27T23:59:59.999Z', priority: 'low' }] }),
       // Completion event exactly at the exclusive end: outside.
-      issue({ slot: 6, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'low', completions: ['2026-10-05T00:00:00.000Z'] }),
+      issue({ slot: 6, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'low', completions: [{ at: '2026-10-05T00:00:00.000Z', priority: 'low' }] }),
       // Created this week, never completed: intake only.
       issue({ slot: 7, createdAt: '2026-09-30T11:00:00.000Z', status: 'open', priority: 'normal' }),
     ],
@@ -407,11 +412,12 @@ test('a reopened task keeps the credit for the week it was completed in', async 
       const week = await tracker.report('?weekStart=2026-09-28');
       assert.equal(week.body.completed.total, 1, 'counted in its completion week although currently open');
       assert.equal(week.body.completed.createdEarlier, 1);
-      assert.equal(week.body.completed.byPriority.high, 1, 'bucketed by the currently stored priority');
+      assert.equal(week.body.completed.byPriority.high, 1, 'bucketed by the priority snapshotted at completion');
       const other = await tracker.report('?weekStart=2026-10-05');
       assert.deepEqual(other.body.completed, {
         total: 0,
         byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+        priorityUnknown: 0,
         createdThisWeek: 0,
         createdEarlier: 0,
         repeatCompletions: 0,
@@ -419,7 +425,7 @@ test('a reopened task keeps the credit for the week it was completed in', async 
       assert.equal(week.body.completedTimingUnknown, 0);
     },
     [
-      issue({ slot: 1, createdAt: '2026-09-01T08:00:00.000Z', status: 'open', priority: 'high', completions: ['2026-09-29T12:00:00.000Z'] }),
+      issue({ slot: 1, createdAt: '2026-09-01T08:00:00.000Z', status: 'open', priority: 'high', completions: [{ at: '2026-09-29T12:00:00.000Z', priority: 'high' }] }),
     ],
   );
 });
@@ -438,6 +444,8 @@ test('completedTimingUnknown counts legacy done issues regardless of the selecte
       assert.equal(withEvents.body.completed.total, 0, 'the third issue completed in a different week');
       const otherWeek = await tracker.report('?weekStart=2026-08-31');
       assert.equal(otherWeek.body.completed.total, 1);
+      assert.equal(otherWeek.body.completed.byPriority.urgent, 1);
+      assert.equal(otherWeek.body.completed.priorityUnknown, 0);
       assert.equal(otherWeek.body.completedTimingUnknown, 2);
     },
     [
@@ -453,7 +461,7 @@ test('completedTimingUnknown counts legacy done issues regardless of the selecte
         updatedAt: '2026-08-06T08:00:00.000Z',
       },
       // Post-history issue with a real event in its own week.
-      issue({ slot: 2, createdAt: '2026-09-01T08:00:00.000Z', status: 'done', priority: 'urgent', completions: ['2026-09-02T08:00:00.000Z'] }),
+      issue({ slot: 2, createdAt: '2026-09-01T08:00:00.000Z', status: 'done', priority: 'urgent', completions: [{ at: '2026-09-02T08:00:00.000Z', priority: 'urgent' }] }),
     ],
   );
 });
@@ -466,6 +474,7 @@ test('low-year completion events are tallied in their exact UTC week', async () 
       assert.deepEqual(response.body.completed, {
         total: 1,
         byPriority: { low: 0, normal: 1, high: 0, urgent: 0 },
+        priorityUnknown: 0,
         createdThisWeek: 0,
         createdEarlier: 1,
         repeatCompletions: 0,
@@ -477,7 +486,7 @@ test('low-year completion events are tallied in their exact UTC week', async () 
       });
     },
     [
-      issue({ slot: 1, createdAt: '0098-06-01T00:00:00.000Z', status: 'done', priority: 'normal', completions: ['0099-01-05T00:00:00.000Z'] }),
+      issue({ slot: 1, createdAt: '0098-06-01T00:00:00.000Z', status: 'done', priority: 'normal', completions: [{ at: '0099-01-05T00:00:00.000Z', priority: 'normal' }] }),
     ],
   );
 });

@@ -90,7 +90,7 @@ included):
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "weekStart": "2026-09-28",
   "weekEndExclusive": "2026-10-05",
   "created": {
@@ -101,6 +101,7 @@ included):
   "completed": {
     "total": 0,
     "byPriority": { "low": 0, "normal": 0, "high": 0, "urgent": 0 },
+    "priorityUnknown": 0,
     "createdThisWeek": 0,
     "createdEarlier": 0,
     "repeatCompletions": 0
@@ -121,8 +122,17 @@ Semantics a client must rely on:
     one of its completion events — including issues created in earlier weeks,
     and **regardless of the issue's current status**: reopening an issue never
     removes the credit for the week it was really completed in.
-  - `byPriority` buckets those same issues by their **currently stored
-    priority** (a re-prioritized issue moves buckets on the next read).
+  - `byPriority` buckets those same issues by the priority **recorded on
+    their earliest completion event inside the selected week** (equal-time
+    ties broken by the order the events were appended). That snapshot is
+    frozen at completion time: later priority edits and same-week
+    re-completions can never rewrite the distribution a week already
+    recorded; a later week is bucketed by its own first event.
+  - `priorityUnknown` counts the issues whose first in-week event predates
+    snapshots (a stored timestamp string): they count once toward `total`,
+    but their completion-time priority is unknown — never guessed from the
+    current priority, never backfilled. The four buckets plus
+    `priorityUnknown` always sum to `completed.total`.
   - `createdThisWeek` / `createdEarlier` partition those distinct issues by
     their known `createdAt` (inside the selected week or not).
   - `repeatCompletions` counts the extra same-week events of issues already
@@ -132,8 +142,9 @@ Semantics a client must rely on:
   **no recorded completion event** — issues that were already done before
   completion history existed. Their timing is genuinely unknown: it is never
   inferred or backfilled from `createdAt` or `updatedAt`, they belong to no
-  week, and the count is independent of the selected week. A later real
-  transition out of and back into `done` records only its actual event.
+  week, and the count is independent of the selected week. Priority unknown
+  (an event exists but its snapshot does not) is a separate concept from
+  timing unknown (no event at all).
 - `updatedAt` is not used anywhere in the report.
 - On an unavailable or corrupt store the report answers `500 STORAGE_ERROR`
   like every other endpoint and leaves the file untouched; recovery is manual
@@ -250,15 +261,27 @@ fix or remove it, restart.
 ```
 
 Each record carries exactly the seven public fields plus the server-owned
-`completions` list: an append-only history of ISO UTC instants, one appended
+`completions` list: an append-only history of completion events, one appended
 **atomically with the accepting mutation** whenever an issue arrives in
 `done` — created directly as `done`, or accepted as a transition from another
-status. Staying `done`, or editing title/description/priority, appends
+status. A simultaneous status+priority change is captured in one event.
+Staying `done`, or editing title/description without a transition, appends
 nothing. Reopening (`done` → any other status) never removes or rewrites past
 events; completing again appends a new event. Clients cannot supply, edit or
 erase the list: `completions` is rejected as an unknown field on every input,
 and it never appears in an issue response — it surfaces only through the
 weekly report.
+
+Events come in two encodings. Events recorded since completion-priority
+snapshots exist are objects `{ "at": "<ISO UTC>", "priority":
+"low|normal|high|urgent" }`: an immutable snapshot of the resulting issue
+priority at the completion instant. Events recorded before that are plain
+timestamp strings; a string and object event may sit in the same list.
+Strings keep unknown completion-time priority **forever** — the server never
+converts, infers or backfills them, because rewriting them would fabricate
+history. All copies handed out (list results, create/update replies)
+duplicate every snapshot object, so no caller can mutate stored history
+through a reference.
 
 The format is intentionally strict (exact fields, UUID ids, enum status, ISO
 UTC timestamps, no extra keys): a hand-edited file is either fully valid or
@@ -279,12 +302,15 @@ the file.
 
 **Rollback limits.** The upgrade is one-way on disk: a server from before
 completion history existed refuses a store containing `completions` fields as
-corrupt (its loader knows only the older shapes). Rolling the software back
-therefore requires restoring a backup taken before the upgrade, or manually
-removing the `completions` lists from every record — which discards recorded
-history and reverts recorded completions to "unknown timing". The events
-themselves are real server-clock instants; nothing is reconstructed after the
-fact.
+corrupt (its loader knows only the older shapes), and a server from before
+completion-priority snapshots refuses snapshot objects (it accepts only
+timestamp strings). Rolling the software back therefore requires restoring a
+backup taken before the upgrade — the preferred path. Manually stripping
+snapshot objects down to their timestamps is possible but lossy: it discards
+exactly the completion-time priorities this version records, reverts those
+issues to `priorityUnknown` in the report, and must never be claimed to
+preserve V3 priority history. The events themselves are real server-clock
+instants; nothing is reconstructed after the fact.
 
 ## Integration notes for the board
 
