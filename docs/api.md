@@ -252,12 +252,34 @@ the import already landed, or commits it once if no result exists yet. A key
 that is not a UUID → `400 VALIDATION_ERROR`. Results are durable across
 restarts.
 
+### `POST /api/imports/match` — was this exact content already imported?
+
+Read-only. Body `{"csv", "mode"?, "excludedLines"?}` — the same fields and
+validation as a commit, without `importKey`. The server computes the same
+digest a commit would store (normalized rows; for `valid_rows` also the mode
+and the exact excluded lines) and answers `200 {"matches": [...]}` with every
+committed import of that digest, oldest first, each in the commit-response
+`import` shape including its stored `excludedRows`. `matches: []` only means no
+such import is stored at that moment (a commit may still be in flight). A
+request a commit would refuse is refused the same way (`400 IMPORT_INVALID`,
+`IMPORT_PREVIEW_MISMATCH`, `VALIDATION_ERROR` for unknown fields). Nothing is
+ever written.
+
+The import panel uses it when a file is chosen: after a lost response and a
+reload, choosing the same file again shows that it was already imported (with
+the skipped lines and reasons the server stored) instead of claiming nothing
+was saved; if the check cannot answer, an unconfirmed earlier send stays
+"result not confirmed" with Check result. "Check pending results" likewise
+lists each confirmed import's skipped lines and reasons from the stored
+`excludedRows`, exactly like a normal success.
+
 ### Everything else
 
 - Unsupported methods on known paths → `405` with an `Allow` header.
 - Unknown `/api/...` paths → `404`.
 - Request bodies are capped at 16 KiB (declared or streamed) → `413` above,
-  except `POST /api/imports`, which is capped at 1 MiB.
+  except `POST /api/imports` and `POST /api/imports/match`, which are capped
+  at 1 MiB.
 
 ## Error model
 

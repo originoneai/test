@@ -440,3 +440,56 @@ test('a corrupt valid-rows record is reported, never rewritten', async () => {
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Already-imported content lookup (POST /api/imports/match): read-only,
+// matched by the same digest as a commit (content + mode + excluded lines).
+// ---------------------------------------------------------------------------
+test('match finds an earlier import of the same content, mode and excluded lines, with its stored skipped rows', () =>
+  withTracker(async (t) => {
+    const match = (payload) => t.request('/api/imports/match', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    const before = await match({ csv: MIXED_CSV, mode: 'valid_rows', excludedLines: MIXED_EXCLUDED });
+    assert.equal(before.status, 200);
+    assert.deepEqual(before.body, { matches: [] });
+    const key = randomUUID();
+    const committed = await t.commit(validRows(key));
+    assert.equal(committed.status, 201);
+    const storeBefore = await readFile(t.storePath, 'utf8');
+    // the same file re-saved with CRLF still matches (normalized content)
+    const found = await match({ csv: MIXED_CSV.replace(/\n/g, '\r\n'), mode: 'valid_rows', excludedLines: MIXED_EXCLUDED });
+    assert.equal(found.status, 200);
+    assert.equal(found.body.matches.length, 1);
+    assert.deepEqual(found.body.matches[0], committed.body.import);
+    assert.deepEqual(found.body.matches[0].excludedRows.map((row) => row.line), MIXED_EXCLUDED);
+    assert.equal(found.body.matches[0].excludedRows[0].problems[0].column, 'title');
+    // a whole-file import of other content does not match; nothing was written
+    const whole = await match({ csv: VALID_CSV });
+    assert.deepEqual(whole.body, { matches: [] });
+    assert.equal(await readFile(t.storePath, 'utf8'), storeBefore);
+    // a stale preview is refused exactly like a commit would be
+    const stale = await match({ csv: MIXED_CSV, mode: 'valid_rows', excludedLines: [3, 5] });
+    assert.equal(stale.status, 400);
+    assert.equal(stale.body.error.code, 'IMPORT_PREVIEW_MISMATCH');
+    // unknown fields and wrong methods are refused
+    assert.equal((await match({ csv: VALID_CSV, importKey: key })).status, 400);
+    assert.equal((await t.request('/api/imports/match')).status, 405);
+  }));
+
+test('match finds a whole-file import and survives a restart', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'import-api-'));
+  let t = null;
+  try {
+    t = await boot(dataDir);
+    const key = randomUUID();
+    const committed = await t.commit({ importKey: key, csv: VALID_CSV });
+    await t.close();
+    t = null;
+    t = await boot(dataDir);
+    const found = await t.request('/api/imports/match', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ csv: VALID_CSV }) });
+    assert.equal(found.status, 200);
+    assert.deepEqual(found.body.matches, [committed.body.import]);
+  } finally {
+    if (t) await t.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});

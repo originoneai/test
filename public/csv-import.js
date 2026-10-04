@@ -269,8 +269,56 @@ export function createImportClient({ fetchImpl = (...args) => globalThis.fetch(.
         body: JSON.stringify(options.mode === 'valid_rows' ? { importKey, csv, mode: 'valid_rows', excludedLines: options.excludedLines } : { importKey, csv }),
       }),
     lookup: (importKey) => call('/api/imports/' + encodeURIComponent(importKey), { method: 'GET' }),
+    // Read-only: every committed import of exactly this content and choice
+    // (same normalized rows, mode and excluded lines as a commit would send).
+    match: async (csv, options = {}) => {
+      let response;
+      try {
+        response = await fetchImpl(base + '/api/imports/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(options.mode === 'valid_rows' ? { csv, mode: 'valid_rows', excludedLines: options.excludedLines } : { csv }),
+        });
+      } catch {
+        return { outcome: 'unknown' };
+      }
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        return { outcome: 'unknown', status: response.status };
+      }
+      if (response.ok && body && Array.isArray(body.matches)) return { outcome: 'ok', status: response.status, matches: body.matches };
+      return { outcome: 'unknown', status: response.status };
+    },
   };
 }
+
+// The rows a valid-rows import left out, as stored by the server: one
+// status sentence and the per-line reasons. Shared by a fresh commit, a
+// replay, Check result, Check pending results and an already-imported file,
+// so every confirmed result shows the same skipped rows.
+function excludedOf(record) {
+  return record && Array.isArray(record.excludedRows) ? record.excludedRows : [];
+}
+
+function skippedSentence(record) {
+  const excluded = excludedOf(record);
+  if (excluded.length === 0) return '';
+  const plural = excluded.length === 1 ? '' : 's';
+  return ` Skipped ${excluded.length} row${plural} with problems (line${plural} ${excluded.map((row) => row.line).join(', ')}); they were not saved.`;
+}
+
+function skippedDetails(record, header) {
+  const excluded = excludedOf(record);
+  if (excluded.length === 0) return [];
+  return [
+    `${header} (${excluded.length} row${excluded.length === 1 ? '' : 's'}):`,
+    ...excluded.flatMap((row) => (Array.isArray(row.problems) ? row.problems : []).map((entry) => describeProblem(row.line, entry))),
+  ];
+}
+
+const issueCountText = (record) => `${record.issueCount} issue${record.issueCount === 1 ? '' : 's'}`;
 
 // An import whose result is not confirmed yet stays in a pending list keyed
 // by its import id, so the outcome can still be looked up after the preview
@@ -383,7 +431,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   // A slower earlier read can then never overwrite a newer preview, and a
   // reset invalidates whatever was still in flight.
   let selectionToken = 0;
-  const state = { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, busy: false, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false, validOnly: false };
+  const state = { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, busy: false, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false, validOnly: false, prior: null };
 
   function showErrors(messages) {
     errorBox.replaceChildren(...messages.map((message) => el('p', {}, message)));
@@ -461,6 +509,32 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     table.hidden = false;
   }
 
+  // What is known about earlier sends of exactly this content: an
+  // unconfirmed send from this browser (pending), imports the server already
+  // holds for the same content and choice, or a check still running. Never
+  // "nothing was saved" — only the server can confirm what is stored.
+  function priorNotice() {
+    const prior = state.prior;
+    if (!prior) return '';
+    const name = state.fileName || 'This file';
+    const parts = [];
+    if (prior.pending) {
+      parts.push(`${name} was already sent from this browser and its result is not confirmed yet — it may already be imported. Use Check result before importing it again; importing again reuses the same import id, so it is applied at most once.`);
+    }
+    if (prior.others.length > 0) {
+      const latest = prior.others[prior.others.length - 1];
+      const times = prior.others.length === 1 ? '' : ` (${prior.others.length} times)`;
+      parts.push(`This exact content was already imported earlier${times}: ${issueCountText(latest)} on ${latest.createdAt}.${skippedSentence(latest)} Importing it again would add these issues a second time.`);
+    }
+    if (prior.checking) parts.push('Checking whether this exact content was already imported…');
+    return parts.join(' ');
+  }
+
+  function withPrior(text) {
+    const notice = priorNotice();
+    return notice ? `${text} ${notice}` : text;
+  }
+
   // Confirm button, status line and the valid-rows choice for the current
   // preview. The default never imports a file with problems; only the
   // explicitly checked choice turns the button into "Import N valid rows".
@@ -482,19 +556,22 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     if (validation.valid) {
       confirmButton.disabled = state.busy;
       confirmButton.textContent = `Import ${validation.rows.length} issue${validation.rows.length === 1 ? '' : 's'}`;
-      status.textContent = `${name}: ${validation.rows.length} issue(s) ready. Review the preview, then confirm.`;
+      status.textContent = withPrior(`${name}: ${validation.rows.length} issue(s) ready. Review the preview, then confirm.`);
     } else if (selection && state.validOnly) {
       confirmButton.disabled = state.busy;
       confirmButton.textContent = `Import ${selection.valid.length} valid row${selection.valid.length === 1 ? '' : 's'}, skip ${selection.excluded.length}`;
-      status.textContent = `${name}: only the ${selection.valid.length} valid row(s) will be imported; ${selection.excluded.length} row(s) with problems will be skipped and not saved. Review the preview, then confirm.`;
+      status.textContent = withPrior(`${name}: only the ${selection.valid.length} valid row(s) will be imported; ${selection.excluded.length} row(s) with problems will be skipped and not saved. Review the preview, then confirm.`);
     } else if (selection) {
       confirmButton.disabled = true;
       confirmButton.textContent = 'Import';
-      status.textContent = `${name} cannot be imported as a whole: ${selection.excluded.length} of ${validation.rows.length} rows have problems. Nothing was saved. Fix them and choose the file again, or explicitly choose to import only the ${selection.valid.length} valid row(s).`;
+      // A preview proves nothing about earlier sends of this content, so it
+      // never claims "Nothing was saved"; what an earlier send did is shown
+      // by the prior notice (pending / already imported / unknown).
+      status.textContent = withPrior(`${name} cannot be imported as a whole: ${selection.excluded.length} of ${validation.rows.length} rows have problems. Fix them and choose the file again, or explicitly choose to import only the ${selection.valid.length} valid row(s).`);
     } else {
       confirmButton.disabled = true;
       confirmButton.textContent = 'Import';
-      status.textContent = `${name} cannot be imported: fix the problems listed and choose the file again. Nothing was saved.`;
+      status.textContent = withPrior(`${name} cannot be imported: fix the problems listed and choose the file again.`);
     }
   }
 
@@ -522,7 +599,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     // pending list, so its result can still be checked afterwards. Any file
     // read still in flight is invalidated.
     selectionToken += 1;
-    Object.assign(state, { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false, validOnly: false });
+    Object.assign(state, { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false, validOnly: false, prior: null });
     input.value = '';
     renderPreview(null);
     renderChoice();
@@ -543,7 +620,14 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     const fingerprint = await fingerprintCsv(text);
     if (token !== null && (token !== selectionToken || state.busy)) return validation; // a newer selection or a started commit wins
     const pending = fingerprint ? pendingStore.entries().find((entry) => entry.fingerprint === fingerprint) : null;
-    Object.assign(state, { csv: text, fileName, validation, importKey: pending ? pending.importKey : newImportKey(), fingerprint, result: null, sent: false, attempts: 0, preexistingPending: Boolean(pending), validOnly: false });
+    const selection = validRowsSelection(validation);
+    const matchOptions = validation.valid ? {} : selection ? { mode: 'valid_rows', excludedLines: selection.excludedLines } : null;
+    const canMatch = typeof client.match === 'function' && matchOptions !== null;
+    Object.assign(state, {
+      csv: text, fileName, validation, importKey: pending ? pending.importKey : newImportKey(), fingerprint, result: null, sent: false, attempts: 0,
+      preexistingPending: Boolean(pending), validOnly: false,
+      prior: pending || canMatch ? { pending: Boolean(pending), others: [], checking: canMatch } : null,
+    });
     renderPreview(validation);
     const rowProblems = validation.rows.filter((row) => row.errors.length > 0);
     showErrors([
@@ -552,9 +636,39 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
       ...rowProblems.flatMap((row) => row.problems.map((entry) => describeProblem(row.line, entry))),
     ]);
     cancelButton.disabled = false;
-    checkButton.hidden = true;
+    // An unconfirmed earlier send of this exact file can be checked right here.
+    checkButton.hidden = !pending;
     renderChoice();
+    if (canMatch) await checkPrior(text, matchOptions);
     return validation;
+  }
+
+  // Asks the server whether exactly this content and choice was already
+  // imported. Only answers that still belong to the visible, unsent preview
+  // are applied; a failed check leaves the result unknown, never "not saved".
+  async function checkPrior(text, options) {
+    const importKey = state.importKey;
+    const token = selectionToken;
+    // The preview is usable while the check runs.
+    state.reading = false;
+    const response = await client.match(text, options);
+    if (token !== selectionToken || state.csv !== text || state.importKey !== importKey || state.sent || state.busy || state.result !== null || !state.prior) return;
+    state.prior.checking = false;
+    if (response && response.outcome === 'ok') {
+      const records = response.matches.filter((record) => record && typeof record.importKey === 'string');
+      const own = state.prior.pending ? records.find((record) => record.importKey === importKey) : null;
+      if (own) {
+        // The unconfirmed send from this browser did land: settle it now.
+        pendingStore.remove(importKey);
+        renderRecovery();
+        showConfirmed(own, state.fileName, `${state.fileName || 'This file'} was already imported earlier (${own.createdAt}): ${issueCountText(own)}.${skippedSentence(own)} Nothing was added again.`);
+        onImported(own);
+        return;
+      }
+      state.prior.others = records;
+    }
+    if (!state.prior.pending && state.prior.others.length === 0) state.prior = null;
+    renderChoice();
   }
 
   async function readFile(file) {
@@ -593,32 +707,35 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   // settle() resolves the outcome of one specific import. The identity is
   // captured when the request is sent, so a selection made while the request
   // is in flight can never be mistaken for the import being settled.
+  // Shows a confirmed import of the current preview: the preview closes and
+  // the rows a valid-rows import left out stay listed with their reasons, as
+  // stored by the server — never silently dropped.
+  function showConfirmed(record, fileName, text) {
+    state.result = record;
+    state.prior = null;
+    renderPreview(null);
+    showErrors(skippedDetails(record, 'Not imported'));
+    state.validOnly = false;
+    validOnlyBox.hidden = true;
+    checkButton.hidden = true;
+    cancelButton.disabled = true;
+    confirmButton.disabled = true;
+    input.value = '';
+    status.textContent = text;
+  }
+
   function settle(response, importKey = state.importKey, fileName = state.fileName) {
     state.busy = false;
     validOnlyInput.disabled = false;
     if (response.outcome === 'ok') {
       const record = response.body.import;
-      state.result = record;
       pendingStore.remove(importKey);
       renderRecovery();
-      renderPreview(null);
-      const excluded = Array.isArray(record.excludedRows) ? record.excludedRows : [];
-      // Rows left out by an explicit valid-rows import stay listed after the
-      // commit, as reported by the server — never silently dropped.
-      showErrors(
-        excluded.length > 0
-          ? [`Not imported (${excluded.length} row${excluded.length === 1 ? '' : 's'}):`, ...excluded.flatMap((row) => row.problems.map((entry) => describeProblem(row.line, entry)))]
-          : [],
+      showConfirmed(
+        record,
+        fileName,
+        `Imported ${issueCountText(record)} from ${fileName || 'the file'}.${skippedSentence(record)}${response.body.replayed ? ' (Already imported earlier; nothing was added again.)' : ''}`,
       );
-      state.validOnly = false;
-      validOnlyBox.hidden = true;
-      checkButton.hidden = true;
-      cancelButton.disabled = true;
-      confirmButton.disabled = true;
-      input.value = '';
-      status.textContent = `Imported ${record.issueCount} issue${record.issueCount === 1 ? '' : 's'} from ${fileName || 'the file'}.${
-        excluded.length > 0 ? ` Skipped ${excluded.length} row${excluded.length === 1 ? '' : 's'} with problems (line${excluded.length === 1 ? '' : 's'} ${excluded.map((row) => row.line).join(', ')}); they were not saved.` : ''
-      }${response.body.replayed ? ' (Already imported earlier; nothing was added again.)' : ''}`;
       onImported(record);
       return;
     }
@@ -647,7 +764,9 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
       status.textContent =
         error.code === 'IMPORT_CONFLICT'
           ? 'This import id was already used for different rows. Nothing new was saved here; use Check result to see what is stored under it.'
-          : definitivelyRefused
+          : definitivelyRefused && state.prior && state.prior.others.length > 0
+            ? 'The server refused this import attempt. Nothing new was saved; this exact content was already imported earlier.'
+            : definitivelyRefused
             ? 'The server refused this import. Nothing was saved.'
             : 'The server refused this import attempt. Nothing new was saved here; an earlier unconfirmed send stays recorded — use Check result.';
       confirmButton.disabled = true;
@@ -713,7 +832,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     if (state.busy) return;
     // Cancelling the preview never destroys the identity of an import whose
     // result is still unknown — only the durable lookup can settle that.
-    const unconfirmed = state.importKey && state.sent && state.result === null && pendingStore.entries().some((entry) => entry.importKey === state.importKey);
+    const unconfirmed = state.importKey && (state.sent || state.preexistingPending) && state.result === null && pendingStore.entries().some((entry) => entry.importKey === state.importKey);
     const name = state.fileName || 'the file';
     reset(
       unconfirmed
@@ -731,12 +850,32 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     status.textContent = 'Checking pending results…';
     let confirmed = 0;
     let stillOpen = 0;
+    const summaries = [];
+    const details = [];
     for (const entry of pending) {
       const response = await client.lookup(entry.importKey);
       if (response && response.outcome === 'ok') {
+        const record = response.body.import;
+        const name = entry.fileName || entry.importKey;
         pendingStore.remove(entry.importKey);
         confirmed += 1;
-        onImported(response.body.import);
+        // The same skipped lines and reasons a normal success shows, from the
+        // excluded rows the server stored with the import.
+        summaries.push(`${name}: imported ${issueCountText(record)}.${skippedSentence(record)}`);
+        details.push(...skippedDetails(record, `Not imported from ${name}`));
+        // The visible preview of this very import is settled too (no commit can be
+        // in flight here: this check only runs while the panel is idle).
+        if (state.importKey === entry.importKey && state.result === null) {
+          state.result = record;
+          state.prior = null;
+          renderPreview(null);
+          validOnlyBox.hidden = true;
+          checkButton.hidden = true;
+          cancelButton.disabled = true;
+          confirmButton.disabled = true;
+          input.value = '';
+        }
+        onImported(record);
       } else {
         // Not found yet, unreachable or refused without a durable record:
         // none of these proves the import was not saved, so it stays pending.
@@ -745,11 +884,13 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     }
     state.busy = false;
     renderRecovery();
+    if (confirmed > 0) showErrors(details);
+    const summary = summaries.length > 0 ? ` ${summaries.join(' ')}` : '';
     status.textContent =
       confirmed > 0 && stillOpen > 0
-        ? `${confirmed} unconfirmed import(s) are confirmed imported; ${stillOpen} still not confirmed.`
+        ? `${confirmed} unconfirmed import(s) are confirmed imported; ${stillOpen} still not confirmed.${summary}`
         : confirmed > 0
-          ? `All ${confirmed} unconfirmed import(s) are confirmed imported.`
+          ? `All ${confirmed} unconfirmed import(s) are confirmed imported.${summary}`
           : 'Still not confirmed: the server has no record yet, which does not prove they were not saved — the request may still be on its way. Check again in a moment.';
   });
 

@@ -268,6 +268,12 @@ export class IssueStore {
     return record ? copyImport(record) : null;
   }
 
+  // Every committed import with this digest, in commit order (read-only).
+  async findImportsByDigest(digest) {
+    await this.#ensureLoaded();
+    return this.imports.filter((candidate) => candidate.digest === digest).map(copyImport);
+  }
+
   // Commits a whole, already-validated batch atomically. The same importKey
   // with the same digest returns the stored record (replayed: true) and writes
   // nothing; the same key with a different digest is refused. Ids, timestamps

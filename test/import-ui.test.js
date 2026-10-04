@@ -84,7 +84,7 @@ const sharedStorage = () => {
   };
 };
 
-function setup(responses = [], { storage } = {}) {
+function setup(responses = [], { storage, matches } = {}) {
   const calls = [];
   const client = {
     commit: async (importKey, csv, options = {}) => {
@@ -96,6 +96,13 @@ function setup(responses = [], { storage } = {}) {
       return responses.shift();
     },
   };
+  // Optional server-side "was this exact content already imported?" lookup.
+  if (matches) {
+    client.match = async (csv, options = {}) => {
+      calls.push({ kind: 'match', csv, options });
+      return matches.shift();
+    };
+  }
   const imported = [];
   const root = new FakeElement('main');
   mountImportPanel(root, {
@@ -487,7 +494,9 @@ test('invalid rows stay visible with line, column and reason; the default import
   assert.deepEqual(problems, ['', 'Column title: title is required.', '', 'Column priority: priority "critical" is not one of: low, normal, high, urgent.']);
   assert.deepEqual(outcomes(ui), ['Not imported while other rows have problems', 'Cannot be imported', 'Not imported while other rows have problems', 'Cannot be imported']);
   assert.equal(ui.one('import-confirm').disabled, true);
-  assert.match(ui.one('import-status').textContent, /cannot be imported as a whole: 2 of 4 rows have problems\. Nothing was saved/);
+  assert.match(ui.one('import-status').textContent, /cannot be imported as a whole: 2 of 4 rows have problems\./);
+  // a preview proves nothing about earlier imports, so it never claims "Nothing was saved"
+  assert.doesNotMatch(ui.one('import-status').textContent, /Nothing was saved/);
   assert.match(ui.one('import-valid-only-label').textContent, /Import only the 2 valid rows and skip the 2 rows with problems \(lines 3, 5\)/);
   await ui.one('import-confirm').fire('click');
   assert.equal(ui.calls.length, 0);
@@ -643,4 +652,149 @@ test('the HTTP client sends mode and excludedLines only for an explicit valid-ro
     { importKey: 'k1', csv: 'title\nA\n' },
     { importKey: 'k2', csv: MIXED, mode: 'valid_rows', excludedLines: [3, 5] },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// Trial findings: recovery after a lost response must never claim "Nothing
+// was saved", and a recovered result shows the same skipped rows as a
+// normal success.
+// ---------------------------------------------------------------------------
+const storedSubset = (importKey) => ({ ...subsetOk(2, [3, 5]).body.import, importKey, createdAt: '2026-10-04T20:00:00.000Z' });
+
+test('bug A: after a lost response and a reload, the same file never says nothing was saved and offers Check result', async () => {
+  const storage = sharedStorage();
+  const first = setup([{ outcome: 'unknown' }], { storage });
+  await first.choose('mixed.csv', MIXED);
+  await toggle(first, true);
+  await first.one('import-confirm').fire('click');
+  const second = setup([], { storage }); // reload; no server content lookup available
+  await second.choose('mixed.csv', MIXED);
+  const status = second.one('import-status').textContent;
+  assert.doesNotMatch(status, /Nothing was saved/);
+  assert.match(status, /already sent/i);
+  assert.match(status, /result is not confirmed/i);
+  assert.equal(second.one('import-check').hidden, false);
+  assert.equal(second.calls.length, 0);
+});
+
+test('bug A: reselecting a file whose lost send was committed shows it as already imported, with its skipped rows', async () => {
+  const storage = sharedStorage();
+  const first = setup([{ outcome: 'unknown' }], { storage });
+  await first.choose('mixed.csv', MIXED);
+  await toggle(first, true);
+  await first.one('import-confirm').fire('click');
+  const key = first.calls[0].importKey;
+  const second = setup([], { storage, matches: [{ outcome: 'ok', matches: [storedSubset(key)] }] });
+  await second.choose('mixed.csv', MIXED);
+  assert.deepEqual(second.calls.map((call) => call.kind), ['match']);
+  assert.deepEqual(second.calls[0].options, { mode: 'valid_rows', excludedLines: [3, 5] });
+  assert.equal(second.calls[0].csv, MIXED);
+  const status = second.one('import-status').textContent;
+  assert.doesNotMatch(status, /Nothing was saved/);
+  assert.match(status, /already imported/i);
+  assert.match(status, /Skipped 2 rows with problems \(lines 3, 5\)/);
+  assert.match(second.one('import-errors').textContent, /Line 3, column title: title is required\./);
+  assert.match(second.one('import-errors').textContent, /Line 5, column priority: priority "critical"/);
+  assert.equal(second.one('import-confirm').disabled, true);
+  assert.equal(second.one('import-recovery').hidden, true); // the pending entry is settled
+  assert.equal(second.imported.length, 1);
+});
+
+test('bug A: after recovery cleared the pending entry, the same file is still recognized as already imported', async () => {
+  const ui = setup([], { storage: sharedStorage(), matches: [{ outcome: 'ok', matches: [storedSubset('11111111-2222-4333-8444-555555555555')] }] });
+  await ui.choose('mixed.csv', MIXED);
+  const status = ui.one('import-status').textContent;
+  assert.doesNotMatch(status, /Nothing was saved/);
+  assert.match(status, /already imported earlier/i);
+  assert.match(status, /2026-10-04T20:00:00\.000Z/);
+  assert.match(status, /second time/);
+  assert.equal(ui.calls.filter((call) => call.kind === 'commit').length, 0);
+});
+
+test('bug A: when the content lookup cannot answer for a pending file, the result stays unknown with Check result', async () => {
+  const storage = sharedStorage();
+  const first = setup([{ outcome: 'unknown' }], { storage });
+  await first.choose('history.csv', VALID);
+  await first.one('import-confirm').fire('click');
+  const second = setup([], { storage, matches: [{ outcome: 'unknown' }] });
+  await second.choose('history.csv', VALID);
+  assert.deepEqual(second.calls[0].options, {});
+  const status = second.one('import-status').textContent;
+  assert.doesNotMatch(status, /Nothing was saved/);
+  assert.match(status, /result is not confirmed/i);
+  assert.equal(second.one('import-check').hidden, false);
+  assert.equal(second.one('import-recovery').hidden, false);
+});
+
+test('bug A: a content lookup with no match for a fresh file adds no claim and changes nothing', async () => {
+  const ui = setup([okResponse(2)], { storage: sharedStorage(), matches: [{ outcome: 'ok', matches: [] }] });
+  await ui.choose('history.csv', VALID);
+  assert.equal(ui.one('import-status').textContent, 'history.csv: 2 issue(s) ready. Review the preview, then confirm.');
+  assert.equal(ui.one('import-confirm').disabled, false);
+});
+
+test('bug B: Check pending results shows the skipped lines and reasons stored by the server', async () => {
+  const storage = sharedStorage();
+  const first = setup([{ outcome: 'unknown' }], { storage });
+  await first.choose('mixed.csv', MIXED);
+  await toggle(first, true);
+  await first.one('import-confirm').fire('click');
+  const key = first.calls[0].importKey;
+  const second = setup([{ outcome: 'ok', status: 200, body: { import: storedSubset(key), replayed: false } }], { storage });
+  await second.one('import-recovery-check').fire('click');
+  const status = second.one('import-status').textContent;
+  assert.match(status, /confirmed imported/);
+  assert.match(status, /mixed\.csv: imported 2 issues\. Skipped 2 rows with problems \(lines 3, 5\); they were not saved\./);
+  const errors = second.one('import-errors');
+  assert.equal(errors.hidden, false);
+  assert.match(errors.textContent, /Not imported from mixed\.csv \(2 rows\):/);
+  assert.match(errors.textContent, /Line 3, column title: title is required\./);
+  assert.match(errors.textContent, /Line 5, column priority: priority "critical" is not one of: low, normal, high, urgent\./);
+  assert.equal(second.imported.length, 1);
+});
+
+test('the HTTP client asks the server about already-imported content with mode and excluded lines', async () => {
+  const requests = [];
+  const client = csvImport.createImportClient({
+    fetchImpl: async (url, options) => {
+      requests.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => ({ matches: [] }) };
+    },
+  });
+  assert.deepEqual(await client.match('title\nA\n'), { outcome: 'ok', status: 200, matches: [] });
+  await client.match(MIXED, { mode: 'valid_rows', excludedLines: [3, 5] });
+  assert.deepEqual(requests, [
+    { url: '/api/imports/match', body: { csv: 'title\nA\n' } },
+    { url: '/api/imports/match', body: { csv: MIXED, mode: 'valid_rows', excludedLines: [3, 5] } },
+  ]);
+});
+
+test('cancelling a reselected unconfirmed file after a reload does not claim nothing was sent', async () => {
+  const storage = sharedStorage();
+  const first = setup([{ outcome: 'unknown' }], { storage });
+  await first.choose('history.csv', VALID);
+  await first.one('import-confirm').fire('click');
+  const second = setup([], { storage });
+  await second.choose('history.csv', VALID);
+  await second.one('import-cancel').fire('click');
+  const status = second.one('import-status').textContent;
+  assert.doesNotMatch(status, /Nothing was sent/);
+  assert.match(status, /still unknown/);
+  assert.equal(second.one('import-recovery').hidden, false);
+});
+
+test('Check pending results also closes the matching preview with its confirmed result', async () => {
+  const storage = sharedStorage();
+  const first = setup([{ outcome: 'unknown' }], { storage });
+  await first.choose('mixed.csv', MIXED);
+  await toggle(first, true);
+  await first.one('import-confirm').fire('click');
+  const key = first.calls[0].importKey;
+  const second = setup([{ outcome: 'ok', status: 200, body: { import: storedSubset(key), replayed: false } }], { storage });
+  await second.choose('mixed.csv', MIXED);
+  await second.one('import-recovery-check').fire('click');
+  assert.equal(second.one('import-confirm').disabled, true);
+  assert.equal(second.one('import-preview').hidden, true);
+  assert.equal(second.one('import-check').hidden, true);
+  assert.match(second.one('import-errors').textContent, /Line 3, column title: title is required\./);
 });
