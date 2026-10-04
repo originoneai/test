@@ -95,9 +95,9 @@ function assertValidationError(body) {
   assert.equal(body.error.code, 'VALIDATION_ERROR');
 }
 
-function zeroReport(weekStart, weekEndExclusive) {
+function zeroReport(weekStart, weekEndExclusive, completedTimingUnknown = 0) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     weekStart,
     weekEndExclusive,
     created: {
@@ -105,6 +105,14 @@ function zeroReport(weekStart, weekEndExclusive) {
       byStatus: { open: 0, in_progress: 0, done: 0 },
       byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
     },
+    completed: {
+      total: 0,
+      byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+      createdThisWeek: 0,
+      createdEarlier: 0,
+      repeatCompletions: 0,
+    },
+    completedTimingUnknown,
   };
 }
 
@@ -184,7 +192,7 @@ test('explicit weekStart tallies only that week using current stored status and 
       const response = await tracker.report('?weekStart=2026-09-28');
       assert.equal(response.status, 200);
       assert.deepEqual(response.body, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         weekStart: '2026-09-28',
         weekEndExclusive: '2026-10-05',
         created: {
@@ -192,6 +200,17 @@ test('explicit weekStart tallies only that week using current stored status and 
           byStatus: { open: 2, in_progress: 1, done: 1 },
           byPriority: { low: 1, normal: 1, high: 1, urgent: 1 },
         },
+        // No recorded completion events anywhere in this fixture; the two
+        // done issues (one inside the week, one outside) are legacy-done and
+        // surface in completedTimingUnknown instead of any week.
+        completed: {
+          total: 0,
+          byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+          createdThisWeek: 0,
+          createdEarlier: 0,
+          repeatCompletions: 0,
+        },
+        completedTimingUnknown: 2,
       });
     },
     [
@@ -231,6 +250,16 @@ test('later mutations move an issue between buckets; updatedAt is never used', a
       byStatus: { open: 1, in_progress: 0, done: 1 },
       byPriority: { low: 0, normal: 1, high: 0, urgent: 1 },
     });
+    // The accepted transition to done recorded one real event, so the same
+    // week also reports it as completed exactly once.
+    assert.deepEqual(response.body.completed, {
+      total: 1,
+      byPriority: { low: 0, normal: 0, high: 0, urgent: 1 },
+      createdThisWeek: 1,
+      createdEarlier: 0,
+      repeatCompletions: 0,
+    });
+    assert.equal(response.body.completedTimingUnknown, 0);
   });
 });
 
@@ -327,4 +356,141 @@ test('reading the report leaves issue APIs and stored bytes intact', async () =>
     assert.equal(list.body.items.length, 1);
     assert.deepEqual(list.body.items[0], created.body);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Report v2: completion statistics (append-only history, per-week dedup)
+// ---------------------------------------------------------------------------
+
+test('completed counts distinct issues once with extra same-week events separate', async () => {
+  await withTracker(
+    async (tracker) => {
+      const response = await tracker.report('?weekStart=2026-09-28');
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body.completed, {
+        // Issue 1 was completed twice inside the week: one task, one repeat.
+        // Issue 2 completed once, created inside the week. Issues 5 and 6
+        // hold events exactly outside the boundaries and count for nothing.
+        total: 2,
+        byPriority: { low: 0, normal: 0, high: 1, urgent: 1 },
+        createdThisWeek: 1,
+        createdEarlier: 1,
+        repeatCompletions: 1,
+      });
+      // The intake statistic keeps its own meaning: both issues created
+      // inside the week are counted there, independently of completion.
+      assert.deepEqual(response.body.created, {
+        total: 2,
+        byStatus: { open: 1, in_progress: 0, done: 1 },
+        byPriority: { low: 0, normal: 1, high: 0, urgent: 1 },
+      });
+      assert.equal(response.body.completedTimingUnknown, 0);
+    },
+    [
+      // Created in an earlier week, completed twice inside the selected week.
+      issue({ slot: 1, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'high', completions: ['2026-09-28T00:00:00.000Z', '2026-09-30T10:00:00.000Z'] }),
+      // Created and completed inside the week, currently done.
+      issue({ slot: 2, createdAt: '2026-09-29T09:00:00.000Z', status: 'done', priority: 'urgent', completions: ['2026-10-04T23:59:59.999Z'] }),
+      // Completion event exactly before the week starts: outside.
+      issue({ slot: 5, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'low', completions: ['2026-09-27T23:59:59.999Z'] }),
+      // Completion event exactly at the exclusive end: outside.
+      issue({ slot: 6, createdAt: '2026-08-20T10:00:00.000Z', status: 'open', priority: 'low', completions: ['2026-10-05T00:00:00.000Z'] }),
+      // Created this week, never completed: intake only.
+      issue({ slot: 7, createdAt: '2026-09-30T11:00:00.000Z', status: 'open', priority: 'normal' }),
+    ],
+  );
+});
+
+test('a reopened task keeps the credit for the week it was completed in', async () => {
+  await withTracker(
+    async (tracker) => {
+      const week = await tracker.report('?weekStart=2026-09-28');
+      assert.equal(week.body.completed.total, 1, 'counted in its completion week although currently open');
+      assert.equal(week.body.completed.createdEarlier, 1);
+      assert.equal(week.body.completed.byPriority.high, 1, 'bucketed by the currently stored priority');
+      const other = await tracker.report('?weekStart=2026-10-05');
+      assert.deepEqual(other.body.completed, {
+        total: 0,
+        byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+        createdThisWeek: 0,
+        createdEarlier: 0,
+        repeatCompletions: 0,
+      }, 'not counted in any other week');
+      assert.equal(week.body.completedTimingUnknown, 0);
+    },
+    [
+      issue({ slot: 1, createdAt: '2026-09-01T08:00:00.000Z', status: 'open', priority: 'high', completions: ['2026-09-29T12:00:00.000Z'] }),
+    ],
+  );
+});
+
+test('completedTimingUnknown counts legacy done issues regardless of the selected week', async () => {
+  await withTracker(
+    async (tracker) => {
+      for (const weekStart of ['2026-09-28', '2026-08-03', '2026-10-05']) {
+        const response = await tracker.report('?weekStart=' + weekStart);
+        assert.equal(response.status, 200, weekStart);
+        assert.equal(response.body.completedTimingUnknown, 2, weekStart + ': one seven-field and one six-field legacy done issue');
+        assert.equal(response.body.completed.total, 0, weekStart + ': unknown timing belongs to no week');
+      }
+      // An issue with recorded events is never unknown, even when done.
+      const withEvents = await tracker.report('?weekStart=2026-09-28');
+      assert.equal(withEvents.body.completed.total, 0, 'the third issue completed in a different week');
+      const otherWeek = await tracker.report('?weekStart=2026-08-31');
+      assert.equal(otherWeek.body.completed.total, 1);
+      assert.equal(otherWeek.body.completedTimingUnknown, 2);
+    },
+    [
+      // Seven-field legacy done issue: unknown completion timing.
+      issue({ slot: 1, createdAt: '2026-08-05T08:00:00.000Z', status: 'done', priority: 'low' }),
+      // Six-field legacy done issue: unknown completion timing, reads as normal.
+      {
+        id: '11111111-1111-4111-8111-000000000009',
+        title: 'Six-field legacy done',
+        description: '',
+        status: 'done',
+        createdAt: '2026-08-06T08:00:00.000Z',
+        updatedAt: '2026-08-06T08:00:00.000Z',
+      },
+      // Post-history issue with a real event in its own week.
+      issue({ slot: 2, createdAt: '2026-09-01T08:00:00.000Z', status: 'done', priority: 'urgent', completions: ['2026-09-02T08:00:00.000Z'] }),
+    ],
+  );
+});
+
+test('low-year completion events are tallied in their exact UTC week', async () => {
+  await withTracker(
+    async (tracker) => {
+      const response = await tracker.report('?weekStart=0099-01-05');
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body.completed, {
+        total: 1,
+        byPriority: { low: 0, normal: 1, high: 0, urgent: 0 },
+        createdThisWeek: 0,
+        createdEarlier: 1,
+        repeatCompletions: 0,
+      });
+      assert.deepEqual(response.body.created, {
+        total: 0,
+        byStatus: { open: 0, in_progress: 0, done: 0 },
+        byPriority: { low: 0, normal: 0, high: 0, urgent: 0 },
+      });
+    },
+    [
+      issue({ slot: 1, createdAt: '0098-06-01T00:00:00.000Z', status: 'done', priority: 'normal', completions: ['0099-01-05T00:00:00.000Z'] }),
+    ],
+  );
+});
+
+test('a report read leaves legacy records un-upgraded on disk', async () => {
+  await withTracker(
+    async (tracker) => {
+      const before = await readFile(tracker.storePath, 'utf8');
+      const response = await tracker.report('?weekStart=2026-09-28');
+      assert.equal(response.status, 200);
+      assert.equal(response.body.completedTimingUnknown, 1);
+      assert.equal(await readFile(tracker.storePath, 'utf8'), before, 'report reads never rewrite storage');
+    },
+    [issue({ slot: 1, createdAt: '2026-09-29T08:00:00.000Z', status: 'done', priority: 'normal' })],
+  );
 });
