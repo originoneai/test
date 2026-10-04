@@ -10,14 +10,22 @@
 // A corrupt store file is reported, never rewritten. Pre-priority records
 // (exactly the legacy six fields) are valid legacy data: they read as
 // 'normal' and are upgraded on disk only by the next successful write,
-// never by a read.
+// never by a read. Completion history is the same pattern one step later:
+// records without a completions list read as no recorded events, and each
+// accepted arrival in 'done' (creation as done, or a transition from another
+// status) appends one server-clock UTC event atomically with the mutation.
+// The list is append-only: reopening or editing never removes or rewrites
+// events, and nothing but an accepted mutation ever adds one. A legacy issue
+// that is already done therefore keeps unknown completion timing forever —
+// no event is ever inferred or backfilled for it.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const DEFAULT_DATA_DIR = '.data';
 const STORE_FILENAME = 'issues.json';
-const ISSUE_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // exact, sorted
+const ISSUE_FIELDS = ['completions', 'createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // exact, sorted
+const LEGACY_PRIORITY_FIELDS = ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt']; // pre-completions shape, exact, sorted
 const LEGACY_ISSUE_FIELDS = ['createdAt', 'description', 'id', 'status', 'title', 'updatedAt']; // pre-priority shape, exact, sorted
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
 const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
@@ -112,7 +120,7 @@ export class IssueStore {
           (issue.description && issue.description.toLowerCase().includes(needle)),
       );
     }
-    return items.map((issue) => ({ ...issue }));
+    return items.map((issue) => ({ ...issue, completions: [...issue.completions] }));
   }
 
   async create({ title, description = '', status = 'open', priority = 'normal' }) {
@@ -123,11 +131,22 @@ export class IssueStore {
       guardStatus(status);
       guardPriority(priority);
       const now = new Date().toISOString();
-      const issue = { id: randomUUID(), title, description, status, priority, createdAt: now, updatedAt: now };
+      // Arriving directly in 'done' is itself an accepted completion; every
+      // other start records nothing until a real transition happens.
+      const issue = {
+        id: randomUUID(),
+        title,
+        description,
+        status,
+        priority,
+        createdAt: now,
+        updatedAt: now,
+        completions: status === 'done' ? [now] : [],
+      };
       const candidate = [...this.issues, issue];
       await this.#persist(candidate);
       this.issues = candidate;
-      return { ...issue };
+      return { ...issue, completions: [...issue.completions] };
     });
   }
 
@@ -135,8 +154,9 @@ export class IssueStore {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
       const keys = Object.keys(patch);
-      // id/createdAt/updatedAt are server-owned; patching them or writing
-      // non-contract values would produce a record the loader refuses.
+      // id/createdAt/updatedAt/completions are server-owned; patching them or
+      // writing non-contract values would produce a record the loader refuses
+      // — and would let a client forge or erase completion history.
       if (keys.length === 0 || keys.some((key) => key !== 'title' && key !== 'description' && key !== 'status' && key !== 'priority')) {
         throw writeGuard('only title, description, status and priority are patchable.');
       }
@@ -146,12 +166,21 @@ export class IssueStore {
       if ('priority' in patch) guardPriority(patch.priority);
       const index = this.issues.findIndex((candidate) => candidate.id === id);
       if (index === -1) return null;
-      const updated = { ...this.issues[index], ...patch, updatedAt: new Date().toISOString() };
+      const now = new Date().toISOString();
+      const previous = this.issues[index];
+      const updated = { ...previous, ...patch, updatedAt: now };
+      // One event per accepted arrival in 'done': a transition from another
+      // status appends the same server-clock instant as the mutation; staying
+      // done (or editing other fields) appends nothing, and leaving 'done'
+      // keeps every past event untouched.
+      if (patch.status === 'done' && previous.status !== 'done') {
+        updated.completions = [...previous.completions, now];
+      }
       const candidate = this.issues.slice();
       candidate[index] = updated;
       await this.#persist(candidate);
       this.issues = candidate;
-      return { ...updated };
+      return { ...updated, completions: [...updated.completions] };
     });
   }
 
@@ -188,11 +217,12 @@ export class IssueStore {
   }
 
   // A store file is only trusted when every record matches the data contract
-  // or the exact pre-priority legacy shape (no priority field); anything else
-  // is corruption: it is reported and the file is kept as-is, so
-  // neither reads nor later successful writes can launder it. Timestamps are
-  // not compared against each other: the writer does not guarantee a monotonic
-  // clock, and a system clock rollback must not invalidate real data.
+  // or one of the two exact legacy shapes (pre-completions with priority, or
+  // pre-priority); anything else is corruption: it is reported and the file is
+  // kept as-is, so neither reads nor later successful writes can launder it.
+  // Timestamps are not compared against each other: the writer does not
+  // guarantee a monotonic clock, and a system clock rollback must not
+  // invalidate real data.
   #parseStore(raw) {
     const refuse = (detail) =>
       new StoreError(
@@ -218,16 +248,25 @@ export class IssueStore {
       }
       const keys = Object.keys(issue).sort();
       const keyList = keys.join(',');
-      // The only tolerated deviation from the full contract is the exact
-      // pre-priority shape: records written before the priority field existed.
-      const legacy = keyList === LEGACY_ISSUE_FIELDS.join(',');
+      // The only tolerated deviations from the full contract are the exact
+      // older shapes: records written before the priority field existed and
+      // before completion history existed.
+      const legacyPriority = keyList === LEGACY_PRIORITY_FIELDS.join(',');
+      const legacySix = keyList === LEGACY_ISSUE_FIELDS.join(',');
+      const legacy = legacyPriority || legacySix;
       if (!legacy && keyList !== ISSUE_FIELDS.join(',')) {
         throw refuse(
-          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')} or the legacy fields ${LEGACY_ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
+          `item ${index} must have exactly the fields ${ISSUE_FIELDS.join(', ')}, the legacy fields ${LEGACY_PRIORITY_FIELDS.join(', ')} or the legacy fields ${LEGACY_ISSUE_FIELDS.join(', ')} (found: ${keys.join(', ') || 'none'}).`,
         );
       }
-      if (Object.values(issue).some((value) => typeof value !== 'string')) {
-        throw refuse(`item ${index} has a non-string field.`);
+      for (const [key, value] of Object.entries(issue)) {
+        if (key === 'completions') {
+          if (!Array.isArray(value) || value.some((event) => typeof event !== 'string' || !isValidIsoUtc(event))) {
+            throw refuse(`item ${index} completions must be a list of valid ISO UTC timestamps.`);
+          }
+        } else if (typeof value !== 'string') {
+          throw refuse(`item ${index} has a non-string field.`);
+        }
       }
       if (!UUID_PATTERN.test(issue.id)) {
         throw refuse(`item ${index} id is not a UUID.`);
@@ -246,7 +285,7 @@ export class IssueStore {
       if (!ISSUE_STATUSES.has(issue.status)) {
         throw refuse(`item ${index} status "${issue.status}" is not one of: open, in_progress, done.`);
       }
-      if (!legacy && !ISSUE_PRIORITIES.has(issue.priority)) {
+      if (!legacySix && !ISSUE_PRIORITIES.has(issue.priority)) {
         throw refuse(`item ${index} priority "${issue.priority}" is not one of: low, normal, high, urgent.`);
       }
       if (!isValidIsoUtc(issue.createdAt) || !isValidIsoUtc(issue.updatedAt)) {
@@ -254,8 +293,15 @@ export class IssueStore {
       }
       // Legacy records are upgraded in memory only: reads never touch the
       // file, and the next successful mutation persists the whole snapshot,
-      // upgrading every legacy record in one atomic write.
-      issues.push(legacy ? { ...issue, priority: 'normal' } : issue);
+      // upgrading every legacy record in one atomic write. A legacy record
+      // with no events gains an empty list — for an issue already done that
+      // empty list is exactly the honest statement "completion time unknown";
+      // no event is invented for it here or anywhere else.
+      issues.push({
+        ...issue,
+        ...(legacySix ? { priority: 'normal' } : {}),
+        ...(legacy ? { completions: [] } : {}),
+      });
     }
     return issues;
   }
