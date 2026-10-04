@@ -111,37 +111,62 @@ export function parseCsv(input) {
   return { records };
 }
 
+// Every row problem names the column it is about (null when it concerns the
+// whole row, such as a wrong number of fields) and a reason, so the preview
+// and the server can say exactly which line, which column and why. `errors`
+// keeps the plain reason texts for callers that only need the messages.
 function validateRow(record, columns) {
-  const errors = [];
+  const problems = [];
+  const problem = (column, reason) => problems.push({ column, reason });
   if (record.fields.length !== columns.length) {
-    errors.push(`expected ${columns.length} field(s) like the header, found ${record.fields.length}.`);
+    problem(null, `expected ${columns.length} field(s) like the header, found ${record.fields.length}.`);
   }
   const values = {};
   columns.forEach((column, index) => {
     values[column] = record.fields[index] ?? '';
   });
   const title = (values.title ?? '').trim();
-  if (title.length < 1) errors.push('title is required.');
-  else if (title.length > IMPORT_TITLE_MAX) errors.push(`title must be at most ${IMPORT_TITLE_MAX} characters.`);
+  if (title.length < 1) problem('title', 'title is required.');
+  else if (title.length > IMPORT_TITLE_MAX) problem('title', `title must be at most ${IMPORT_TITLE_MAX} characters.`);
   const description = values.description ?? IMPORT_DEFAULTS.description;
   if (description.length > IMPORT_DESCRIPTION_MAX) {
-    errors.push(`description must be at most ${IMPORT_DESCRIPTION_MAX} characters.`);
+    problem('description', `description must be at most ${IMPORT_DESCRIPTION_MAX} characters.`);
   }
   const statusText = (values.status ?? '').trim();
   const status = statusText === '' ? IMPORT_DEFAULTS.status : statusText;
   if (!IMPORT_STATUSES.includes(status)) {
-    errors.push(`status "${statusText}" is not one of: ${IMPORT_STATUSES.join(', ')}.`);
+    problem('status', `status "${statusText}" is not one of: ${IMPORT_STATUSES.join(', ')}.`);
   }
   const priorityText = (values.priority ?? '').trim();
   const priority = priorityText === '' ? IMPORT_DEFAULTS.priority : priorityText;
   if (!IMPORT_PRIORITIES.includes(priority)) {
-    errors.push(`priority "${priorityText}" is not one of: ${IMPORT_PRIORITIES.join(', ')}.`);
+    problem('priority', `priority "${priorityText}" is not one of: ${IMPORT_PRIORITIES.join(', ')}.`);
   }
   return {
     line: record.line,
     issue: { title, description, status, priority },
-    errors,
+    problems,
+    errors: problems.map((entry) => entry.reason),
   };
+}
+
+/** "Line 9, column title: title is required." — one readable problem line. */
+export function describeProblem(line, entry) {
+  return `Line ${line}, ${entry.column ? `column ${entry.column}` : 'whole row'}: ${entry.reason}`;
+}
+
+// The explicit "import only the valid rows" choice. It exists only when the
+// file itself is acceptable (no file-level problem such as an unsupported
+// column or a limit) and the rows split into at least one valid and at least
+// one invalid row. `excludedLines` is exactly what the user saw excluded in
+// the preview; the server recomputes it and refuses the commit when it
+// differs, so a stale or different preview can never be committed.
+export function validRowsSelection(validation) {
+  if (!validation || validation.fileErrors.length > 0 || validation.rows.length === 0) return null;
+  const valid = validation.rows.filter((row) => row.errors.length === 0);
+  const excluded = validation.rows.filter((row) => row.errors.length > 0);
+  if (valid.length === 0 || excluded.length === 0) return null;
+  return { valid, excluded, excludedLines: excluded.map((row) => row.line) };
 }
 
 // Full validation of one file. Never throws. `valid` is true only when the
@@ -235,15 +260,65 @@ export function createImportClient({ fetchImpl = (...args) => globalThis.fetch(.
     return { outcome: 'rejected', status: response.status, body };
   }
   return {
-    commit: (importKey, csv) =>
+    // options: {} for the default whole-file import, or {mode: 'valid_rows',
+    // excludedLines} when the user explicitly chose to import only valid rows.
+    commit: (importKey, csv, options = {}) =>
       call('/api/imports', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ importKey, csv }),
+        body: JSON.stringify(options.mode === 'valid_rows' ? { importKey, csv, mode: 'valid_rows', excludedLines: options.excludedLines } : { importKey, csv }),
       }),
     lookup: (importKey) => call('/api/imports/' + encodeURIComponent(importKey), { method: 'GET' }),
+    // Read-only: every committed import of exactly this content and choice
+    // (same normalized rows, mode and excluded lines as a commit would send).
+    match: async (csv, options = {}) => {
+      let response;
+      try {
+        response = await fetchImpl(base + '/api/imports/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(options.mode === 'valid_rows' ? { csv, mode: 'valid_rows', excludedLines: options.excludedLines } : { csv }),
+        });
+      } catch {
+        return { outcome: 'unknown' };
+      }
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        return { outcome: 'unknown', status: response.status };
+      }
+      if (response.ok && body && Array.isArray(body.matches)) return { outcome: 'ok', status: response.status, matches: body.matches };
+      return { outcome: 'unknown', status: response.status };
+    },
   };
 }
+
+// The rows a valid-rows import left out, as stored by the server: one
+// status sentence and the per-line reasons. Shared by a fresh commit, a
+// replay, Check result, Check pending results and an already-imported file,
+// so every confirmed result shows the same skipped rows.
+function excludedOf(record) {
+  return record && Array.isArray(record.excludedRows) ? record.excludedRows : [];
+}
+
+function skippedSentence(record) {
+  const excluded = excludedOf(record);
+  if (excluded.length === 0) return '';
+  const plural = excluded.length === 1 ? '' : 's';
+  return ` Skipped ${excluded.length} row${plural} with problems (line${plural} ${excluded.map((row) => row.line).join(', ')}); they were not saved.`;
+}
+
+function skippedDetails(record, header) {
+  const excluded = excludedOf(record);
+  if (excluded.length === 0) return [];
+  return [
+    `${header} (${excluded.length} row${excluded.length === 1 ? '' : 's'}):`,
+    ...excluded.flatMap((row) => (Array.isArray(row.problems) ? row.problems : []).map((entry) => describeProblem(row.line, entry))),
+  ];
+}
+
+const issueCountText = (record) => `${record.issueCount} issue${record.issueCount === 1 ? '' : 's'}`;
 
 // An import whose result is not confirmed yet stays in a pending list keyed
 // by its import id, so the outcome can still be looked up after the preview
@@ -326,7 +401,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   const section = el('section', { class: 'import-panel', 'aria-labelledby': 'import-heading', 'data-role': 'import' });
   section.append(el('h2', { id: 'import-heading' }, 'Import historical issues (CSV)'));
   section.append(
-    el('p', { class: 'hint' }, 'Columns: title (required), description, status (open, in_progress, done; default open), priority (low, normal, high, urgent; default normal). UTF-8, up to 500 issues. Nothing is saved until you confirm.'),
+    el('p', { class: 'hint' }, 'Columns: title (required), description, status (open, in_progress, done; default open), priority (low, normal, high, urgent; default normal). UTF-8, up to 500 issues. Nothing is saved until you confirm. If some rows have problems, nothing is imported unless you explicitly choose to import only the valid rows.'),
   );
   const label = el('label', { for: 'import-file' }, 'CSV file');
   const input = el('input', { id: 'import-file', type: 'file', accept: '.csv,text/csv', 'data-role': 'import-file' });
@@ -339,9 +414,16 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   const cancelButton = el('button', { type: 'button', 'data-role': 'import-cancel', disabled: '' }, 'Cancel');
   const checkButton = el('button', { type: 'button', 'data-role': 'import-check', hidden: '' }, 'Check result');
   actions.append(confirmButton, cancelButton, checkButton);
+  // The explicit, opt-in choice to import only the valid rows. Hidden unless
+  // the file splits into valid and invalid rows; always unchecked at first.
+  const validOnlyBox = el('p', { class: 'import-valid-only', 'data-role': 'import-valid-only-box', hidden: '' });
+  const validOnlyInput = el('input', { id: 'import-valid-only', type: 'checkbox', 'data-role': 'import-valid-only' });
+  validOnlyInput.checked = false;
+  const validOnlyLabel = el('label', { for: 'import-valid-only', 'data-role': 'import-valid-only-label' });
+  validOnlyBox.append(validOnlyInput, validOnlyLabel);
   const recoveryBox = el('div', { 'data-role': 'import-recovery', hidden: '' });
   const recoveryCheckButton = el('button', { type: 'button', 'data-role': 'import-recovery-check', hidden: '' }, 'Check pending results');
-  section.append(status, errorBox, recoveryBox, table, actions);
+  section.append(status, errorBox, recoveryBox, table, validOnlyBox, actions);
   root.append(section);
 
   // Selections are tokened: every file choice takes the next token, and an
@@ -349,7 +431,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   // A slower earlier read can then never overwrite a newer preview, and a
   // reset invalidates whatever was still in flight.
   let selectionToken = 0;
-  const state = { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, busy: false, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false };
+  const state = { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, busy: false, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false, validOnly: false, prior: null };
 
   function showErrors(messages) {
     errorBox.replaceChildren(...messages.map((message) => el('p', {}, message)));
@@ -389,6 +471,13 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   }
   renderRecovery();
 
+  // What will happen to one row if the user confirms now.
+  function rowOutcome(validation, row) {
+    if (validation.valid) return 'Will be imported';
+    if (row.errors.length > 0) return state.validOnly ? 'Excluded: will not be imported' : 'Cannot be imported';
+    return state.validOnly ? 'Will be imported' : 'Not imported while other rows have problems';
+  }
+
   function renderPreview(validation) {
     table.replaceChildren();
     if (!validation || validation.rows.length === 0) {
@@ -397,18 +486,22 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     }
     const head = el('thead');
     const headRow = el('tr');
-    for (const name of ['Line', 'Title', 'Description', 'Status', 'Priority', 'Problems']) headRow.append(el('th', { scope: 'col' }, name));
+    for (const name of ['Line', 'Title', 'Description', 'Status', 'Priority', 'Result', 'Problems']) headRow.append(el('th', { scope: 'col' }, name));
     head.append(headRow);
     const body = el('tbody');
     for (const row of validation.rows) {
-      const tr = el('tr', { 'data-role': 'import-row', class: row.errors.length ? 'has-error' : '' });
+      const excluded = row.errors.length > 0;
+      const tr = el('tr', { 'data-role': 'import-row', 'data-line': String(row.line), class: excluded ? 'has-error' : '' });
+      const problems = el('td', { 'data-role': 'import-row-problems' });
+      problems.append(...row.problems.map((entry) => el('div', {}, `${entry.column ? `Column ${entry.column}` : 'Whole row'}: ${entry.reason}`)));
       tr.append(
         el('td', {}, String(row.line)),
         el('td', {}, row.issue.title),
         el('td', { class: 'import-description' }, row.issue.description),
         el('td', {}, row.issue.status),
         el('td', {}, row.issue.priority),
-        el('td', { 'data-role': 'import-row-problems' }, row.errors.join(' ')),
+        el('td', { 'data-role': 'import-row-outcome' }, rowOutcome(validation, row)),
+        problems,
       );
       body.append(tr);
     }
@@ -416,14 +509,100 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     table.hidden = false;
   }
 
+  // What is known about earlier sends of exactly this content: an
+  // unconfirmed send from this browser (pending), imports the server already
+  // holds for the same content and choice, or a check still running. Never
+  // "nothing was saved" — only the server can confirm what is stored.
+  function priorNotice() {
+    const prior = state.prior;
+    if (!prior) return '';
+    const name = state.fileName || 'This file';
+    const parts = [];
+    if (prior.pending) {
+      parts.push(`${name} was already sent from this browser and its result is not confirmed yet — it may already be imported. Use Check result before importing it again; importing again reuses the same import id, so it is applied at most once.`);
+    }
+    if (prior.others.length > 0) {
+      const latest = prior.others[prior.others.length - 1];
+      const times = prior.others.length === 1 ? '' : ` (${prior.others.length} times)`;
+      parts.push(`This exact content was already imported earlier${times}: ${issueCountText(latest)} on ${latest.createdAt}.${skippedSentence(latest)} Importing it again would add these issues a second time.`);
+    }
+    if (prior.checking) parts.push('Checking whether this exact content was already imported…');
+    return parts.join(' ');
+  }
+
+  function withPrior(text) {
+    const notice = priorNotice();
+    return notice ? `${text} ${notice}` : text;
+  }
+
+  // Confirm button, status line and the valid-rows choice for the current
+  // preview. The default never imports a file with problems; only the
+  // explicitly checked choice turns the button into "Import N valid rows".
+  function renderChoice() {
+    const validation = state.validation;
+    const selection = validRowsSelection(validation);
+    if (!selection) {
+      state.validOnly = false;
+      validOnlyInput.checked = false;
+      validOnlyBox.hidden = true;
+    } else {
+      validOnlyBox.hidden = false;
+      validOnlyInput.disabled = state.busy;
+      validOnlyInput.checked = state.validOnly;
+      validOnlyLabel.textContent = `Import only the ${selection.valid.length} valid row${selection.valid.length === 1 ? '' : 's'} and skip the ${selection.excluded.length} row${selection.excluded.length === 1 ? '' : 's'} with problems (line${selection.excluded.length === 1 ? '' : 's'} ${selection.excludedLines.join(', ')}). Skipped rows are not saved; fix them and import them in another file.`;
+    }
+    if (!validation) return;
+    const name = state.fileName;
+    if (validation.valid) {
+      confirmButton.disabled = state.busy;
+      confirmButton.textContent = `Import ${validation.rows.length} issue${validation.rows.length === 1 ? '' : 's'}`;
+      status.textContent = withPrior(`${name}: ${validation.rows.length} issue(s) ready. Review the preview, then confirm.`);
+    } else if (selection && state.validOnly) {
+      confirmButton.disabled = state.busy;
+      confirmButton.textContent = `Import ${selection.valid.length} valid row${selection.valid.length === 1 ? '' : 's'}, skip ${selection.excluded.length}`;
+      status.textContent = withPrior(`${name}: only the ${selection.valid.length} valid row(s) will be imported; ${selection.excluded.length} row(s) with problems will be skipped and not saved. Review the preview, then confirm.`);
+    } else if (selection) {
+      confirmButton.disabled = true;
+      confirmButton.textContent = 'Import';
+      // A preview proves nothing about earlier sends of this content, so it
+      // never claims "Nothing was saved"; what an earlier send did is shown
+      // by the prior notice (pending / already imported / unknown).
+      status.textContent = withPrior(`${name} cannot be imported as a whole: ${selection.excluded.length} of ${validation.rows.length} rows have problems. Fix them and choose the file again, or explicitly choose to import only the ${selection.valid.length} valid row(s).`);
+    } else {
+      confirmButton.disabled = true;
+      confirmButton.textContent = 'Import';
+      status.textContent = withPrior(`${name} cannot be imported: fix the problems listed and choose the file again.`);
+    }
+  }
+
+  // Only a fully valid file, or the explicitly chosen valid rows of a file
+  // that has some, can ever be sent.
+  function canConfirm() {
+    if (!state.validation) return false;
+    return state.validation.valid || (state.validOnly && validRowsSelection(state.validation) !== null);
+  }
+
+  validOnlyInput.addEventListener('change', () => {
+    // Ignored while a commit/lookup resolves or a newly chosen file is still
+    // being read (the visible preview is then about to be replaced).
+    if (state.busy || state.reading || !validRowsSelection(state.validation)) {
+      validOnlyInput.checked = state.validOnly;
+      return;
+    }
+    state.validOnly = Boolean(validOnlyInput.checked);
+    renderPreview(state.validation);
+    renderChoice();
+  });
+
   function reset(message = '') {
     // An unconfirmed import survives the reset: its identity stays in the
     // pending list, so its result can still be checked afterwards. Any file
     // read still in flight is invalidated.
     selectionToken += 1;
-    Object.assign(state, { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false });
+    Object.assign(state, { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false, validOnly: false, prior: null });
     input.value = '';
     renderPreview(null);
+    renderChoice();
     showErrors([]);
     status.textContent = message;
     confirmButton.disabled = true;
@@ -441,25 +620,55 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     const fingerprint = await fingerprintCsv(text);
     if (token !== null && (token !== selectionToken || state.busy)) return validation; // a newer selection or a started commit wins
     const pending = fingerprint ? pendingStore.entries().find((entry) => entry.fingerprint === fingerprint) : null;
-    Object.assign(state, { csv: text, fileName, validation, importKey: pending ? pending.importKey : newImportKey(), fingerprint, result: null, sent: false, attempts: 0, preexistingPending: Boolean(pending) });
+    const selection = validRowsSelection(validation);
+    const matchOptions = validation.valid ? {} : selection ? { mode: 'valid_rows', excludedLines: selection.excludedLines } : null;
+    const canMatch = typeof client.match === 'function' && matchOptions !== null;
+    Object.assign(state, {
+      csv: text, fileName, validation, importKey: pending ? pending.importKey : newImportKey(), fingerprint, result: null, sent: false, attempts: 0,
+      preexistingPending: Boolean(pending), validOnly: false,
+      prior: pending || canMatch ? { pending: Boolean(pending), others: [], checking: canMatch } : null,
+    });
     renderPreview(validation);
     const rowProblems = validation.rows.filter((row) => row.errors.length > 0);
     showErrors([
       ...validation.fileErrors,
-      ...rowProblems.map((row) => `Line ${row.line}: ${row.errors.join(' ')}`),
+      ...(rowProblems.length > 0 ? [`${rowProblems.length} of ${validation.rows.length} rows cannot be imported:`] : []),
+      ...rowProblems.flatMap((row) => row.problems.map((entry) => describeProblem(row.line, entry))),
     ]);
     cancelButton.disabled = false;
-    checkButton.hidden = true;
-    if (validation.valid) {
-      confirmButton.disabled = false;
-      confirmButton.textContent = `Import ${validation.rows.length} issue${validation.rows.length === 1 ? '' : 's'}`;
-      status.textContent = `${fileName}: ${validation.rows.length} issue(s) ready. Review the preview, then confirm.`;
-    } else {
-      confirmButton.disabled = true;
-      confirmButton.textContent = 'Import';
-      status.textContent = `${fileName} cannot be imported: fix the problems listed and choose the file again. Nothing was saved.`;
-    }
+    // An unconfirmed earlier send of this exact file can be checked right here.
+    checkButton.hidden = !pending;
+    renderChoice();
+    if (canMatch) await checkPrior(text, matchOptions);
     return validation;
+  }
+
+  // Asks the server whether exactly this content and choice was already
+  // imported. Only answers that still belong to the visible, unsent preview
+  // are applied; a failed check leaves the result unknown, never "not saved".
+  async function checkPrior(text, options) {
+    const importKey = state.importKey;
+    const token = selectionToken;
+    // The preview is usable while the check runs.
+    state.reading = false;
+    const response = await client.match(text, options);
+    if (token !== selectionToken || state.csv !== text || state.importKey !== importKey || state.sent || state.busy || state.result !== null || !state.prior) return;
+    state.prior.checking = false;
+    if (response && response.outcome === 'ok') {
+      const records = response.matches.filter((record) => record && typeof record.importKey === 'string');
+      const own = state.prior.pending ? records.find((record) => record.importKey === importKey) : null;
+      if (own) {
+        // The unconfirmed send from this browser did land: settle it now.
+        pendingStore.remove(importKey);
+        renderRecovery();
+        showConfirmed(own, state.fileName, `${state.fileName || 'This file'} was already imported earlier (${own.createdAt}): ${issueCountText(own)}.${skippedSentence(own)} Nothing was added again.`);
+        onImported(own);
+        return;
+      }
+      state.prior.others = records;
+    }
+    if (!state.prior.pending && state.prior.others.length === 0) state.prior = null;
+    renderChoice();
   }
 
   async function readFile(file) {
@@ -498,20 +707,35 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   // settle() resolves the outcome of one specific import. The identity is
   // captured when the request is sent, so a selection made while the request
   // is in flight can never be mistaken for the import being settled.
+  // Shows a confirmed import of the current preview: the preview closes and
+  // the rows a valid-rows import left out stay listed with their reasons, as
+  // stored by the server — never silently dropped.
+  function showConfirmed(record, fileName, text) {
+    state.result = record;
+    state.prior = null;
+    renderPreview(null);
+    showErrors(skippedDetails(record, 'Not imported'));
+    state.validOnly = false;
+    validOnlyBox.hidden = true;
+    checkButton.hidden = true;
+    cancelButton.disabled = true;
+    confirmButton.disabled = true;
+    input.value = '';
+    status.textContent = text;
+  }
+
   function settle(response, importKey = state.importKey, fileName = state.fileName) {
     state.busy = false;
+    validOnlyInput.disabled = false;
     if (response.outcome === 'ok') {
       const record = response.body.import;
-      state.result = record;
       pendingStore.remove(importKey);
       renderRecovery();
-      renderPreview(null);
-      showErrors([]);
-      checkButton.hidden = true;
-      cancelButton.disabled = true;
-      confirmButton.disabled = true;
-      input.value = '';
-      status.textContent = `Imported ${record.issueCount} issue${record.issueCount === 1 ? '' : 's'} from ${fileName || 'the file'}.${response.body.replayed ? ' (Already imported earlier; nothing was added again.)' : ''}`;
+      showConfirmed(
+        record,
+        fileName,
+        `Imported ${issueCountText(record)} from ${fileName || 'the file'}.${skippedSentence(record)}${response.body.replayed ? ' (Already imported earlier; nothing was added again.)' : ''}`,
+      );
       onImported(record);
       return;
     }
@@ -524,20 +748,25 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
       // freshly minted id — no unconfirmed send ever made — durably means
       // "nothing was saved"; every other refusal keeps the import pending and
       // its lookup available.
-      const validationRefusal = error && (error.code === 'IMPORT_INVALID' || error.code === 'VALIDATION_ERROR');
+      const validationRefusal = error && (error.code === 'IMPORT_INVALID' || error.code === 'VALIDATION_ERROR' || error.code === 'IMPORT_PREVIEW_MISMATCH');
       const definitivelyRefused = validationRefusal && state.attempts === 1 && !state.preexistingPending;
       if (definitivelyRefused) pendingStore.remove(importKey);
       renderRecovery();
       const details = error.details;
       const lines = [error.message];
       if (details && Array.isArray(details.rowErrors)) {
-        for (const row of details.rowErrors) lines.push(`Line ${row.line}: ${row.errors.join(' ')}`);
+        for (const row of details.rowErrors) {
+          if (Array.isArray(row.problems)) for (const entry of row.problems) lines.push(describeProblem(row.line, entry));
+          else lines.push(`Line ${row.line}: ${row.errors.join(' ')}`);
+        }
       }
       showErrors(lines);
       status.textContent =
         error.code === 'IMPORT_CONFLICT'
           ? 'This import id was already used for different rows. Nothing new was saved here; use Check result to see what is stored under it.'
-          : definitivelyRefused
+          : definitivelyRefused && state.prior && state.prior.others.length > 0
+            ? 'The server refused this import attempt. Nothing new was saved; this exact content was already imported earlier.'
+            : definitivelyRefused
             ? 'The server refused this import. Nothing was saved.'
             : 'The server refused this import attempt. Nothing new was saved here; an earlier unconfirmed send stays recorded — use Check result.';
       confirmButton.disabled = true;
@@ -549,15 +778,16 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     // and keep the import in the pending list until its result is known.
     showErrors([RESULT_UNKNOWN]);
     status.textContent = 'Result unknown.';
-    confirmButton.disabled = false;
+    confirmButton.disabled = !canConfirm();
     cancelButton.disabled = false;
     checkButton.hidden = false;
     renderRecovery();
   }
 
   confirmButton.addEventListener('click', async () => {
-    if (state.busy || state.reading || !state.validation || !state.validation.valid) return;
+    if (state.busy || state.reading || !canConfirm()) return;
     state.busy = true;
+    validOnlyInput.disabled = true;
     state.sent = true;
     state.attempts += 1;
     // Capture what is being sent and record the import id before anything
@@ -565,11 +795,14 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     const importKey = state.importKey;
     const fileName = state.fileName;
     const csv = state.csv;
+    // The default sends the whole file; the valid-rows choice also sends the
+    // exact lines the preview showed as excluded, which the server re-checks.
+    const options = state.validation.valid ? {} : { mode: 'valid_rows', excludedLines: validRowsSelection(state.validation).excludedLines };
     pendingStore.add(importKey, fileName, state.fingerprint);
     confirmButton.disabled = true;
     cancelButton.disabled = true;
     status.textContent = 'Importing…';
-    settle(await client.commit(importKey, csv), importKey, fileName);
+    settle(await client.commit(importKey, csv, options), importKey, fileName);
   });
 
   checkButton.addEventListener('click', async () => {
@@ -587,7 +820,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
       state.busy = false;
       showErrors(['No record of this import was found yet, which does not confirm anything: the request may still be on its way. Check again in a moment; importing again reuses the same import id, which applies the import at most once.']);
       status.textContent = 'Result not confirmed yet.';
-      confirmButton.disabled = false;
+      confirmButton.disabled = !canConfirm();
       cancelButton.disabled = false;
       checkButton.hidden = false;
       return;
@@ -599,7 +832,7 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     if (state.busy) return;
     // Cancelling the preview never destroys the identity of an import whose
     // result is still unknown — only the durable lookup can settle that.
-    const unconfirmed = state.importKey && state.sent && state.result === null && pendingStore.entries().some((entry) => entry.importKey === state.importKey);
+    const unconfirmed = state.importKey && (state.sent || state.preexistingPending) && state.result === null && pendingStore.entries().some((entry) => entry.importKey === state.importKey);
     const name = state.fileName || 'the file';
     reset(
       unconfirmed
@@ -617,12 +850,32 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     status.textContent = 'Checking pending results…';
     let confirmed = 0;
     let stillOpen = 0;
+    const summaries = [];
+    const details = [];
     for (const entry of pending) {
       const response = await client.lookup(entry.importKey);
       if (response && response.outcome === 'ok') {
+        const record = response.body.import;
+        const name = entry.fileName || entry.importKey;
         pendingStore.remove(entry.importKey);
         confirmed += 1;
-        onImported(response.body.import);
+        // The same skipped lines and reasons a normal success shows, from the
+        // excluded rows the server stored with the import.
+        summaries.push(`${name}: imported ${issueCountText(record)}.${skippedSentence(record)}`);
+        details.push(...skippedDetails(record, `Not imported from ${name}`));
+        // The visible preview of this very import is settled too (no commit can be
+        // in flight here: this check only runs while the panel is idle).
+        if (state.importKey === entry.importKey && state.result === null) {
+          state.result = record;
+          state.prior = null;
+          renderPreview(null);
+          validOnlyBox.hidden = true;
+          checkButton.hidden = true;
+          cancelButton.disabled = true;
+          confirmButton.disabled = true;
+          input.value = '';
+        }
+        onImported(record);
       } else {
         // Not found yet, unreachable or refused without a durable record:
         // none of these proves the import was not saved, so it stays pending.
@@ -631,11 +884,13 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     }
     state.busy = false;
     renderRecovery();
+    if (confirmed > 0) showErrors(details);
+    const summary = summaries.length > 0 ? ` ${summaries.join(' ')}` : '';
     status.textContent =
       confirmed > 0 && stillOpen > 0
-        ? `${confirmed} unconfirmed import(s) are confirmed imported; ${stillOpen} still not confirmed.`
+        ? `${confirmed} unconfirmed import(s) are confirmed imported; ${stillOpen} still not confirmed.${summary}`
         : confirmed > 0
-          ? `All ${confirmed} unconfirmed import(s) are confirmed imported.`
+          ? `All ${confirmed} unconfirmed import(s) are confirmed imported.${summary}`
           : 'Still not confirmed: the server has no record yet, which does not prove they were not saved — the request may still be on its way. Check again in a moment.';
   });
 

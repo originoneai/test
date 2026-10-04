@@ -159,6 +159,23 @@ Imports a whole CSV file of historical issues as **one atomic batch**
 { "importKey": "<UUID chosen by the client for this import>", "csv": "<the file text>" }
 ```
 
+Optional fields select **what** is imported:
+
+- `"mode": "all"` (the default when omitted) — all-or-nothing: any file or
+  row problem refuses the whole file.
+- `"mode": "valid_rows"` with `"excludedLines": [3, 9]` — the user explicitly
+  chose to import only the valid rows. `excludedLines` must be the ascending
+  line numbers of exactly the rows the preview showed as invalid; the server
+  re-validates the file and refuses the commit with `400
+  IMPORT_PREVIEW_MISMATCH` (nothing written) if its own list differs, so a
+  stale or different preview can never be committed. The valid rows are then
+  committed as one atomic batch and the excluded rows are recorded with the
+  import (never silently dropped). File-level problems (size or row limits,
+  unsupported or repeated columns, unreadable CSV, no rows) still refuse the
+  whole file. A file in which every row is valid, or none is, cannot use
+  this mode (`400 IMPORT_INVALID`; import a valid file with the default).
+  `excludedLines` without `mode: "valid_rows"` → `400 VALIDATION_ERROR`.
+
 Any other body field is refused (`400 VALIDATION_ERROR`). The server parses
 and validates the CSV itself with the same module the page previews with
 (`public/csv-import.js`); nothing the browser computed is trusted.
@@ -179,24 +196,40 @@ empty file is refused.
 
 **Responses.**
 
-- `201` — committed. Every row became an issue with a server-assigned id and
-  one shared server timestamp; a row arriving as `done` gets the same
-  `{at, priority}` completion snapshot as a create in `done`, so it counts in
-  the weekly report for that day.
+- `201` — committed. Every imported row became an issue with a
+  server-assigned id and one shared server timestamp (CSV files never carry
+  dates); a row arriving as `done` gets the same `{at, priority}` completion
+  snapshot as a create in `done`, so it counts in the weekly report for that
+  day. `mode` says which choice was committed; `excludedRows` lists the rows
+  left out by a `valid_rows` import with their problems (always `[]` for
+  `all`):
   ```json
-  { "import": { "importKey": "…", "status": "committed", "createdAt": "…Z",
-                "issueCount": 6, "issueIds": ["…", "…"] }, "replayed": false }
+  { "import": { "importKey": "…", "status": "committed", "mode": "valid_rows",
+                "createdAt": "…Z", "issueCount": 6, "issueIds": ["…", "…"],
+                "excludedRows": [ { "line": 9, "problems": [
+                  { "column": "title", "reason": "title is required." } ] } ] },
+    "replayed": false }
   ```
 - `200` with `"replayed": true` — this `importKey` was already committed for
-  the same normalized rows (re-sent after a lost acknowledgement, even if the
-  file was re-saved with other line endings or a BOM). The stored outcome is
+  the same normalized rows and the same choice (mode and excluded lines) —
+  re-sent after a lost acknowledgement, even if the file was re-saved with
+  other line endings or a BOM. The stored outcome is
   returned unchanged; **nothing is created again.**
-- `400 IMPORT_INVALID` — the file or at least one row is invalid. **Nothing
-  is written**, not even the valid rows. `error.details` lists every problem:
-  `{"fileErrors": ["…"], "rowErrors": [{"line": 9, "errors": ["title is required."]}]}`
-  where `line` is the physical line in the file where that record starts.
-- `409 IMPORT_CONFLICT` — the `importKey` was already used for different rows.
-  Nothing is written; start a new import with a new key.
+- `400 IMPORT_INVALID` — with the default mode: the file or at least one row
+  is invalid. **Nothing is written**, not even the valid rows. With
+  `valid_rows`: a file-level problem, or no row (or every row) is valid.
+  `error.details` lists every problem:
+  `{"fileErrors": ["…"], "rowErrors": [{"line": 9, "errors": ["title is required."], "problems": [{"column": "title", "reason": "title is required."}]}]}`
+  where `line` is the physical line in the file where that record starts and
+  `column` names the offending column (`null` when the problem concerns the
+  whole row, e.g. a wrong number of fields).
+- `400 IMPORT_PREVIEW_MISMATCH` — `valid_rows` was requested with
+  `excludedLines` that differ from the server's validation. Nothing is
+  written; `error.details` carries the server's `excludedLines` and
+  `rowErrors`. Choose the file again and confirm a fresh preview.
+- `409 IMPORT_CONFLICT` — the `importKey` was already used for different rows
+  or a different choice of rows. Nothing is written; start a new import with
+  a new key.
 - `413 PAYLOAD_TOO_LARGE` — body over 1 MiB.
 - `500 STORAGE_ERROR` — persistence failed; issues **and** import records are
   unchanged and the same request may be retried with the same key.
@@ -219,18 +252,41 @@ the import already landed, or commits it once if no result exists yet. A key
 that is not a UUID → `400 VALIDATION_ERROR`. Results are durable across
 restarts.
 
+### `POST /api/imports/match` — was this exact content already imported?
+
+Read-only. Body `{"csv", "mode"?, "excludedLines"?}` — the same fields and
+validation as a commit, without `importKey`. The server computes the same
+digest a commit would store (normalized rows; for `valid_rows` also the mode
+and the exact excluded lines) and answers `200 {"matches": [...]}` with every
+committed import of that digest, oldest first, each in the commit-response
+`import` shape including its stored `excludedRows`. `matches: []` only means no
+such import is stored at that moment (a commit may still be in flight). A
+request a commit would refuse is refused the same way (`400 IMPORT_INVALID`,
+`IMPORT_PREVIEW_MISMATCH`, `VALIDATION_ERROR` for unknown fields). Nothing is
+ever written.
+
+The import panel uses it when a file is chosen: after a lost response and a
+reload, choosing the same file again shows that it was already imported (with
+the skipped lines and reasons the server stored) instead of claiming nothing
+was saved; if the check cannot answer, an unconfirmed earlier send stays
+"result not confirmed" with Check result. "Check pending results" likewise
+lists each confirmed import's skipped lines and reasons from the stored
+`excludedRows`, exactly like a normal success.
+
 ### Everything else
 
 - Unsupported methods on known paths → `405` with an `Allow` header.
 - Unknown `/api/...` paths → `404`.
 - Request bodies are capped at 16 KiB (declared or streamed) → `413` above,
-  except `POST /api/imports`, which is capped at 1 MiB.
+  except `POST /api/imports` and `POST /api/imports/match`, which are capped
+  at 1 MiB.
 
 ## Error model
 
 Every error body is `{"error":{"code":"...","message":"..."}}` — a stable
 machine-readable `code` plus a human-readable `message`, never a stack trace.
-`IMPORT_INVALID` additionally carries `error.details` (see `POST /api/imports`).
+`IMPORT_INVALID` and `IMPORT_PREVIEW_MISMATCH` additionally carry
+`error.details` (see `POST /api/imports`).
 
 | Status | Code | Meaning for the client |
 | --- | --- | --- |
@@ -238,6 +294,7 @@ machine-readable `code` plus a human-readable `message`, never a stack trace.
 | 400 | `INVALID_JSON` | Body was not readable/parseable JSON. A retry with a re-serialized body may work. |
 | 400 | `INVALID_URL` | Malformed request URL. |
 | 400 | `IMPORT_INVALID` | The CSV import was refused as a whole; `details` lists file and row problems. Nothing was written. |
+| 400 | `IMPORT_PREVIEW_MISMATCH` | A valid-rows import named different excluded lines than the server found. Nothing was written. |
 | 404 | `IMPORT_NOT_FOUND` | No committed import has this key. |
 | 409 | `IMPORT_CONFLICT` | The import key was already used for different rows. Nothing was written. |
 | 404 | `NOT_FOUND` | Unknown resource or issue id. Refresh the list before acting on it. |
@@ -346,6 +403,12 @@ until then, so stores that never imported keep the exact format above):
 }
 ```
 
+A record of an explicit valid-rows import additionally carries
+`"mode": "valid_rows"` and `"excludedRows": [{"line": 9, "problems":
+[{"column": "title", "reason": "title is required."}]}]` (non-empty,
+ascending lines; `column` may be `null`); its digest also covers the mode
+and the excluded lines. Whole-file records keep the four-field shape.
+
 On load each import record must have exactly these fields, a unique key,
 and list only existing issue ids not claimed by another import; anything else
 is reported as a corrupt store like any other corruption.
@@ -442,6 +505,13 @@ exclusively — there is no fixture mode and no offline fallback:
   creation directly as done, transitions into and out of done, repeated
   completion, unchanged-done edits, client-forged history, process reload,
   corrupt data, failed writes and the legacy upgrade path.
+- `test/csv-import.test.js`, `test/import-api.test.js`,
+  `test/import-ui.test.js` — historical CSV import: parsing and per-row
+  problems (line, column, reason), the all-or-nothing default, the explicit
+  valid-rows mode (exact excluded lines, stale-preview refusal, atomic
+  subset, replay/conflict, restart durability, failed writes, corrupt
+  records) and the panel (preview, opt-in choice, cancel, unknown-outcome
+  recovery across reloads).
 - `test/storage.test.js` — the store directly: on-disk format, reload,
   corruption refusal, write guards with boundary acceptance, serialization,
   failed-write recovery.

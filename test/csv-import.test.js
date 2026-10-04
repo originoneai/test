@@ -2,7 +2,7 @@
 // (specs/historical-issue-import.md). Fixtures are inline synthetic text.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCsv, validateImportCsv, MAX_CSV_BYTES, MAX_IMPORT_ROWS, isImportKey } from '../public/csv-import.js';
+import { parseCsv, validateImportCsv, validRowsSelection, describeProblem, MAX_CSV_BYTES, MAX_IMPORT_ROWS, isImportKey } from '../public/csv-import.js';
 
 const BOM = '\uFEFF';
 
@@ -99,4 +99,33 @@ test('import keys must be UUIDs', () => {
   assert.equal(isImportKey('5b0f0d2a-3c1e-4a7b-9f00-1234567890ab'), true);
   assert.equal(isImportKey('not-a-key'), false);
   assert.equal(isImportKey(42), false);
+});
+
+test('every row problem names its line, its column (or the whole row) and a reason', () => {
+  const result = validateImportCsv('title,status,priority\nOk,open,low\n,open,critical\nShort,open\nBad,closed,\n');
+  assert.equal(result.valid, false);
+  const byLine = Object.fromEntries(result.rows.map((row) => [row.line, row.problems]));
+  assert.deepEqual(byLine[2], []);
+  assert.deepEqual(byLine[3], [
+    { column: 'title', reason: 'title is required.' },
+    { column: 'priority', reason: 'priority "critical" is not one of: low, normal, high, urgent.' },
+  ]);
+  assert.deepEqual(byLine[4], [{ column: null, reason: 'expected 3 field(s) like the header, found 2.' }]);
+  assert.deepEqual(byLine[5], [{ column: 'status', reason: 'status "closed" is not one of: open, in_progress, done.' }]);
+  // errors keeps the same reason texts for message-only callers
+  assert.deepEqual(result.rows[1].errors, ['title is required.', 'priority "critical" is not one of: low, normal, high, urgent.']);
+  assert.equal(describeProblem(3, byLine[3][0]), 'Line 3, column title: title is required.');
+  assert.equal(describeProblem(4, byLine[4][0]), 'Line 4, whole row: expected 3 field(s) like the header, found 2.');
+});
+
+test('the valid-rows choice exists only for an acceptable file with both valid and invalid rows', () => {
+  const mixed = validRowsSelection(validateImportCsv('title,priority\nA,low\n,low\nB,\nC,critical\n'));
+  assert.deepEqual(mixed.valid.map((row) => row.line), [2, 4]);
+  assert.deepEqual(mixed.excludedLines, [3, 5]);
+  assert.equal(validRowsSelection(validateImportCsv('title\nA\nB\n')), null, 'nothing to exclude: import the whole file');
+  assert.equal(validRowsSelection(validateImportCsv('title,priority\n,low\nX,critical\n')), null, 'no valid row');
+  assert.equal(validRowsSelection(validateImportCsv('title,password\nA,x\n,y\n')), null, 'file-level problem');
+  const tooMany = 'title\n' + Array.from({ length: MAX_IMPORT_ROWS }, (_, i) => `T${i}`).join('\n') + '\n\n';
+  assert.equal(validRowsSelection(validateImportCsv(tooMany)), null, 'over the row limit even with an invalid row');
+  assert.equal(validRowsSelection(null), null);
 });

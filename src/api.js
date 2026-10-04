@@ -1,11 +1,11 @@
 // Issue API for TEST-API; implements the contract in specs/issue-tracker.md
 // and specs/weekly-delivery-summary.md.
 // Routes: GET/POST /api/issues, PATCH /api/issues/:id, GET /api/reports/weekly,
-// POST /api/imports, GET /api/imports/:importKey (specs/historical-issue-import.md);
+// POST /api/imports, POST /api/imports/match, GET /api/imports/:importKey (specs/historical-issue-import.md);
 // other methods get 405.
 import { createHash } from 'node:crypto';
 import { IssueStore } from './store.js';
-import { isImportKey, validateImportCsv, MAX_CSV_BYTES, MAX_IMPORT_ROWS } from '../public/csv-import.js';
+import { isImportKey, validateImportCsv, validRowsSelection, MAX_CSV_BYTES, MAX_IMPORT_ROWS } from '../public/csv-import.js';
 
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
 const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
@@ -462,9 +462,14 @@ function toImportResource(record, replayed) {
     import: {
       importKey: record.importKey,
       status: 'committed',
+      mode: record.mode === 'valid_rows' ? 'valid_rows' : 'all',
       createdAt: record.createdAt,
       issueCount: record.issueIds.length,
       issueIds: record.issueIds.slice(),
+      excludedRows: (record.excludedRows || []).map((row) => ({
+        line: row.line,
+        problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })),
+      })),
     },
     replayed,
   };
@@ -472,51 +477,143 @@ function toImportResource(record, replayed) {
 
 // The digest identifies the normalized batch (what would be stored), so the
 // same file re-sent after a lost acknowledgement — even re-saved with CRLF
-// or a BOM — is recognized as the same import.
-function importDigest(rows) {
-  return createHash('sha256').update(JSON.stringify(rows.map((row) => [row.title, row.description, row.status, row.priority]))).digest('hex');
+// or a BOM — is recognized as the same import. A whole-file import keeps its
+// original digest; a valid-rows import also binds the mode and the exact
+// excluded lines, so the same key can never be replayed as a different
+// choice (that is refused as IMPORT_CONFLICT).
+function importDigest(rows, excludedLines = null) {
+  const tuples = rows.map((row) => [row.title, row.description, row.status, row.priority]);
+  const material = excludedLines === null ? tuples : ['valid_rows', tuples, excludedLines];
+  return createHash('sha256').update(JSON.stringify(material)).digest('hex');
 }
 
-// Whole-batch commit: the server re-parses and re-validates the CSV itself;
-// any file or row problem rejects the entire batch before anything is written.
-async function commitImport(req, res) {
+const rowProblemList = (rows) =>
+  rows.map((row) => ({ line: row.line, errors: row.errors, problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })) }));
+
+// Commit: the server re-parses and re-validates the CSV itself. By default
+// (mode "all") any file or row problem rejects the entire batch before
+// anything is written. Only an explicit mode "valid_rows" — with the exact
+// excluded lines the user saw — commits the valid subset, atomically, and
+// records which lines were left out and why. File-level problems (limits,
+// columns, parse errors) always reject everything.
+// Parses and validates a commit (or match) request exactly as a commit
+// would. Sends the refusal and returns null, or returns the batch that a
+// commit would store: {importKey, rows, excludedRows} where excludedRows is
+// null for a whole-file import.
+async function resolveImportRequest(req, res, { withKey }) {
   const parsed = await parseJsonBody(req, res, IMPORT_BODY_LIMIT_BYTES);
-  if (!parsed) return;
+  if (!parsed) return null;
   const body = parsed.value;
   if (!isPlainObject(body)) {
     sendError(res, 400, 'VALIDATION_ERROR', 'Request body must be a JSON object.');
-    return;
+    return null;
   }
-  if (rejectUnknownFields(res, body, ['importKey', 'csv'])) return;
-  if (!isImportKey(body.importKey)) {
+  if (rejectUnknownFields(res, body, withKey ? ['importKey', 'csv', 'mode', 'excludedLines'] : ['csv', 'mode', 'excludedLines'])) return null;
+  if (withKey && !isImportKey(body.importKey)) {
     sendError(res, 400, 'VALIDATION_ERROR', 'importKey is required and must be a UUID chosen by the client for this import.');
-    return;
+    return null;
   }
   if (typeof body.csv !== 'string') {
     sendError(res, 400, 'VALIDATION_ERROR', 'csv is required and must be the file text.');
-    return;
+    return null;
+  }
+  const mode = body.mode === undefined ? 'all' : body.mode;
+  if (mode !== 'all' && mode !== 'valid_rows') {
+    sendError(res, 400, 'VALIDATION_ERROR', 'mode must be "all" (the default) or "valid_rows".');
+    return null;
+  }
+  if (mode === 'all' && body.excludedLines !== undefined) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'excludedLines is only accepted with mode "valid_rows".');
+    return null;
+  }
+  if (
+    mode === 'valid_rows' &&
+    (!Array.isArray(body.excludedLines) ||
+      body.excludedLines.length < 1 ||
+      !body.excludedLines.every((line, index) => Number.isSafeInteger(line) && line > 1 && (index === 0 || line > body.excludedLines[index - 1])))
+  ) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'mode "valid_rows" requires excludedLines: the ascending line numbers shown as excluded in the preview.');
+    return null;
   }
   const validation = validateImportCsv(body.csv);
-  if (!validation.valid) {
-    const rowErrors = validation.rows
-      .filter((row) => row.errors.length > 0)
-      .map((row) => ({ line: row.line, errors: row.errors }));
+  const invalidRows = validation.rows.filter((row) => row.errors.length > 0);
+  const limits = `limits: ${MAX_CSV_BYTES} bytes, ${MAX_IMPORT_ROWS} issues`;
+  if (mode === 'all') {
+    if (!validation.valid) {
+      sendError(res, 400, 'IMPORT_INVALID', `The file cannot be imported; nothing was saved (${limits}).`, {
+        fileErrors: validation.fileErrors,
+        rowErrors: rowProblemList(invalidRows),
+      });
+      return null;
+    }
+    return { importKey: body.importKey, rows: validation.rows.map((row) => row.issue), excludedRows: null };
+  }
+  if (validation.fileErrors.length > 0) {
+    sendError(res, 400, 'IMPORT_INVALID', `The file cannot be imported; nothing was saved (${limits}).`, {
+      fileErrors: validation.fileErrors,
+      rowErrors: [],
+    });
+    return null;
+  }
+  const selection = validRowsSelection(validation);
+  if (!selection) {
     sendError(
       res,
       400,
       'IMPORT_INVALID',
-      `The file cannot be imported; nothing was saved (limits: ${MAX_CSV_BYTES} bytes, ${MAX_IMPORT_ROWS} issues).`,
-      { fileErrors: validation.fileErrors, rowErrors },
+      invalidRows.length === 0
+        ? 'Every row is valid; import the whole file (mode "all") instead. Nothing was saved.'
+        : 'No row of this file can be imported; nothing was saved.',
+      { fileErrors: [], rowErrors: rowProblemList(invalidRows) },
     );
-    return;
+    return null;
   }
-  const rows = validation.rows.map((row) => row.issue);
+  if (JSON.stringify(selection.excludedLines) !== JSON.stringify(body.excludedLines)) {
+    sendError(
+      res,
+      400,
+      'IMPORT_PREVIEW_MISMATCH',
+      'The rows the server would exclude differ from the preview you confirmed; nothing was saved. Choose the file again to see a fresh preview.',
+      { excludedLines: selection.excludedLines, rowErrors: rowProblemList(selection.excluded) },
+    );
+    return null;
+  }
+  return {
+    importKey: body.importKey,
+    rows: selection.valid.map((row) => row.issue),
+    excludedRows: selection.excluded.map((row) => ({ line: row.line, problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })) })),
+  };
+}
+
+async function commitImport(req, res) {
+  const batch = await resolveImportRequest(req, res, { withKey: true });
+  if (!batch) return;
+  await commitRows(res, batch.importKey, batch.rows, batch.excludedRows);
+}
+
+const batchDigest = (batch) => importDigest(batch.rows, batch.excludedRows === null ? null : batch.excludedRows.map((row) => row.line));
+
+// Match: "was this exact content already imported?" Read-only. The request
+// is validated like a commit and matched by the same digest (normalized
+// rows, plus mode and excluded lines for a valid-rows import), so a page
+// that lost a commit response can tell an already-imported file apart from
+// a new one without guessing. Returns every committed import with that
+// digest, oldest first, each with its stored skipped rows.
+async function matchImport(req, res) {
+  const batch = await resolveImportRequest(req, res, { withKey: false });
+  if (!batch) return;
+  const records = await getStore().findImportsByDigest(batchDigest(batch));
+  sendJson(res, 200, { matches: records.map((record) => toImportResource(record, false).import) });
+}
+
+async function commitRows(res, importKey, rows, excludedRows) {
+  const digest = batchDigest({ rows, excludedRows });
   let outcome;
   try {
-    outcome = await getStore().importBatch(body.importKey, importDigest(rows), rows);
+    outcome = await getStore().importBatch(importKey, digest, rows, excludedRows === null ? null : { mode: 'valid_rows', excludedRows });
   } catch (err) {
     if (err && err.code === 'IMPORT_CONFLICT') {
-      sendError(res, 409, 'IMPORT_CONFLICT', 'This importKey was already used for a different file; choose the file again to start a new import.');
+      sendError(res, 409, 'IMPORT_CONFLICT', 'This importKey was already used for a different file or a different choice of rows; choose the file again to start a new import.');
       return;
     }
     throw err;
@@ -582,6 +679,15 @@ export async function handleApi(req, res) {
       }
       res.setHeader('Allow', 'POST');
       sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/imports.`);
+      return;
+    }
+    if (url.pathname === '/api/imports/match') {
+      if (req.method === 'POST') {
+        await matchImport(req, res);
+        return;
+      }
+      res.setHeader('Allow', 'POST');
+      sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/imports/match.`);
       return;
     }
     const importMatch = url.pathname.match(/^\/api\/imports\/([^/]+)$/);

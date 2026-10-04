@@ -270,3 +270,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 .import-panel tr.has-error td { background: var(--danger-bg); }
 .import-panel [role="alert"] p { margin: 4px 0; color: var(--danger); }
 .import-actions { display: flex; gap: 8px; }
+.import-panel .import-valid-only { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 12px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); }
+.import-panel .import-valid-only input { margin-top: 3px; }
+.import-panel .import-valid-only label { display: inline; font-weight: normal; margin: 0; }
