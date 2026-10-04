@@ -32,6 +32,10 @@
 // all, and a retried commit finds the record instead of creating duplicates.
 // The list is written only once it is non-empty, so a store that never
 // imported anything keeps the original exact {"issues": [...]} format.
+// An import the user explicitly limited to its valid rows additionally
+// carries mode "valid_rows" and excludedRows [{line, problems: [{column,
+// reason}]}]: the rows that were left out and why, so the result can always
+// show what was not imported. Whole-file records keep the four-field shape.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -58,7 +62,35 @@ function copyCompletions(events) {
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 
 function copyImport(record) {
-  return { importKey: record.importKey, digest: record.digest, createdAt: record.createdAt, issueIds: record.issueIds.slice() };
+  const copy = { importKey: record.importKey, digest: record.digest, createdAt: record.createdAt, issueIds: record.issueIds.slice() };
+  if (record.mode === 'valid_rows') {
+    copy.mode = 'valid_rows';
+    copy.excludedRows = record.excludedRows.map((row) => ({
+      line: row.line,
+      problems: row.problems.map((entry) => ({ column: entry.column, reason: entry.reason })),
+    }));
+  }
+  return copy;
+}
+
+// excludedRows of a valid-rows import: a non-empty list of distinct,
+// ascending data lines (> 1, the header is line 1), each with at least one
+// {column (string or null), reason (non-empty string)} problem.
+function isExcludedRows(value) {
+  if (!Array.isArray(value) || value.length < 1) return false;
+  let previous = 1;
+  for (const row of value) {
+    if (!isPlainObject(row) || Object.keys(row).sort().join(',') !== 'line,problems') return false;
+    if (!Number.isSafeInteger(row.line) || row.line <= previous) return false;
+    previous = row.line;
+    if (!Array.isArray(row.problems) || row.problems.length < 1) return false;
+    for (const entry of row.problems) {
+      if (!isPlainObject(entry) || Object.keys(entry).sort().join(',') !== 'column,reason') return false;
+      if (!(entry.column === null || (typeof entry.column === 'string' && entry.column.length > 0))) return false;
+      if (typeof entry.reason !== 'string' || entry.reason.length < 1) return false;
+    }
+  }
+  return true;
 }
 
 function isPlainObject(value) {
@@ -241,7 +273,11 @@ export class IssueStore {
   // nothing; the same key with a different digest is refused. Ids, timestamps
   // and completion snapshots are server-owned; issues arriving as done get the
   // same {at, priority} completion snapshot as a create in 'done'.
-  async importBatch(importKey, digest, rows) {
+  //
+  // `subset` is null for a whole-file import, or {mode: 'valid_rows',
+  // excludedRows} when the user explicitly imported only the valid rows; the
+  // excluded rows are stored with the record in the same atomic write.
+  async importBatch(importKey, digest, rows, subset = null) {
     return this.#enqueue(async () => {
       await this.#ensureLoaded();
       if (typeof importKey !== 'string' || !UUID_PATTERN.test(importKey)) throw writeGuard('importKey must be a UUID.');
@@ -257,6 +293,9 @@ export class IssueStore {
         return { replayed: true, record: copyImport(existing) };
       }
       if (!Array.isArray(rows) || rows.length < 1) throw writeGuard('an import needs at least one issue.');
+      if (subset !== null && (!isPlainObject(subset) || subset.mode !== 'valid_rows' || !isExcludedRows(subset.excludedRows))) {
+        throw writeGuard('a valid-rows import must list its excluded rows with their problems.');
+      }
       const now = new Date().toISOString();
       const created = rows.map((row) => {
         const keys = Object.keys(row).sort().join(',');
@@ -276,7 +315,13 @@ export class IssueStore {
           completions: row.status === 'done' ? [{ at: now, priority: row.priority }] : [],
         };
       });
-      const record = { importKey: key, digest, createdAt: now, issueIds: created.map((issue) => issue.id) };
+      const record = copyImport({
+        importKey: key,
+        digest,
+        createdAt: now,
+        issueIds: created.map((issue) => issue.id),
+        ...(subset === null ? {} : { mode: 'valid_rows', excludedRows: subset.excludedRows }),
+      });
       const issues = [...this.issues, ...created];
       const imports = [...this.imports, record];
       await this.#persist(issues, imports);
@@ -417,8 +462,12 @@ export class IssueStore {
       const seenKeys = new Set();
       const claimed = new Set();
       for (const [index, record] of parsed.imports.entries()) {
-        if (!isPlainObject(record) || Object.keys(record).sort().join(',') !== 'createdAt,digest,importKey,issueIds') {
-          throw refuse(`import ${index} must have exactly the fields importKey, digest, createdAt, issueIds.`);
+        const recordKeys = isPlainObject(record) ? Object.keys(record).sort().join(',') : '';
+        if (recordKeys !== 'createdAt,digest,importKey,issueIds' && recordKeys !== 'createdAt,digest,excludedRows,importKey,issueIds,mode') {
+          throw refuse(`import ${index} must have exactly the fields importKey, digest, createdAt, issueIds (plus mode and excludedRows for a valid-rows import).`);
+        }
+        if ('mode' in record && (record.mode !== 'valid_rows' || !isExcludedRows(record.excludedRows))) {
+          throw refuse(`import ${index} has an invalid mode or excludedRows list.`);
         }
         if (typeof record.importKey !== 'string' || !UUID_PATTERN.test(record.importKey) || record.importKey !== record.importKey.toLowerCase()) {
           throw refuse(`import ${index} importKey is not a lowercase UUID.`);

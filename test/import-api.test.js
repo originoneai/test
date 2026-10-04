@@ -237,3 +237,206 @@ test('the page serves the shared import module as JavaScript', () =>
     assert.match(res.headers.get('content-type'), /javascript/);
     assert.match(await res.text(), /export function validateImportCsv/);
   }));
+
+// ---------------------------------------------------------------------------
+// Explicit "import only the valid rows" (mode valid_rows). Default stays
+// all-or-nothing; the subset is committed only on explicit request with the
+// exact excluded lines the preview showed.
+// ---------------------------------------------------------------------------
+const MIXED_CSV = 'title,description,status,priority\nKeep open,,open,low\n,missing title,open,low\nKeep done,"closed, long ago",done,urgent\nBad priority,,open,critical\nBad status,,closed,\n';
+const MIXED_EXCLUDED = [3, 5, 6];
+const validRows = (importKey, csv = MIXED_CSV, excludedLines = MIXED_EXCLUDED) => ({ importKey, csv, mode: 'valid_rows', excludedLines });
+
+test('by default a file with some invalid rows is still refused whole, with line, column and reason', () =>
+  withTracker(async (t) => {
+    const importKey = randomUUID();
+    const res = await t.commit({ importKey, csv: MIXED_CSV });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'IMPORT_INVALID');
+    assert.deepEqual(
+      res.body.error.details.rowErrors.map((row) => [row.line, row.problems.map((entry) => entry.column)]),
+      [[3, ['title']], [5, ['priority']], [6, ['status']]],
+    );
+    assert.match(res.body.error.details.rowErrors[1].problems[0].reason, /priority "critical"/);
+    assert.equal((await t.list()).body.items.length, 0);
+    assert.equal((await t.lookup(importKey)).status, 404);
+    // an explicit mode "all" behaves exactly like the default
+    assert.equal((await t.commit({ importKey, csv: MIXED_CSV, mode: 'all' })).body.error.code, 'IMPORT_INVALID');
+  }));
+
+test('mode valid_rows commits exactly the valid rows atomically and records the excluded ones', () =>
+  withTracker(async (t) => {
+    await t.request('/api/issues', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Existing' }) });
+    const importKey = randomUUID();
+    const res = await t.commit(validRows(importKey));
+    assert.equal(res.status, 201);
+    assert.equal(res.body.replayed, false);
+    assert.equal(res.body.import.mode, 'valid_rows');
+    assert.equal(res.body.import.issueCount, 2);
+    assert.deepEqual(res.body.import.excludedRows.map((row) => row.line), MIXED_EXCLUDED);
+    assert.deepEqual(res.body.import.excludedRows[0].problems, [{ column: 'title', reason: 'title is required.' }]);
+    const list = (await t.list()).body.items;
+    assert.deepEqual(list.map((issue) => issue.title).sort(), ['Existing', 'Keep done', 'Keep open']);
+    const imported = list.filter((issue) => res.body.import.issueIds.includes(issue.id));
+    assert.equal(imported.length, 2);
+    for (const issue of imported) assert.equal(issue.createdAt, res.body.import.createdAt); // server-assigned time
+    const stored = JSON.parse(await readFile(t.storePath, 'utf8'));
+    const done = stored.issues.find((issue) => issue.title === 'Keep done');
+    assert.deepEqual(done.completions, [{ at: done.createdAt, priority: 'urgent' }]);
+    assert.equal(stored.imports[0].mode, 'valid_rows');
+    // the weekly summary is computed from the persisted import
+    const weekly = await t.request('/api/reports/weekly');
+    assert.equal(weekly.status, 200);
+    // Existing + the two imported rows; only the imported done row completed.
+    assert.equal(weekly.body.created.total, 3);
+    assert.deepEqual(weekly.body.created.byStatus, { open: 2, in_progress: 0, done: 1 });
+    assert.equal(weekly.body.completed.total, 1);
+    assert.equal(weekly.body.completed.byPriority.urgent, 1);
+    const lookup = await t.lookup(importKey);
+    assert.equal(lookup.status, 200);
+    assert.deepEqual(lookup.body.import, res.body.import);
+  }));
+
+test('a whole-file import reports mode all and no excluded rows', () =>
+  withTracker(async (t) => {
+    const res = await t.commit({ importKey: randomUUID(), csv: VALID_CSV });
+    assert.equal(res.body.import.mode, 'all');
+    assert.deepEqual(res.body.import.excludedRows, []);
+    const stored = JSON.parse(await readFile(t.storePath, 'utf8'));
+    assert.deepEqual(Object.keys(stored.imports[0]).sort(), ['createdAt', 'digest', 'importKey', 'issueIds']);
+  }));
+
+test('a stale preview (different excluded lines) is refused and writes nothing', () =>
+  withTracker(async (t) => {
+    const importKey = randomUUID();
+    const res = await t.commit(validRows(importKey, MIXED_CSV, [3, 5]));
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, 'IMPORT_PREVIEW_MISMATCH');
+    assert.deepEqual(res.body.error.details.excludedLines, MIXED_EXCLUDED);
+    assert.equal((await t.list()).body.items.length, 0);
+    assert.equal((await t.lookup(importKey)).status, 404);
+    // the corrected request then commits once
+    assert.equal((await t.commit(validRows(importKey))).status, 201);
+  }));
+
+test('malformed valid-rows requests are refused', () =>
+  withTracker(async (t) => {
+    const key = randomUUID();
+    const bad = [
+      { importKey: key, csv: MIXED_CSV, mode: 'subset' },
+      { importKey: key, csv: MIXED_CSV, mode: 'valid_rows' },
+      { importKey: key, csv: MIXED_CSV, mode: 'valid_rows', excludedLines: [] },
+      { importKey: key, csv: MIXED_CSV, mode: 'valid_rows', excludedLines: [5, 3, 6] },
+      { importKey: key, csv: MIXED_CSV, mode: 'valid_rows', excludedLines: [1, 3] },
+      { importKey: key, csv: MIXED_CSV, mode: 'valid_rows', excludedLines: ['3'] },
+      { importKey: key, csv: MIXED_CSV, mode: 'all', excludedLines: [3] },
+      { importKey: key, csv: MIXED_CSV, excludedLines: [3] },
+    ];
+    for (const payload of bad) {
+      const res = await t.commit(payload);
+      assert.equal(res.status, 400, JSON.stringify(payload));
+      assert.equal(res.body.error.code, 'VALIDATION_ERROR');
+    }
+    assert.equal((await t.list()).body.items.length, 0);
+  }));
+
+test('valid_rows never overrides file-level problems, limits, an all-valid or an all-invalid file', () =>
+  withTracker(async (t) => {
+    const cases = [
+      ['title,password\nA,x\n,y\n', [3], /cannot be imported/],
+      ['title\n' + Array.from({ length: 500 }, (_, i) => `T${i}`).join('\n') + '\n,\n', [502], /cannot be imported/],
+      [VALID_CSV, [2], /Every row is valid/],
+      ['title,priority\n,low\nX,critical\n', [2, 3], /No row of this file/],
+    ];
+    for (const [csv, excludedLines, message] of cases) {
+      const res = await t.commit(validRows(randomUUID(), csv, excludedLines));
+      assert.equal(res.status, 400);
+      assert.equal(res.body.error.code, 'IMPORT_INVALID');
+      assert.match(res.body.error.message, message);
+    }
+    const huge = 'title\n' + 'x'.repeat(256 * 1024) + '\n,\n';
+    assert.equal((await t.commit(validRows(randomUUID(), huge, [3]))).body.error.code, 'IMPORT_INVALID');
+    assert.equal((await t.list()).body.items.length, 0);
+  }));
+
+test('repeating a valid-rows commit replays it; reusing its key for another file or choice conflicts', () =>
+  withTracker(async (t) => {
+    const importKey = randomUUID();
+    const first = await t.commit(validRows(importKey));
+    const again = await t.commit(validRows(importKey, MIXED_CSV.replace(/\n/g, '\r\n')));
+    assert.equal(again.status, 200);
+    assert.equal(again.body.replayed, true);
+    assert.deepEqual(again.body.import, first.body.import);
+    const other = MIXED_CSV.replace('Keep open', 'Different');
+    const conflict = await t.commit(validRows(importKey, other));
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.body.error.code, 'IMPORT_CONFLICT');
+    // a whole-file key cannot be replayed as a valid-rows choice either
+    const wholeKey = randomUUID();
+    assert.equal((await t.commit({ importKey: wholeKey, csv: 'title\nOnly\n' })).status, 201);
+    assert.equal((await t.commit(validRows(wholeKey, 'title,priority\nOnly,\n,low\n', [3]))).status, 409);
+    assert.equal((await t.list()).body.items.length, 3);
+    // the same file under a new key is a new, deliberate import
+    assert.equal((await t.commit(validRows(randomUUID()))).status, 201);
+    assert.equal((await t.list()).body.items.length, 5);
+  }));
+
+test('a valid-rows import and its excluded rows survive a restart and still replay', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'import-valid-rows-restart-'));
+  try {
+    const importKey = randomUUID();
+    let t = await boot(dataDir);
+    const first = await t.commit(validRows(importKey));
+    await t.close();
+    t = await boot(dataDir);
+    const lookup = await t.lookup(importKey);
+    assert.equal(lookup.status, 200);
+    assert.deepEqual(lookup.body.import, first.body.import);
+    const replay = await t.commit(validRows(importKey));
+    assert.equal(replay.body.replayed, true);
+    assert.equal((await t.list()).body.items.length, 2);
+    await t.close();
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('failed persistence of a valid-rows import leaves everything unchanged', { skip: isRoot && 'root ignores permissions' }, () =>
+  withTracker(async (t, dataDir) => {
+    await t.request('/api/issues', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Existing' }) });
+    const before = await readFile(t.storePath, 'utf8');
+    const importKey = randomUUID();
+    await chmod(dataDir, 0o500);
+    let res;
+    try {
+      res = await t.commit(validRows(importKey));
+    } finally {
+      await chmod(dataDir, 0o700);
+    }
+    assert.equal(res.status, 500);
+    assert.equal(await readFile(t.storePath, 'utf8'), before);
+    assert.equal((await t.lookup(importKey)).status, 404);
+    assert.equal((await t.commit(validRows(importKey))).status, 201);
+    assert.equal((await t.list()).body.items.length, 3);
+  }));
+
+test('a corrupt valid-rows record is reported, never rewritten', async () => {
+  for (const extra of [{ mode: 'valid_rows' }, { mode: 'other', excludedRows: [{ line: 3, problems: [{ column: 'title', reason: 'x' }] }] }, { mode: 'valid_rows', excludedRows: [{ line: 3, problems: [] }] }]) {
+    const dataDir = await mkdtemp(join(tmpdir(), 'import-corrupt-subset-'));
+    try {
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      const corrupt = JSON.stringify({
+        issues: [{ id, title: 'T', description: '', status: 'open', priority: 'normal', createdAt: now, updatedAt: now, completions: [] }],
+        imports: [{ importKey: randomUUID(), digest: 'a'.repeat(64), createdAt: now, issueIds: [id], ...extra }],
+      });
+      await writeFile(join(dataDir, 'issues.json'), corrupt);
+      const t = await boot(dataDir);
+      assert.equal((await t.list()).status, 500, JSON.stringify(extra));
+      assert.equal(await readFile(join(dataDir, 'issues.json'), 'utf8'), corrupt);
+      await t.close();
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }
+});
