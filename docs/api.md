@@ -210,10 +210,14 @@ result. Choosing the same file again later is a new import with a new key.
 
 Returns the committed result for that key with `200` in the same shape as the
 commit response (`"replayed": false`), so a client whose commit outcome was
-unknown can find out whether it landed. `404 IMPORT_NOT_FOUND` means nothing
-was committed under the key (rejected or never received; the client may
-commit it now). A key that is not a UUID → `400 VALIDATION_ERROR`. Results are
-durable across restarts.
+unknown can find out whether it landed. `404 IMPORT_NOT_FOUND` means no record
+is stored under the key at that moment; it is not proof that nothing was ever
+saved, because a commit of that key may still be in flight and not visible
+yet. Re-checking later is always safe, and retrying the commit with the same
+key and identical rows commits at most once: it returns the stored result if
+the import already landed, or commits it once if no result exists yet. A key
+that is not a UUID → `400 VALIDATION_ERROR`. Results are durable across
+restarts.
 
 ### Everything else
 

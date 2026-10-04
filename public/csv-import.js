@@ -192,12 +192,28 @@ export function validateImportCsv(text) {
 // Browser panel: select, preview, cancel or confirm.
 // ---------------------------------------------------------------------------
 
-const RESULT_UNKNOWN = 'The import result could not be confirmed. Nothing will be sent twice: use Check result, or Import again — the same import is never applied twice.';
+const RESULT_UNKNOWN = 'The import result could not be confirmed yet. Importing again with the same import id applies it at most once — the server returns the stored result if it already landed — or use Check result. The import stays listed as unconfirmed until its result is known.';
 
 function newImportKey() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
   const hex = [...Array(32)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+const DIGEST_AVAILABLE =
+  typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle && typeof globalThis.crypto.subtle.digest === 'function';
+
+// SHA-256 of the file text, hex encoded: a content fingerprint that lets a
+// reloaded page recognize the exact same unconfirmed import and reuse its id
+// instead of minting a new one that could duplicate the rows. Only the
+// fingerprint is persisted, never the file text. When the runtime offers no
+// digest there is no way to prove content identity, so no id is reused and
+// the panel says that reselect dedup is unavailable instead of promising it.
+async function fingerprintCsv(text) {
+  if (!DIGEST_AVAILABLE) return null;
+  const bytes = new TextEncoder().encode(text);
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 export function createImportClient({ fetchImpl = (...args) => globalThis.fetch(...args), base = '' } = {}) {
@@ -229,7 +245,78 @@ export function createImportClient({ fetchImpl = (...args) => globalThis.fetch(.
   };
 }
 
-export function mountImportPanel(root, { client = createImportClient(), doc = root.ownerDocument, onImported = () => {}, decode } = {}) {
+// An import whose result is not confirmed yet stays in a pending list keyed
+// by its import id, so the outcome can still be looked up after the preview
+// is cancelled or the page is reloaded. The list lives in sessionStorage when
+// the browser allows it and always in memory for this page; when storage
+// cannot be used the panel says recovery across reloads is unavailable
+// instead of silently promising it.
+const PENDING_STORAGE_KEY = 'issue-imports-pending';
+
+export function createPendingImportStore(getStorage = () => globalThis.sessionStorage) {
+  let storage = null;
+  let usable = true;
+  try {
+    storage = getStorage();
+    if (!storage || typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function') {
+      storage = null;
+      usable = false;
+    }
+  } catch {
+    storage = null;
+    usable = false;
+  }
+  let memory = [];
+  const sanitize = (value) =>
+    Array.isArray(value) && value.every((entry) => entry && isImportKey(entry.importKey) && typeof entry.fileName === 'string')
+      ? value
+      : null;
+  function entries() {
+    if (!usable) return [...memory];
+    let raw;
+    try {
+      raw = storage.getItem(PENDING_STORAGE_KEY);
+    } catch {
+      usable = false;
+      return [...memory];
+    }
+    if (raw === null) return [];
+    let parsed;
+    try {
+      parsed = sanitize(JSON.parse(raw));
+    } catch {
+      parsed = null;
+    }
+    if (parsed === null) {
+      // Unreadable or rewritten data: promise nothing about earlier sessions.
+      usable = false;
+      return [...memory];
+    }
+    memory = parsed;
+    return [...parsed];
+  }
+  function write(list) {
+    memory = list;
+    if (!usable) return;
+    try {
+      storage.setItem(PENDING_STORAGE_KEY, JSON.stringify(list));
+    } catch {
+      usable = false;
+    }
+  }
+  return {
+    usable: () => usable,
+    entries,
+    add(importKey, fileName, fingerprint) {
+      write([...entries().filter((entry) => entry.importKey !== importKey), { importKey, fileName, fingerprint }]);
+    },
+    remove(importKey) {
+      write(entries().filter((entry) => entry.importKey !== importKey));
+    },
+  };
+}
+
+export function mountImportPanel(root, { client = createImportClient(), doc = root.ownerDocument, onImported = () => {}, decode, pendingStore = createPendingImportStore() } = {}) {
   const el = (tag, attrs = {}, text) => {
     const node = doc.createElement(tag);
     for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
@@ -252,15 +339,55 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   const cancelButton = el('button', { type: 'button', 'data-role': 'import-cancel', disabled: '' }, 'Cancel');
   const checkButton = el('button', { type: 'button', 'data-role': 'import-check', hidden: '' }, 'Check result');
   actions.append(confirmButton, cancelButton, checkButton);
-  section.append(status, errorBox, table, actions);
+  const recoveryBox = el('div', { 'data-role': 'import-recovery', hidden: '' });
+  const recoveryCheckButton = el('button', { type: 'button', 'data-role': 'import-recovery-check', hidden: '' }, 'Check pending results');
+  section.append(status, errorBox, recoveryBox, table, actions);
   root.append(section);
 
-  const state = { csv: null, fileName: '', validation: null, importKey: null, busy: false, result: null };
+  // Selections are tokened: every file choice takes the next token, and an
+  // await may only mutate panel state while its token is still the newest.
+  // A slower earlier read can then never overwrite a newer preview, and a
+  // reset invalidates whatever was still in flight.
+  let selectionToken = 0;
+  const state = { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, busy: false, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false };
 
   function showErrors(messages) {
     errorBox.replaceChildren(...messages.map((message) => el('p', {}, message)));
     errorBox.hidden = messages.length === 0;
   }
+
+  function renderRecovery() {
+    recoveryBox.replaceChildren();
+    const pending = pendingStore.entries();
+    if (!pendingStore.usable()) {
+      recoveryBox.append(
+        el('p', {}, 'Import recovery across reloads is unavailable in this browser: the list of unconfirmed imports cannot be stored. An unconfirmed import can still be checked from this page.'),
+      );
+      if (pending.length === 0) {
+        recoveryCheckButton.hidden = true;
+        recoveryBox.hidden = false;
+        return;
+      }
+    } else if (pending.length === 0) {
+      recoveryBox.hidden = true;
+      return;
+    }
+    recoveryBox.append(
+      el(
+        'p',
+        {},
+        `${pending.length} import result${pending.length === 1 ? ' is' : 's are'} still unconfirmed (${pending.map((entry) => entry.fileName || entry.importKey).join(', ')}). ${
+          DIGEST_AVAILABLE
+            ? 'Choosing the exact same file again reuses its import id, which applies the import at most once; a different file starts a new import.'
+            : 'Choosing a file again always starts a new import id in this browser; use Check pending results instead.'
+        }`,
+      ),
+    );
+    recoveryBox.append(recoveryCheckButton);
+    recoveryCheckButton.hidden = false;
+    recoveryBox.hidden = false;
+  }
+  renderRecovery();
 
   function renderPreview(validation) {
     table.replaceChildren();
@@ -290,7 +417,11 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   }
 
   function reset(message = '') {
-    Object.assign(state, { csv: null, fileName: '', validation: null, importKey: null, result: null });
+    // An unconfirmed import survives the reset: its identity stays in the
+    // pending list, so its result can still be checked afterwards. Any file
+    // read still in flight is invalidated.
+    selectionToken += 1;
+    Object.assign(state, { csv: null, fileName: '', validation: null, importKey: null, fingerprint: null, result: null, sent: false, attempts: 0, preexistingPending: false, reading: false });
     input.value = '';
     renderPreview(null);
     showErrors([]);
@@ -301,9 +432,16 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
     checkButton.hidden = true;
   }
 
-  function preview(text, fileName) {
+  async function preview(text, fileName, token = null) {
     const validation = validateImportCsv(text);
-    Object.assign(state, { csv: text, fileName, validation, importKey: newImportKey(), result: null });
+    // Re-selecting the exact text of an unconfirmed import — now or after a
+    // reload — reuses that import's id, so confirming again can only replay
+    // it, never duplicate the rows. Without a digest, content identity cannot
+    // be proven, so a fresh id is minted and nothing is deduplicated.
+    const fingerprint = await fingerprintCsv(text);
+    if (token !== null && (token !== selectionToken || state.busy)) return validation; // a newer selection or a started commit wins
+    const pending = fingerprint ? pendingStore.entries().find((entry) => entry.fingerprint === fingerprint) : null;
+    Object.assign(state, { csv: text, fileName, validation, importKey: pending ? pending.importKey : newImportKey(), fingerprint, result: null, sent: false, attempts: 0, preexistingPending: Boolean(pending) });
     renderPreview(validation);
     const rowProblems = validation.rows.filter((row) => row.errors.length > 0);
     showErrors([
@@ -336,82 +474,169 @@ export function mountImportPanel(root, { client = createImportClient(), doc = ro
   }
 
   input.addEventListener('change', async () => {
+    if (state.busy) return; // a commit or lookup is resolving; pick the file again after it finishes
+    const token = ++selectionToken;
     const file = input.files && input.files[0];
     if (!file) return;
+    // While the chosen file is being read the visible preview no longer
+    // matches the input, so importing is disabled until the new preview is
+    // ready — the stale preview must never be committed.
+    state.reading = true;
+    confirmButton.disabled = true;
     const read = await readFile(file);
+    if (token !== selectionToken) return; // a newer selection superseded this read
     if (read.error) {
+      state.reading = false;
       reset('');
       showErrors([read.error]);
       return;
     }
-    preview(read.text, file.name);
+    await preview(read.text, file.name, token);
+    if (token === selectionToken) state.reading = false;
   });
 
-  function settle(response) {
+  // settle() resolves the outcome of one specific import. The identity is
+  // captured when the request is sent, so a selection made while the request
+  // is in flight can never be mistaken for the import being settled.
+  function settle(response, importKey = state.importKey, fileName = state.fileName) {
     state.busy = false;
     if (response.outcome === 'ok') {
       const record = response.body.import;
       state.result = record;
+      pendingStore.remove(importKey);
+      renderRecovery();
       renderPreview(null);
       showErrors([]);
       checkButton.hidden = true;
       cancelButton.disabled = true;
       confirmButton.disabled = true;
       input.value = '';
-      status.textContent = `Imported ${record.issueCount} issue${record.issueCount === 1 ? '' : 's'} from ${state.fileName || 'the file'}.${response.body.replayed ? ' (Already imported earlier; nothing was added again.)' : ''}`;
+      status.textContent = `Imported ${record.issueCount} issue${record.issueCount === 1 ? '' : 's'} from ${fileName || 'the file'}.${response.body.replayed ? ' (Already imported earlier; nothing was added again.)' : ''}`;
       onImported(record);
       return;
     }
     if (response.outcome === 'rejected') {
-      const details = response.body.error.details;
-      const lines = [response.body.error.message];
+      const error = response.body.error;
+      // A refusal of this attempt proves nothing about earlier sends of the
+      // same import id: the server validates the file before consulting the
+      // durable key, and an earlier send whose response was lost may already
+      // be committed. Only a validation refusal of the very first send of a
+      // freshly minted id — no unconfirmed send ever made — durably means
+      // "nothing was saved"; every other refusal keeps the import pending and
+      // its lookup available.
+      const validationRefusal = error && (error.code === 'IMPORT_INVALID' || error.code === 'VALIDATION_ERROR');
+      const definitivelyRefused = validationRefusal && state.attempts === 1 && !state.preexistingPending;
+      if (definitivelyRefused) pendingStore.remove(importKey);
+      renderRecovery();
+      const details = error.details;
+      const lines = [error.message];
       if (details && Array.isArray(details.rowErrors)) {
         for (const row of details.rowErrors) lines.push(`Line ${row.line}: ${row.errors.join(' ')}`);
       }
       showErrors(lines);
-      status.textContent = 'The server refused this import. Nothing was saved.';
+      status.textContent =
+        error.code === 'IMPORT_CONFLICT'
+          ? 'This import id was already used for different rows. Nothing new was saved here; use Check result to see what is stored under it.'
+          : definitivelyRefused
+            ? 'The server refused this import. Nothing was saved.'
+            : 'The server refused this import attempt. Nothing new was saved here; an earlier unconfirmed send stays recorded — use Check result.';
       confirmButton.disabled = true;
       cancelButton.disabled = false;
-      checkButton.hidden = true;
+      checkButton.hidden = !pendingStore.entries().some((entry) => entry.importKey === importKey);
       return;
     }
-    // Unknown outcome: keep the same import key so a retry is deduplicated.
+    // Unknown outcome: keep the same import key so a retry is deduplicated,
+    // and keep the import in the pending list until its result is known.
     showErrors([RESULT_UNKNOWN]);
     status.textContent = 'Result unknown.';
     confirmButton.disabled = false;
     cancelButton.disabled = false;
     checkButton.hidden = false;
+    renderRecovery();
   }
 
   confirmButton.addEventListener('click', async () => {
-    if (state.busy || !state.validation || !state.validation.valid) return;
+    if (state.busy || state.reading || !state.validation || !state.validation.valid) return;
     state.busy = true;
+    state.sent = true;
+    state.attempts += 1;
+    // Capture what is being sent and record the import id before anything
+    // leaves: even a lost page keeps a checkable identity for this import.
+    const importKey = state.importKey;
+    const fileName = state.fileName;
+    const csv = state.csv;
+    pendingStore.add(importKey, fileName, state.fingerprint);
     confirmButton.disabled = true;
     cancelButton.disabled = true;
     status.textContent = 'Importing…';
-    settle(await client.commit(state.importKey, state.csv));
+    settle(await client.commit(importKey, csv), importKey, fileName);
   });
 
   checkButton.addEventListener('click', async () => {
     if (state.busy || !state.importKey) return;
     state.busy = true;
+    // The import being checked is fixed the moment the lookup leaves; a
+    // selection made meanwhile must not redefine what the answer settles.
+    const importKey = state.importKey;
+    const fileName = state.fileName;
     status.textContent = 'Checking…';
-    const response = await client.lookup(state.importKey);
+    const response = await client.lookup(importKey);
     if (response.outcome === 'rejected' && response.status === 404) {
+      // A missing record does not prove the import was not saved: the request
+      // may still be on its way. Keep the id pending and keep checking open.
       state.busy = false;
-      showErrors(['This import was not saved. You can import it now.']);
-      status.textContent = 'Not imported yet.';
+      showErrors(['No record of this import was found yet, which does not confirm anything: the request may still be on its way. Check again in a moment; importing again reuses the same import id, which applies the import at most once.']);
+      status.textContent = 'Result not confirmed yet.';
       confirmButton.disabled = false;
       cancelButton.disabled = false;
-      checkButton.hidden = true;
+      checkButton.hidden = false;
       return;
     }
-    settle(response);
+    settle(response, importKey, fileName);
   });
 
   cancelButton.addEventListener('click', () => {
     if (state.busy) return;
-    reset('Import cancelled. Nothing was saved.');
+    // Cancelling the preview never destroys the identity of an import whose
+    // result is still unknown — only the durable lookup can settle that.
+    const unconfirmed = state.importKey && state.sent && state.result === null && pendingStore.entries().some((entry) => entry.importKey === state.importKey);
+    const name = state.fileName || 'the file';
+    reset(
+      unconfirmed
+        ? `Cancelled here — the result of ${name} is still unknown. Use Check result before importing that file again.`
+        : 'Import cancelled. Nothing was sent.',
+    );
+    renderRecovery();
+  });
+
+  recoveryCheckButton.addEventListener('click', async () => {
+    if (state.busy) return;
+    const pending = pendingStore.entries();
+    if (pending.length === 0) return;
+    state.busy = true;
+    status.textContent = 'Checking pending results…';
+    let confirmed = 0;
+    let stillOpen = 0;
+    for (const entry of pending) {
+      const response = await client.lookup(entry.importKey);
+      if (response && response.outcome === 'ok') {
+        pendingStore.remove(entry.importKey);
+        confirmed += 1;
+        onImported(response.body.import);
+      } else {
+        // Not found yet, unreachable or refused without a durable record:
+        // none of these proves the import was not saved, so it stays pending.
+        stillOpen += 1;
+      }
+    }
+    state.busy = false;
+    renderRecovery();
+    status.textContent =
+      confirmed > 0 && stillOpen > 0
+        ? `${confirmed} unconfirmed import(s) are confirmed imported; ${stillOpen} still not confirmed.`
+        : confirmed > 0
+          ? `All ${confirmed} unconfirmed import(s) are confirmed imported.`
+          : 'Still not confirmed: the server has no record yet, which does not prove they were not saved — the request may still be on its way. Check again in a moment.';
   });
 
   return { section, state, preview, reset };
