@@ -1,15 +1,17 @@
-// Frontend coverage for the Weekly summary: UTC week helpers, the version-1
-// report shape check, the live HTTP adapter's report read, and the mounted
-// summary (default current UTC week, week selection, independence from the
+// Frontend coverage for the Weekly summary: UTC week helpers, the version-2
+// report shape check (version-1 and malformed replies refused), the live HTTP
+// adapter's report read, and the mounted summary (default current UTC week,
+// week selection, created and completed shown separately, repeat completions,
+// current-priority labelling, unknown completion timing, independence from the
 // board's search and filters, refresh after board changes, loading, empty,
-// failure and stale-reply handling). The report endpoint is stubbed here: the
-// summary is checked against the agreed version-1 contract
-// (GET /api/reports/weekly?weekStart=YYYY-MM-DD), not against a server.
+// failure and stale-reply handling). The report endpoint is stubbed here with
+// synthetic responses that follow the agreed version-2 contract
+// (GET /api/reports/weekly?weekStart=YYYY-MM-DD), not a server.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ApiError, FIRST_WEEK_START, LAST_WEEK_START, addUtcDays, createHttpAdapter, formatUtcDay,
-  isSupportedWeek, isValidWeeklyReport, mountApp, parseIsoDate, utcWeekStart,
+  isSupportedWeek, isValidWeeklyReport, mountApp, parseIsoDate, utcWeekStart, weeklyReportProblem,
 } from '../public/app.js';
 
 const STATUSES = ['open', 'in_progress', 'done'];
@@ -117,13 +119,14 @@ function jsonResponse(status, body) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures: an issue store shared by the board adapter and a report stub that
-// counts like the version-1 contract (createdAt inside the UTC week, current
-// status and priority, every key present).
+// Fixtures: an issue store shared by the board adapter, a completion history
+// the stub server keeps (append-only, server clock), and a report stub that
+// counts like the version-2 contract.
 // ---------------------------------------------------------------------------
 
 const WEEK = '2026-09-28'; // a Monday
 const PREV_WEEK = '2026-09-21';
+const SERVER_NOW = '2026-10-02T00:00:00.000Z'; // the stub server's clock for changes
 
 function fixtureIssues() {
   const at = (iso) => ({ createdAt: iso, updatedAt: iso });
@@ -132,13 +135,32 @@ function fixtureIssues() {
     { id: 'wk-0002', title: '<b>Markup</b> title', description: 'needle', status: 'in_progress', priority: 'high', ...at('2026-09-30T12:00:00.000Z') },
     { id: 'wk-0003', title: 'Login needle', description: '', status: 'open', priority: 'normal', ...at('2026-10-04T23:59:59.999Z') },
     { id: 'wk-0004', title: 'Done thing', description: '', status: 'done', priority: 'low', ...at('2026-10-01T08:00:00.000Z') },
-    // Outside the week: the Sunday before and the Monday after.
+    // Created outside the week: the Sunday before and the Monday after.
     { id: 'wk-0005', title: 'Before', description: '', status: 'open', priority: 'normal', ...at('2026-09-27T23:59:59.999Z') },
     { id: 'wk-0006', title: 'After', description: '', status: 'open', priority: 'normal', ...at('2026-10-05T00:00:00.000Z') },
+    // Created earlier, completed in the last millisecond of the week.
+    { id: 'wk-0007', title: 'Old report', description: '', status: 'done', priority: 'high', ...at('2026-09-10T09:00:00.000Z') },
+    // Completed on both sides of the week, never inside it.
+    { id: 'wk-0008', title: 'Edge completions', description: '', status: 'done', priority: 'normal', ...at('2026-09-01T09:00:00.000Z') },
+    // Legacy: done before completion times were recorded (updated in the week,
+    // which must not be read as a completion time).
+    { id: 'wk-0009', title: 'Legacy done', description: '', status: 'done', priority: 'normal', createdAt: '2026-08-01T09:00:00.000Z', updatedAt: '2026-09-30T09:00:00.000Z' },
   ];
 }
 
-function boardAdapter(store) {
+// Recorded completion events (server-clock UTC), oldest first.
+function fixtureCompletions() {
+  return {
+    // Completed, then reopened: the completion stays in the week.
+    'wk-0001': ['2026-09-29T10:00:00.000Z'],
+    // Completed three times in the week (reopened twice): one issue, two extra.
+    'wk-0004': ['2026-10-01T09:00:00.000Z', '2026-10-02T10:00:00.000Z', '2026-10-03T11:00:00.000Z'],
+    'wk-0007': ['2026-10-04T23:59:59.999Z'],
+    'wk-0008': ['2026-09-27T23:59:59.999Z', '2026-10-05T00:00:00.000Z'],
+  };
+}
+
+function boardAdapter(store, history) {
   const calls = { list: [], create: [], update: [] };
   return {
     mode: 'recording', calls,
@@ -161,28 +183,47 @@ function boardAdapter(store) {
     },
     async update(id, patch) {
       calls.update.push({ id, patch: { ...patch } });
-      const next = { ...store.get(id), ...patch, updatedAt: '2026-10-02T00:00:00.000Z' };
+      const prev = store.get(id);
+      const next = { ...prev, ...patch, updatedAt: SERVER_NOW };
+      // Like the server: a move into done from another status appends one event.
+      if (next.status === 'done' && prev.status !== 'done') history.set(id, [...(history.get(id) ?? []), SERVER_NOW]);
       store.set(id, next);
       return { ...next };
     },
   };
 }
 
-function countReport(store, weekStart) {
+function countReport(store, weekStart, history = new Map()) {
   const start = Date.parse(weekStart + 'T00:00:00.000Z');
   const end = start + 7 * 24 * 60 * 60 * 1000;
-  const byStatus = Object.fromEntries(STATUSES.map((k) => [k, 0]));
-  const byPriority = Object.fromEntries(PRIORITIES.map((k) => [k, 0]));
-  let total = 0;
+  const inWeek = (iso) => { const t = Date.parse(iso); return t >= start && t < end; };
+  const zeros = (keys) => Object.fromEntries(keys.map((k) => [k, 0]));
+  const created = { total: 0, byStatus: zeros(STATUSES), byPriority: zeros(PRIORITIES) };
+  const completed = { total: 0, byPriority: zeros(PRIORITIES), createdThisWeek: 0, createdEarlier: 0, repeatCompletions: 0 };
+  let completedTimingUnknown = 0;
   for (const issue of store.values()) {
-    const t = Date.parse(issue.createdAt);
-    if (t >= start && t < end) { total += 1; byStatus[issue.status] += 1; byPriority[issue.priority] += 1; }
+    if (inWeek(issue.createdAt)) { created.total += 1; created.byStatus[issue.status] += 1; created.byPriority[issue.priority] += 1; }
+    const events = (history.get(issue.id) ?? []).filter(inWeek);
+    if (events.length > 0) {
+      completed.total += 1;
+      completed.repeatCompletions += events.length - 1;
+      completed.byPriority[issue.priority] += 1;
+      if (inWeek(issue.createdAt)) completed.createdThisWeek += 1; else completed.createdEarlier += 1;
+    }
+    if (issue.status === 'done' && (history.get(issue.id) ?? []).length === 0) completedTimingUnknown += 1;
   }
-  return { schemaVersion: 1, weekStart, weekEndExclusive: addUtcDays(weekStart, 7), created: { total, byStatus, byPriority } };
+  return { schemaVersion: 2, weekStart, weekEndExclusive: addUtcDays(weekStart, 7), created, completed, completedTimingUnknown };
 }
 
+const fixtureStore = () => new Map(fixtureIssues().map((i) => [i.id, i]));
+const fixtureHistory = () => new Map(Object.entries(fixtureCompletions()));
+const emptyReport = (weekStart, weekEndExclusive = addUtcDays(weekStart, 7)) => ({ schemaVersion: 2, weekStart, weekEndExclusive,
+  created: { total: 0, byStatus: { open: 0, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 } },
+  completed: { total: 0, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 }, createdThisWeek: 0, createdEarlier: 0, repeatCompletions: 0 },
+  completedTimingUnknown: 0 });
+
 // A report source over the store; `next` (if set) answers the next read.
-function reportStub(store) {
+function reportStub(store, history) {
   const stub = {
     calls: [],
     next: [],
@@ -190,23 +231,24 @@ function reportStub(store) {
       stub.calls.push(weekStart);
       const custom = stub.next.shift();
       if (custom) return custom(weekStart);
-      return countReport(store, weekStart);
+      return countReport(store, weekStart, history);
     },
   };
   return stub;
 }
 
-async function mountSummary({ now = new Date('2026-09-30T15:00:00.000Z'), issues = fixtureIssues(), withReports = true } = {}) {
+async function mountSummary({ now = new Date('2026-09-30T15:00:00.000Z'), issues = fixtureIssues(), completions = fixtureCompletions(), withReports = true } = {}) {
   const store = new Map(issues.map((issue) => [issue.id, { ...issue }]));
-  const adapter = boardAdapter(store);
-  const reports = reportStub(store);
+  const history = new Map(Object.entries(completions).map(([id, events]) => [id, [...events]]));
+  const adapter = boardAdapter(store, history);
+  const reports = reportStub(store, history);
   const doc = new FakeDocument();
   const root = new FakeElement(doc, 'div');
   doc.root = root;
   const app = mountApp(root, { adapter, doc, searchDelayMs: 0, reports: withReports ? reports : null, now: () => now });
   await app.ready;
   await app.weekly.idle();
-  return { doc, root, app, adapter, reports, store };
+  return { doc, root, app, adapter, reports, store, history };
 }
 
 const countOf = (root, key, value) => byRole(root, `weekly-${key}-${value}`).textContent;
@@ -215,6 +257,16 @@ function shownCounts(root) {
     total: byRole(root, 'weekly-total').textContent,
     byStatus: Object.fromEntries(STATUSES.map((k) => [k, countOf(root, 'status', k)])),
     byPriority: Object.fromEntries(PRIORITIES.map((k) => [k, countOf(root, 'priority', k)])),
+  };
+}
+const text = (root, role) => byRole(root, role).textContent;
+function shownCompleted(root) {
+  return {
+    total: text(root, 'weekly-completed-total'),
+    repeat: text(root, 'weekly-repeat'),
+    createdThisWeek: text(root, 'weekly-completed-created-this-week'),
+    createdEarlier: text(root, 'weekly-completed-created-earlier'),
+    byPriority: Object.fromEntries(PRIORITIES.map((k) => [k, countOf(root, 'completed-priority', k)])),
   };
 }
 
@@ -237,26 +289,62 @@ test('UTC week helpers name the Monday of the UTC week and only accept real date
   assert.equal(formatUtcDay(WEEK), 'Mon 28 Sep 2026', 'labels name the weekday, day, month and year');
 });
 
-test('only a complete version-1 report for the requested week is accepted', () => {
-  const good = countReport(new Map(fixtureIssues().map((i) => [i.id, i])), WEEK);
+test('only a complete version-2 report for the requested week is accepted', () => {
+  const good = countReport(fixtureStore(), WEEK, fixtureHistory());
   assert.equal(isValidWeeklyReport(good, WEEK), true);
+  assert.equal(weeklyReportProblem(good, WEEK), null);
   assert.equal(good.created.total, 4, 'fixture sanity: four issues created in the week');
+  assert.deepEqual(good.completed, { total: 3, byPriority: { low: 1, normal: 0, high: 1, urgent: 1 }, createdThisWeek: 2, createdEarlier: 1, repeatCompletions: 2 },
+    'fixture sanity: three distinct completed issues, two extra completions');
+  assert.equal(good.completedTimingUnknown, 1, 'fixture sanity: one legacy done issue');
+  const c = good.created;
+  const d = good.completed;
+  const { completed: _drop, ...noCompleted } = good;
+  const { completedTimingUnknown: _drop2, ...noUnknown } = good;
   const variants = {
     'another week': { ...good, weekStart: PREV_WEEK, weekEndExclusive: WEEK },
-    'schema version 2': { ...good, schemaVersion: 2 },
+    'schema version 3': { ...good, schemaVersion: 3 },
+    'schema version as text': { ...good, schemaVersion: '2' },
     'non-Monday week': { ...good, weekStart: '2026-09-29', weekEndExclusive: '2026-10-06' },
     'wrong end': { ...good, weekEndExclusive: '2026-10-04' },
-    'missing status key': { ...good, created: { ...good.created, byStatus: { open: 2, in_progress: 1 } } },
-    'missing priority key': { ...good, created: { ...good.created, byPriority: { low: 1, normal: 1, high: 1 } } },
-    'negative count': { ...good, created: { ...good.created, total: -1 } },
-    'fractional count': { ...good, created: { ...good.created, byStatus: { ...good.created.byStatus, done: 0.5 } } },
-    'counts not adding up': { ...good, created: { ...good.created, total: 5 } },
-    'text count': { ...good, created: { ...good.created, total: '4' } },
+    'missing status key': { ...good, created: { ...c, byStatus: { open: 2, in_progress: 1 } } },
+    'missing priority key': { ...good, created: { ...c, byPriority: { low: 1, normal: 1, high: 1 } } },
+    'negative count': { ...good, created: { ...c, total: -1 } },
+    'fractional count': { ...good, created: { ...c, byStatus: { ...c.byStatus, done: 0.5 } } },
+    'created counts not adding up': { ...good, created: { ...c, total: 5 } },
+    'text count': { ...good, created: { ...c, total: '4' } },
+    'no completed part (version-1 body labelled 2)': noCompleted,
+    'completed as an array': { ...good, completed: [] },
+    'no unknown-timing count': noUnknown,
+    'unknown-timing as null': { ...good, completedTimingUnknown: null },
+    'unknown-timing negative': { ...good, completedTimingUnknown: -1 },
+    'completed priority key missing': { ...good, completed: { ...d, byPriority: { low: 1, high: 1, urgent: 1 } } },
+    'completed priorities not adding up': { ...good, completed: { ...d, total: 4 } },
+    'origin not adding up': { ...good, completed: { ...d, createdEarlier: 2 } },
+    'origin missing': { ...good, completed: { ...d, createdThisWeek: undefined } },
+    'repeat missing': { ...good, completed: { ...d, repeatCompletions: undefined } },
+    'repeat fractional': { ...good, completed: { ...d, repeatCompletions: 1.5 } },
+    'more completed-this-week than created': { ...good, created: { total: 1, byStatus: { open: 1, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 0, high: 0, urgent: 1 } } },
+    'repeats without any completed issue': { ...emptyReport(WEEK), completed: { ...emptyReport(WEEK).completed, repeatCompletions: 1 } },
   };
   for (const [name, report] of Object.entries(variants)) {
     assert.equal(isValidWeeklyReport(report, WEEK), false, name);
+    assert.equal(weeklyReportProblem(report, WEEK).code, 'INVALID_RESPONSE', name);
   }
   assert.equal(isValidWeeklyReport(null, WEEK), false);
+  assert.equal(isValidWeeklyReport([], WEEK), false);
+  assert.equal(isValidWeeklyReport(emptyReport(WEEK), WEEK), true, 'a real all-zero week is valid');
+});
+
+test('a version-1 report is refused with its own message, never shown as version 2', () => {
+  const v1 = { schemaVersion: 1, weekStart: WEEK, weekEndExclusive: '2026-10-05',
+    created: { total: 4, byStatus: { open: 2, in_progress: 1, done: 1 }, byPriority: { low: 1, normal: 1, high: 1, urgent: 1 } } };
+  assert.equal(isValidWeeklyReport(v1, WEEK), false);
+  const problem = weeklyReportProblem(v1, WEEK);
+  assert.equal(problem.code, 'UNSUPPORTED_REPORT_VERSION');
+  assert.match(problem.message, /older weekly report \(version 1\) without completion data/);
+  // Even with version-2 parts bolted on, a version-1 label is not version 2.
+  assert.equal(weeklyReportProblem({ ...countReport(fixtureStore(), WEEK, fixtureHistory()), schemaVersion: 1 }, WEEK).code, 'UNSUPPORTED_REPORT_VERSION');
 });
 
 // ---------------------------------------------------------------------------
@@ -265,7 +353,7 @@ test('only a complete version-1 report for the requested week is accepted', () =
 
 test('the adapter reads GET /api/reports/weekly?weekStart= and keeps the error envelope', async () => {
   const calls = [];
-  const good = countReport(new Map(fixtureIssues().map((i) => [i.id, i])), WEEK);
+  const good = countReport(fixtureStore(), WEEK, fixtureHistory());
   const api = createHttpAdapter({ fetchImpl: async (url, init) => { calls.push({ url, init }); return jsonResponse(200, good); } });
   assert.deepEqual(await api.weeklyReport(WEEK), good);
   assert.equal(calls.length, 1);
@@ -285,6 +373,13 @@ test('the adapter reads GET /api/reports/weekly?weekStart= and keeps the error e
 
   const offline = createHttpAdapter({ fetchImpl: async () => { throw new TypeError('fetch failed'); } });
   await assert.rejects(offline.weeklyReport(WEEK), (e) => e.code === 'NETWORK_ERROR');
+
+  const { completed: _c, completedTimingUnknown: _u, ...createdOnly } = good;
+  const v1 = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, { ...createdOnly, schemaVersion: 1 }) });
+  await assert.rejects(v1.weeklyReport(WEEK), (e) => e instanceof ApiError && e.code === 'UNSUPPORTED_REPORT_VERSION' && e.status === 200,
+    'a version-1 reply is refused explicitly');
+  const halfV2 = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, { ...createdOnly, schemaVersion: 2 }) });
+  await assert.rejects(halfV2.weeklyReport(WEEK), (e) => e.code === 'INVALID_RESPONSE', 'a version-2 label without completion data is unreadable');
 });
 
 // ---------------------------------------------------------------------------
@@ -312,6 +407,100 @@ test('the summary is a labelled section showing the current UTC week, its total 
   assert.equal(byRole(root, 'weekly-result').hidden, false);
   assert.equal(byRole(root, 'weekly-error').hidden, true);
   assert.equal(section.getAttribute('aria-busy'), 'false');
+});
+
+test('created and completed are separate, labelled parts with their own totals (never one merged number)', async () => {
+  const { root } = await mountSummary();
+  const created = byRole(root, 'weekly-created');
+  const completed = byRole(root, 'weekly-completed');
+  assert.ok(created && completed && created !== completed, 'two parts');
+  assert.equal(created.tagName, 'SECTION');
+  assert.equal(completed.tagName, 'SECTION');
+  assert.equal(byId(root, created.getAttribute('aria-labelledby')).textContent, 'Created this week');
+  assert.equal(byId(root, completed.getAttribute('aria-labelledby')).textContent, 'Completed this week');
+  assert.match(created.textContent, /Counted by when each issue was created\./);
+  assert.match(completed.textContent, /Counted by recorded completion time\./);
+  assert.equal(text(root, 'weekly-total'), '4');
+  assert.equal(text(root, 'weekly-total-label'), 'issues created in this week');
+  assert.equal(text(root, 'weekly-completed-total'), '3', 'distinct issues with a completion in the week');
+  assert.equal(text(root, 'weekly-completed-total-label'), 'issues completed in this week');
+  assert.ok(elementsOf(created).includes(byRole(root, 'weekly-total')), 'the created total sits in the created part');
+  assert.ok(elementsOf(completed).includes(byRole(root, 'weekly-completed-total')), 'the completed total sits in the completed part');
+  assert.ok(!elementsOf(created).includes(byRole(root, 'weekly-completed-total')));
+  assert.ok(!elementsOf(root).some((el) => el.textContent === '7'), 'no element shows created + completed as one number');
+});
+
+test('repeat completions are shown apart; a reopened issue keeps its completion; origin and current priority are labelled', async () => {
+  const { root } = await mountSummary();
+  assert.deepEqual(shownCompleted(root), {
+    total: '3', repeat: '2', createdThisWeek: '2', createdEarlier: '1',
+    byPriority: { low: '1', normal: '0', high: '1', urgent: '1' },
+  });
+  assert.match(text(root, 'weekly-repeat-label'), /^extra completions of the same issues \(completed again after being reopened; not added to the count above\)$/);
+  // wk-0001 was completed this week and is open again now: it still counts.
+  assert.equal(countOf(root, 'completed-priority', 'urgent'), '1', 'the reopened urgent issue is still completed this week');
+  assert.equal(countOf(root, 'status', 'open'), '2', 'while the created part shows it at its current status');
+  const priorityHeading = byId(root, 'weekly-completed-priority-heading');
+  assert.equal(priorityHeading.textContent, 'By current priority (as stored now, not at completion)');
+  assert.equal(byId(root, 'weekly-origin-heading').textContent, 'When these issues were created');
+  assert.equal(byRole(root, 'weekly-completed-origin').getAttribute('aria-labelledby'), 'weekly-origin-heading');
+  assert.equal(byRole(root, 'weekly-by-completed-priority').getAttribute('aria-labelledby'), 'weekly-completed-priority-heading');
+  assert.match(byRole(root, 'weekly-completed').textContent, /An issue completed more than once in the week counts once; reopening later does not remove it\./);
+});
+
+test('one extra completion reads in the singular; none reads 0 explicitly', async () => {
+  const { root, app, reports } = await mountSummary();
+  const base = countReport(fixtureStore(), WEEK, fixtureHistory());
+  reports.next.push(async () => ({ ...base, completed: { ...base.completed, repeatCompletions: 1 } }));
+  await app.weekly.reload();
+  assert.equal(text(root, 'weekly-repeat'), '1');
+  assert.match(text(root, 'weekly-repeat-label'), /^extra completion of the same issues/);
+  reports.next.push(async () => ({ ...base, completed: { ...base.completed, repeatCompletions: 0 } }));
+  await app.weekly.reload();
+  assert.equal(text(root, 'weekly-repeat'), '0', 'a real zero from the server is shown as 0');
+});
+
+test('done issues without a recorded completion time are named as unknown and not placed in the week', async () => {
+  const { root } = await mountSummary();
+  const note = byRole(root, 'weekly-unknown');
+  assert.equal(note.hidden, false);
+  assert.equal(byId(root, 'weekly-unknown-heading').textContent, 'Completion time unknown');
+  assert.equal(text(root, 'weekly-unknown-text'), '1 done issue has no recorded completion time, so it is not counted in this or any other week.');
+  assert.ok(!elementsOf(byRole(root, 'weekly-completed')).includes(note), 'the unknown note is not part of the completed count');
+  assert.equal(text(root, 'weekly-completed-total'), '3', 'the legacy issue is not counted as completed this week');
+
+  // Several unknowns: plural. None: no note at all.
+  const many = await mountSummary({ issues: [...fixtureIssues(), { id: 'wk-0010', title: 'Legacy 2', description: '', status: 'done', priority: 'low', createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:00:00.000Z' }] });
+  assert.equal(text(many.root, 'weekly-unknown-text'), '2 done issues have no recorded completion time, so they are not counted in this or any other week.');
+  const none = await mountSummary({ issues: fixtureIssues().filter((i) => i.id !== 'wk-0009') });
+  assert.equal(byRole(none.root, 'weekly-unknown').hidden, true, 'no note when every done issue has a completion time');
+});
+
+test('the unknown-timing note is the same in every week (it is not tied to the selected week)', async () => {
+  const { root } = await mountSummary();
+  for (const target of ['weekly-prev', 'weekly-prev', 'weekly-next', 'weekly-next', 'weekly-next']) {
+    await byRole(root, target).dispatch('click');
+    await tick();
+    assert.equal(byRole(root, 'weekly-unknown').hidden, false);
+    assert.match(text(root, 'weekly-unknown-text'), /^1 done issue has no recorded completion time/);
+  }
+});
+
+test('completions on the week boundaries: the last millisecond is inside, the next Monday and the Sunday before are not', async () => {
+  const { root } = await mountSummary();
+  // wk-0007 (completed 2026-10-04T23:59:59.999Z, created earlier) is this week's only earlier-created completion.
+  assert.equal(text(root, 'weekly-completed-created-earlier'), '1');
+  assert.equal(countOf(root, 'completed-priority', 'high'), '1');
+  assert.equal(countOf(root, 'completed-priority', 'normal'), '0', 'wk-0008 completed just outside the week on both sides');
+  await byRole(root, 'weekly-prev').dispatch('click');
+  await tick();
+  assert.deepEqual(shownCompleted(root), { total: '1', repeat: '0', createdThisWeek: '0', createdEarlier: '1', byPriority: { low: '0', normal: '1', high: '0', urgent: '0' } },
+    'the Sunday-23:59 completion belongs to the week before');
+  await byRole(root, 'weekly-next').dispatch('click');
+  await byRole(root, 'weekly-next').dispatch('click');
+  await tick();
+  assert.equal(text(root, 'weekly-completed-total'), '1', 'the Monday-00:00 completion starts the next week');
+  assert.equal(countOf(root, 'completed-priority', 'normal'), '1');
 });
 
 test('a board mounted without a report source shows no summary and reads no report', async () => {
@@ -364,9 +553,18 @@ test('choosing a week reads that week; any day maps to its Monday; previous/next
   await byRole(root, 'weekly-prev').dispatch('click');
   await tick();
   assert.equal(reports.calls.at(-1), '2026-09-14');
-  assert.equal(byRole(root, 'weekly-status').textContent, 'No issues were created in this week.', 'an empty week says so');
-  assert.equal(byRole(root, 'weekly-result').hidden, true, 'no zero-filled distribution is shown for an empty week');
-  assert.match(byRole(root, 'announcer').textContent, /^No issues were created in the week of Mon 14 Sep 2026 to Sun 20 Sep 2026 \(UTC\)\.$/);
+  assert.equal(byRole(root, 'weekly-result').hidden, false, 'an empty week still shows both parts');
+  assert.equal(byRole(root, 'weekly-created-empty').hidden, false);
+  assert.equal(text(root, 'weekly-created-empty'), 'No issues were created in this week.', 'an empty week says so');
+  assert.equal(byRole(root, 'weekly-created-details').hidden, true, 'no zero-filled distribution is shown for an empty week');
+  assert.equal(byRole(root, 'weekly-completed-empty').hidden, false);
+  assert.equal(text(root, 'weekly-completed-empty'), 'No issues have a recorded completion in this week.');
+  assert.equal(byRole(root, 'weekly-completed-details').hidden, true);
+  assert.equal(text(root, 'weekly-total'), '0');
+  assert.equal(text(root, 'weekly-completed-total'), '0');
+  assert.equal(byRole(root, 'weekly-status').hidden, true, 'no loading or error line');
+  assert.equal(byRole(root, 'announcer').textContent,
+    'Week of Mon 14 Sep 2026 to Sun 20 Sep 2026 (UTC). No issues were created. No issues have a recorded completion. 1 done issue has no recorded completion time, so it is not counted in this or any other week.');
 
   await byRole(root, 'weekly-next').dispatch('click');
   await byRole(root, 'weekly-next').dispatch('click');
@@ -382,7 +580,10 @@ test('choosing a week reads that week; any day maps to its Monday; previous/next
   await byRole(root, 'weekly-this').dispatch('click');
   await tick();
   assert.equal(reports.calls.at(-1), WEEK, 'This week returns to the current UTC week');
-  assert.match(byRole(root, 'announcer').textContent, /^4 issues created in the week of .*Status: Open 2, In progress 1, Done 1\. Priority: Low 1, Normal 1, High 1, Urgent 1\.$/);
+  assert.equal(byRole(root, 'announcer').textContent,
+    'Week of Mon 28 Sep 2026 to Sun 4 Oct 2026 (UTC). 4 issues created. Status: Open 2, In progress 1, Done 1. Priority: Low 1, Normal 1, High 1, Urgent 1. '
+    + '3 issues completed, plus 2 extra completions of the same issues. Created this week 2, earlier 1. Current priority: Low 1, Normal 0, High 1, Urgent 1. '
+    + '1 done issue has no recorded completion time, so it is not counted in this or any other week.');
 
   const count = reports.calls.length;
   week.value = '2026-10-02'; // another day of the week already shown
@@ -430,6 +631,9 @@ test('board changes refresh the selected week without touching drafts or filters
   await move.dispatch('change');
   await app.weekly.idle();
   assert.deepEqual(shownCounts(root).byStatus, { open: '1', in_progress: '1', done: '2' }, 'counts use the current status');
+  assert.equal(text(root, 'weekly-completed-total'), '4', 'the new completion is read back from the server');
+  assert.equal(text(root, 'weekly-completed-created-this-week'), '3');
+  assert.equal(text(root, 'weekly-repeat'), '2');
 
   // Edit dialog save.
   const edit = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-edit' && el.getAttribute('data-issue-id') === 'wk-0002');
@@ -475,6 +679,7 @@ test('loading shows a busy state; a reply for an older week never replaces a new
   await tick(5);
   assert.equal(byRole(root, 'weekly-week').value, WEEK, 'the stale reply does not move the picker');
   assert.equal(byRole(root, 'weekly-total').textContent, '4', 'the stale reply does not replace the counts');
+  assert.equal(text(root, 'weekly-completed-total'), '3', 'nor the completed counts');
   assert.equal(section.getAttribute('aria-busy'), 'false');
 });
 
@@ -501,7 +706,7 @@ test('a failed read is recoverable: clear message, Retry, board untouched, focus
   assert.equal(doc.activeElement, byRole(root, 'weekly-heading'), 'focus moves from the hidden Retry to the summary heading');
   assert.equal(byRole(root, 'weekly-heading').getAttribute('tabindex'), '-1');
   assert.equal(byRole(root, 'weekly-total').textContent, '1', 'the retried week is shown');
-  assert.match(byRole(root, 'announcer').textContent, /^1 issue created in the week of Mon 21 Sep 2026/);
+  assert.match(byRole(root, 'announcer').textContent, /^Week of Mon 21 Sep 2026 to Sun 27 Sep 2026 \(UTC\)\. 1 issue created\./);
 });
 
 test('a failed refresh keeps the last counts for the same week and says so', async () => {
@@ -513,15 +718,59 @@ test('a failed refresh keeps the last counts for the same week and says so', asy
   assert.match(byRole(root, 'weekly-error-text').textContent, /The connection to the server failed\. Showing the last summary that loaded for this week\./);
   assert.equal(byRole(root, 'weekly-result').hidden, false, 'the last counts for this same week stay visible');
   assert.equal(byRole(root, 'weekly-total').textContent, '4');
+  assert.equal(text(root, 'weekly-completed-total'), '3');
 });
 
 test('a malformed report is a read failure, not wrong numbers', async () => {
   const { root, reports, app } = await mountSummary();
-  reports.next.push(async (week) => ({ schemaVersion: 1, weekStart: week, weekEndExclusive: addUtcDays(week, 7), created: { total: 3, byStatus: { open: 3 }, byPriority: {} } }));
+  reports.next.push(async (week) => ({ ...emptyReport(week), created: { total: 3, byStatus: { open: 3 }, byPriority: {} } }));
   await app.weekly.reload();
   assert.equal(byRole(root, 'weekly-error').hidden, false);
   assert.match(byRole(root, 'weekly-error-text').textContent, /could not read/);
   assert.equal(byRole(root, 'weekly-total').textContent, '4', 'the earlier valid counts are not replaced by a malformed reply');
+  assert.equal(text(root, 'weekly-completed-total'), '3');
+});
+
+test('a version-1 reply from any report source is an explicit error, with no made-up completion zeros', async () => {
+  const { root, reports, app } = await mountSummary();
+  const v1 = (week) => ({ schemaVersion: 1, weekStart: week, weekEndExclusive: addUtcDays(week, 7),
+    created: { total: 1, byStatus: { open: 1, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 1, high: 0, urgent: 0 } } });
+  // Same week (a refresh): the error is shown and the last version-2 counts stay, labelled as such.
+  reports.next.push(async (week) => v1(week));
+  await app.weekly.reload();
+  assert.equal(byRole(root, 'weekly-error').hidden, false);
+  assert.match(text(root, 'weekly-error-text'), /^Could not load the weekly summary: The server sent an older weekly report \(version 1\) without completion data, so completed counts cannot be shown\. Showing the last summary that loaded for this week\.$/);
+  assert.equal(text(root, 'weekly-total'), '4', 'the version-1 created count did not replace anything');
+  // Another week: nothing from the version-1 reply is shown at all.
+  reports.next.push(async (week) => v1(week));
+  await byRole(root, 'weekly-prev').dispatch('click');
+  await app.weekly.idle();
+  assert.equal(byRole(root, 'weekly-result').hidden, true, 'no counts, and no completed zeros, for a version-1 week');
+  assert.equal(text(root, 'weekly-status'), 'The summary for this week is not available right now.');
+  assert.equal(byRole(root, 'weekly-retry').hidden, false);
+  // Retry once the server answers version 2.
+  await byRole(root, 'weekly-retry').dispatch('click');
+  await app.weekly.idle();
+  assert.equal(byRole(root, 'weekly-error').hidden, true);
+  assert.equal(text(root, 'weekly-completed-total'), '1');
+});
+
+test('reopening keeps the past completion; completing again adds one extra completion, not a new issue', async () => {
+  const { root, app, history } = await mountSummary();
+  const move = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-status' && el.getAttribute('data-issue-id') === 'wk-0004');
+  move.value = 'open';
+  await move.dispatch('change');
+  await app.weekly.idle();
+  assert.equal(countOf(root, 'status', 'done'), '0', 'the created part shows the reopened issue as open now');
+  assert.deepEqual(shownCompleted(root), { total: '3', repeat: '2', createdThisWeek: '2', createdEarlier: '1', byPriority: { low: '1', normal: '0', high: '1', urgent: '1' } },
+    'reopening does not remove the completion from the week');
+  const again = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-status' && el.getAttribute('data-issue-id') === 'wk-0004');
+  again.value = 'done';
+  await again.dispatch('change');
+  await app.weekly.idle();
+  assert.equal(history.get('wk-0004').length, 4, 'the stub server recorded one more event');
+  assert.equal(text(root, 'weekly-completed-total'), '3', 'the same issue still counts once');
+  assert.equal(text(root, 'weekly-repeat'), '3', 'the extra completion is shown apart');
 });
 
 test('distribution bars are decorative and sized from the counts; counts are plain text', async () => {
@@ -529,11 +778,13 @@ test('distribution bars are decorative and sized from the counts; counts are pla
   const status = byRole(root, 'weekly-status-open');
   assert.equal(status.textContent, '2');
   const tracks = elementsOf(byRole(root, 'weekly')).filter((el) => el.className === 'weekly-track');
-  assert.equal(tracks.length, STATUSES.length + PRIORITIES.length);
+  assert.equal(tracks.length, STATUSES.length + PRIORITIES.length + PRIORITIES.length);
   assert.ok(tracks.every((el) => el.getAttribute('aria-hidden') === 'true'));
   const openBar = tracks[0].children[0];
   assert.equal(openBar.style.width, '50%');
-  const lists = ['weekly-by-status', 'weekly-by-priority'].map((role) => elementsOf(byRole(root, 'weekly')).find((el) => el.tagName === 'UL' && el.getAttribute('data-role') === role));
+  const completedBars = elementsOf(byRole(root, 'weekly-by-completed-priority')).filter((el) => el.className.startsWith('weekly-bar '));
+  assert.deepEqual(completedBars.map((el) => el.style.width), ['33%', '0%', '33%', '33%'], 'completed bars are sized from the completed total');
+  const lists = ['weekly-by-status', 'weekly-by-priority', 'weekly-by-completed-priority', 'weekly-completed-origin'].map((role) => elementsOf(byRole(root, 'weekly')).find((el) => el.tagName === 'UL' && el.getAttribute('data-role') === role));
   assert.ok(lists.every((ul) => ul && ul.getAttribute('aria-labelledby')), 'each distribution list is labelled by its heading');
 });
 
@@ -623,8 +874,7 @@ test('week normalization keeps low years and names no week outside four-digit ye
 });
 
 test('a report for a low-year week is accepted when it echoes that week; unsupported weeks never are', async () => {
-  const empty = (weekStart, weekEndExclusive) => ({ schemaVersion: 1, weekStart, weekEndExclusive,
-    created: { total: 0, byStatus: { open: 0, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 } } });
+  const empty = emptyReport;
   assert.equal(isValidWeeklyReport(empty('0099-01-05', '0099-01-12'), '0099-01-05'), true);
   assert.equal(isValidWeeklyReport(empty('0100-01-04', '0100-01-11'), '0100-01-04'), true);
   assert.equal(isValidWeeklyReport(empty('0999-01-07', '0999-01-14'), '0999-01-07'), true);
@@ -661,7 +911,7 @@ test('picking low-year days reads those weeks and shows four-digit labels', asyn
     assert.equal(week.value, monday);
     assert.equal(byRole(root, 'weekly-range').textContent, label);
     assert.equal(byRole(root, 'weekly-error').hidden, true, 'the low-year report is shown, not rejected');
-    assert.match(byRole(root, 'weekly-status').textContent, /No issues were created in this week/);
+    assert.equal(byRole(root, 'weekly-created-empty').hidden, false, 'an empty low-year week says so');
   }
   // Previous/Next cross the 0099/0100 year end by whole weeks.
   week.value = '0099-12-30';

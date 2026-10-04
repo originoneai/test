@@ -261,7 +261,7 @@ test('legacy journey: the adapter reads a legacy board as Normal and its first s
     for (const issue of raw.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        SEVEN_FIELDS,
+        ['completions', ...SEVEN_FIELDS],
         'the adapter save upgraded every record in one write',
       );
     }

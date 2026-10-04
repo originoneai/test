@@ -18,6 +18,8 @@ import {
   matchesSubmitted, mountApp, validateIssueInput,
 } from '../public/app.js';
 
+const EIGHT_FIELDS = ['completions', 'createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'];
+
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
 
 // ---------------------------------------------------------------------------
@@ -879,8 +881,8 @@ test('a board mounted over a live legacy file renders Normal cards, filters them
     for (const issue of raw.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
-        'the card change upgraded every record to the seven-field shape',
+        EIGHT_FIELDS,
+        'the card change upgraded every record to the eight-field shape',
       );
     }
     assert.equal(raw.issues.find((issue) => issue.id === LEGACY_UI_ID_A).priority, 'high');

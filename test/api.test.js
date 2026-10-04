@@ -535,14 +535,15 @@ test('a store file with valid legacy records stays fully usable', async () => {
       const stored = JSON.parse(await readFile(storePath, 'utf8'));
       assert.equal(stored.issues.length, 3);
       // With legacy support, a successful mutation persists every record in
-      // the seven-field shape and the two legacy records read back as
-      // 'normal'; before that support exists the test fails earlier, at the
-      // list above.
+      // the current eight-field shape (priority plus the empty completion
+      // history) and the two legacy records read back as 'normal'; before
+      // that support exists the test fails earlier, at the list above.
       for (const issue of stored.issues) {
         assert.deepEqual(
           Object.keys(issue).sort(),
-          ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+          ['completions', 'createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
         );
+        assert.deepEqual(issue.completions, [], 'no events are invented during the upgrade');
       }
       assert.equal(stored.issues[0].priority, 'normal', 'legacy records upgrade to normal');
       assert.equal(stored.issues[1].priority, 'normal', 'untouched legacy records upgrade on the same write');
@@ -797,4 +798,38 @@ test('unknown-outcome saves are recovered by refresh-and-compare, never blind re
 process.on('exit', () => {
   resetApiStore();
   delete process.env.DATA_DIR;
+});
+
+test('completion history is server-owned: never accepted, never returned', async () => {
+  await withTracker(async (tracker) => {
+    const forgedCreate = await tracker.postIssue('Forgery', undefined);
+    assert.equal(forgedCreate.status, 201);
+    const id = forgedCreate.body.id;
+
+    const withHistory = await tracker.request('/api/issues', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Carry history', completions: ['2020-01-01T00:00:00Z'] }),
+    });
+    assert.equal(withHistory.status, 400);
+    assert.equal(withHistory.body.error.code, 'VALIDATION_ERROR');
+
+    const patchHistory = await tracker.patchIssue(id, { completions: [] });
+    assert.equal(patchHistory.status, 400);
+    assert.equal(patchHistory.body.error.code, 'VALIDATION_ERROR');
+
+    // A real completion transition works and stays invisible on the resource.
+    const done = await tracker.patchIssue(id, { status: 'done' });
+    assert.equal(done.status, 200);
+    assert.deepEqual(
+      Object.keys(done.body).sort(),
+      ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+      'the issue resource keeps exactly the seven public fields',
+    );
+    const listed = await tracker.list();
+    assert.deepEqual(
+      Object.keys(listed.body.items[0]).sort(),
+      ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+    );
+  });
 });

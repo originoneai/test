@@ -36,7 +36,10 @@ operational detail an integrating client needs.
 | `createdAt` / `updatedAt` | ISO UTC (`Z`) instants taken from the server's wall clock. `createdAt` never changes. `updatedAt` is regenerated at each accepted update: usually later, but **not guaranteed to advance** — same-millisecond updates can tie and a clock rollback can set it earlier. Do not use it for ordering or conflict detection. |
 
 Exactly these seven fields are ever returned; unknown fields in input are
-rejected, so a client can detect its own typos.
+rejected, so a client can detect its own typos. The server additionally keeps
+an internal append-only `completions` history per issue (see storage below);
+it is not part of the issue resource and reaches clients only through the
+weekly report.
 
 ## Endpoints
 
@@ -66,9 +69,11 @@ Response `200` with the updated issue, or `404` if the id is unknown.
 
 ### `GET /api/reports/weekly`
 
-Weekly intake summary behind the board's Weekly overview section. It is a pure
-read over the same committed data: it never mutates the store, and it is
-independent of any `GET /api/issues` filter the client may hold.
+Weekly summary behind the board's Weekly overview section: the week's intake
+(`created`) and the week's throughput (`completed`) as **two independent
+statistics — they are never merged into one number**. It is a pure read over
+the same committed data: it never mutates the store, and it is independent of
+any `GET /api/issues` filter the client may hold.
 
 Query parameters — at most one, `weekStart`:
 
@@ -80,32 +85,56 @@ Query parameters — at most one, `weekStart`:
 - Unknown parameter names, repeats, impossible dates (`2026-02-30`),
   non-ISO forms (`2026-9-28`) and non-Mondays → `400 VALIDATION_ERROR`.
 
-Response `200` (empty-week example; all enum keys are always present, zeros
+Response `200` (empty example; all enum keys are always present, zeros
 included):
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "weekStart": "2026-09-28",
   "weekEndExclusive": "2026-10-05",
   "created": {
     "total": 0,
     "byStatus": { "open": 0, "in_progress": 0, "done": 0 },
     "byPriority": { "low": 0, "normal": 0, "high": 0, "urgent": 0 }
-  }
+  },
+  "completed": {
+    "total": 0,
+    "byPriority": { "low": 0, "normal": 0, "high": 0, "urgent": 0 },
+    "createdThisWeek": 0,
+    "createdEarlier": 0,
+    "repeatCompletions": 0
+  },
+  "completedTimingUnknown": 0
 }
 ```
 
 Semantics a client must rely on:
 
-- `created.total` counts exactly the issues whose immutable `createdAt` falls
-  inside `[weekStart, weekEndExclusive)`; `weekEndExclusive` itself is outside.
-- `byStatus` / `byPriority` tally those same issues with the status and
-  priority **stored right now**. Editing or re-prioritizing an issue moves it
-  between buckets on the next report read — the report is a current-state
-  snapshot of that week's intake, not a historical completion timeline.
-- `updatedAt` is not used anywhere: there is no completed-at history to
-  approximate from it.
+- `created` is the intake statistic and keeps its original meaning exactly:
+  it counts the issues whose immutable `createdAt` falls inside
+  `[weekStart, weekEndExclusive)`, tallying them with the status and priority
+  **stored right now**. `weekEndExclusive` itself is outside.
+- `completed` is the throughput statistic, derived from the server-recorded
+  append-only completion history (see storage below):
+  - `total` counts each issue **once** in every week that contains at least
+    one of its completion events — including issues created in earlier weeks,
+    and **regardless of the issue's current status**: reopening an issue never
+    removes the credit for the week it was really completed in.
+  - `byPriority` buckets those same issues by their **currently stored
+    priority** (a re-prioritized issue moves buckets on the next read).
+  - `createdThisWeek` / `createdEarlier` partition those distinct issues by
+    their known `createdAt` (inside the selected week or not).
+  - `repeatCompletions` counts the extra same-week events of issues already
+    counted once (complete → reopen → complete again within one week adds 1);
+    it is never folded into `total`.
+- `completedTimingUnknown` counts issues that are currently `done` but have
+  **no recorded completion event** — issues that were already done before
+  completion history existed. Their timing is genuinely unknown: it is never
+  inferred or backfilled from `createdAt` or `updatedAt`, they belong to no
+  week, and the count is independent of the selected week. A later real
+  transition out of and back into `done` records only its actual event.
+- `updatedAt` is not used anywhere in the report.
 - On an unavailable or corrupt store the report answers `500 STORAGE_ERROR`
   like every other endpoint and leaves the file untouched; recovery is manual
   as described below.
@@ -220,11 +249,42 @@ fix or remove it, restart.
 }
 ```
 
+Each record carries exactly the seven public fields plus the server-owned
+`completions` list: an append-only history of ISO UTC instants, one appended
+**atomically with the accepting mutation** whenever an issue arrives in
+`done` — created directly as `done`, or accepted as a transition from another
+status. Staying `done`, or editing title/description/priority, appends
+nothing. Reopening (`done` → any other status) never removes or rewrites past
+events; completing again appends a new event. Clients cannot supply, edit or
+erase the list: `completions` is rejected as an unknown field on every input,
+and it never appears in an issue response — it surfaces only through the
+weekly report.
+
 The format is intentionally strict (exact fields, UUID ids, enum status, ISO
 UTC timestamps, no extra keys): a hand-edited file is either fully valid or
 the server refuses it as corrupt. Backups can be made by copying the file
 while the server is stopped, or at any time — a snapshot mid-rename can never
 be torn because of the atomic write.
+
+**Compatible shapes and migration.** The loader accepts three exact record
+shapes: the current eight-field form (with `completions`), the pre-completions
+seven-field form (with `priority`), and the pre-priority six-field legacy
+form. Records without a `completions` list read as *no recorded events* while
+keeping every stored value untouched — for an issue that is already `done`
+that is precisely the "completion time unknown" state the report exposes, and
+no event is ever invented for it. Older records are upgraded on disk only by
+the next successful write, which rewrites the whole snapshot atomically and
+adds an explicit empty `completions` list to each of them; reads never modify
+the file.
+
+**Rollback limits.** The upgrade is one-way on disk: a server from before
+completion history existed refuses a store containing `completions` fields as
+corrupt (its loader knows only the older shapes). Rolling the software back
+therefore requires restoring a backup taken before the upgrade, or manually
+removing the `completions` lists from every record — which discards recorded
+history and reverts recorded completions to "unknown timing". The events
+themselves are real server-clock instants; nothing is reconstructed after the
+fact.
 
 ## Integration notes for the board
 
@@ -258,7 +318,14 @@ exclusively — there is no fixture mode and no offline fallback:
   default, `[weekStart, weekEndExclusive)` boundaries with current
   status/priority tallying, legacy records, validation and 405 handling,
   low-year and upper-boundary week formatting, corrupt-store refusal without
-  rewrite, and read-only behavior next to the issue APIs.
+  rewrite, and read-only behavior next to the issue APIs. The V2 additions
+  cover distinct-versus-repeat completion counts, reopened tasks, the
+  created/completed partitions, the current-priority basis, unknown legacy
+  timing and completion-event boundaries.
+- `test/completion-history.test.js` — the completion history itself:
+  creation directly as done, transitions into and out of done, repeated
+  completion, unchanged-done edits, client-forged history, process reload,
+  corrupt data, failed writes and the legacy upgrade path.
 - `test/storage.test.js` — the store directly: on-disk format, reload,
   corruption refusal, write guards with boundary acceptance, serialization,
   failed-write recovery.

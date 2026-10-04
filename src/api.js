@@ -52,6 +52,14 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+// The issue resource is exactly the seven public fields; the server-internal
+// completion history never leaves through an issue response, only through the
+// weekly report.
+function toIssueResource(issue) {
+  const { completions, ...resource } = issue;
+  return resource;
+}
+
 // Never interpolate client-supplied values into strings directly: objects can
 // carry a null/hostile toString and implicit conversion throws (observed as a
 // 500 for status {"toString": null}). JSON.stringify cannot invoke it.
@@ -230,25 +238,64 @@ async function weeklyReport(searchParams, res) {
     }
   }
   const endMs = startMs + WEEK_DAYS * DAY_MS;
-  // Counts describe the current state of that week's intake: an issue belongs
-  // to the week its immutable createdAt falls in, but is tallied with the
-  // status and priority stored right now. updatedAt is irrelevant.
+  // Two independent statistics over the same committed snapshot. `created`
+  // describes the week's intake: an issue belongs to the week its immutable
+  // createdAt falls in, tallied with the status and priority stored right
+  // now. `completed` describes the week's throughput: an issue counts once in
+  // every week that holds at least one of its recorded completion events —
+  // regardless of its current status, so reopened work keeps the credit for
+  // the week it was really done — with extra same-week events counted
+  // separately and the priority bucket following the currently stored value.
   const items = await getStore().list();
   const byStatus = { open: 0, in_progress: 0, done: 0 };
   const byPriority = { low: 0, normal: 0, high: 0, urgent: 0 };
+  const completedByPriority = { low: 0, normal: 0, high: 0, urgent: 0 };
   let total = 0;
+  let completedTotal = 0;
+  let createdThisWeek = 0;
+  let createdEarlier = 0;
+  let repeatCompletions = 0;
+  let completedTimingUnknown = 0;
   for (const issue of items) {
     const createdMs = Date.parse(issue.createdAt);
-    if (createdMs < startMs || createdMs >= endMs) continue;
-    byStatus[issue.status] += 1;
-    byPriority[issue.priority] += 1;
-    total += 1;
+    const createdInWeek = createdMs >= startMs && createdMs < endMs;
+    if (createdInWeek) {
+      byStatus[issue.status] += 1;
+      byPriority[issue.priority] += 1;
+      total += 1;
+    }
+    const eventsInWeek = issue.completions.reduce(
+      (count, event) => {
+        const eventMs = Date.parse(event);
+        return eventMs >= startMs && eventMs < endMs ? count + 1 : count;
+      },
+      0,
+    );
+    if (eventsInWeek > 0) {
+      completedTotal += 1;
+      completedByPriority[issue.priority] += 1;
+      // A partition by the known createdAt: created inside the week, or not.
+      if (createdInWeek) createdThisWeek += 1;
+      else createdEarlier += 1;
+      repeatCompletions += eventsInWeek - 1;
+    }
+    // Done with no recorded event anywhere: the pre-history legacy case. It
+    // belongs to no week and is reported as unknown regardless of selection.
+    if (issue.status === 'done' && issue.completions.length === 0) completedTimingUnknown += 1;
   }
   sendJson(res, 200, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     weekStart: formatIsoDate(startMs),
     weekEndExclusive: formatIsoDate(endMs),
     created: { total, byStatus, byPriority },
+    completed: {
+      total: completedTotal,
+      byPriority: completedByPriority,
+      createdThisWeek,
+      createdEarlier,
+      repeatCompletions,
+    },
+    completedTimingUnknown,
   });
 }
 
@@ -269,7 +316,7 @@ async function listIssues(searchParams, res) {
     priority: priority || undefined,
     query: query === null ? undefined : query,
   });
-  sendJson(res, 200, { items });
+  sendJson(res, 200, { items: items.map(toIssueResource) });
 }
 
 async function createIssue(req, res) {
@@ -309,7 +356,7 @@ async function createIssue(req, res) {
     priority = body.priority;
   }
   const issue = await getStore().create({ title: body.title.trim(), description, priority });
-  sendJson(res, 201, issue);
+  sendJson(res, 201, toIssueResource(issue));
 }
 
 async function updateIssue(req, res, id) {
@@ -363,7 +410,7 @@ async function updateIssue(req, res, id) {
     sendError(res, 404, 'NOT_FOUND', `No issue with id ${displayValue(id)}.`);
     return;
   }
-  sendJson(res, 200, updated);
+  sendJson(res, 200, toIssueResource(updated));
 }
 
 export async function handleApi(req, res) {
