@@ -13,6 +13,7 @@ import { createServer } from '../src/server.js';
 import { resetApiStore } from '../src/api.js';
 
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+const EIGHT_FIELDS = ['completions', 'createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'];
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const BODY_LIMIT = 16 * 1024;
 
@@ -310,7 +311,7 @@ test('priority persists across a restart in fresh data', async () => {
     for (const issue of raw.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+        EIGHT_FIELDS,
       );
     }
 
@@ -438,8 +439,8 @@ test('the first HTTP save upgrades the legacy file and the upgrade survives a re
     for (const issue of stored.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
-        'the successful save upgraded every record to the seven-field shape',
+        EIGHT_FIELDS,
+        'the successful save upgraded every record to the eight-field shape',
       );
     }
     const untouched = stored.issues.find((issue) => issue.id === LEGACY_API_ID_A);

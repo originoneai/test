@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { IssueStore, StoreError } from '../src/store.js';
 
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+const EIGHT_FIELDS = ['completions', 'createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'];
 const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 
 const storePathOf = (dir) => join(dir, 'issues.json');
@@ -39,7 +40,7 @@ const priorityRecord = (overrides = {}) =>
     ...overrides,
   });
 
-test('create writes the seven-field contract shape with the given priority', async () => {
+test('create writes the eight-field contract shape with the given priority', async () => {
   await withDir(async (dir) => {
     const store = new IssueStore(dir);
     const first = await store.create({ title: 'First', priority: 'urgent' });
@@ -56,7 +57,7 @@ test('create writes the seven-field contract shape with the given priority', asy
     for (const issue of stored.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+        EIGHT_FIELDS,
       );
     }
     assert.equal(stored.issues[0].priority, 'urgent');
@@ -331,8 +332,8 @@ test('the next successful write upgrades every legacy record atomically and keep
     for (const issue of stored.issues) {
       assert.deepEqual(
         Object.keys(issue).sort(),
-        ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
-        'every record now persists in the seven-field shape',
+        EIGHT_FIELDS,
+        'every record now persists in the eight-field shape',
       );
     }
     assert.deepEqual(
@@ -345,7 +346,7 @@ test('the next successful write upgrades every legacy record atomically and keep
     assert.equal(untouched.updatedAt, '2024-02-29T09:30:00.250Z', 'the migration never bumps updatedAt');
     assert.equal(untouched.title, 'Legacy triage card', 'and keeps its content');
 
-    // The upgrade is durable: a fresh instance serves the seven-field file.
+    // The upgrade is durable: a fresh instance serves the eight-field file.
     const reloaded = new IssueStore(dir);
     assert.deepEqual(
       (await reloaded.list({ priority: 'normal' })).map((issue) => issue.id),
@@ -388,7 +389,7 @@ test('a failed write against a legacy file leaves it byte-identical and still us
     const stored = JSON.parse(await readFile(storePathOf(dir), 'utf8'));
     assert.deepEqual(
       Object.keys(stored.issues[0]).sort(),
-      ['createdAt', 'description', 'id', 'priority', 'status', 'title', 'updatedAt'],
+      EIGHT_FIELDS,
       'the first successful write after the failure performs the upgrade',
     );
     assert.equal(stored.issues[0].priority, 'high', 'the chosen priority wins over the normal default');
