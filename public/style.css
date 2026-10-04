@@ -258,3 +258,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
   .sidebar { max-height: calc(100vh - 32px); overflow-y: auto; }
   .board { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; }
 }
+
+/* Historical CSV import panel */
+.import-panel { margin-top: 24px; padding: 16px; background: var(--white); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.import-panel h2 { margin: 0 0 8px; font-size: 1.125rem; }
+.import-panel .hint { margin: 0 0 12px; color: var(--muted); font-size: 0.875rem; }
+.import-panel label { display: block; font-weight: 600; margin-bottom: 4px; }
+.import-panel table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.875rem; }
+.import-panel th, .import-panel td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.import-panel .import-description { white-space: pre-wrap; overflow-wrap: anywhere; }
+.import-panel tr.has-error td { background: var(--danger-bg); }
+.import-panel [role="alert"] p { margin: 4px 0; color: var(--danger); }
+.import-actions { display: flex; gap: 8px; }

@@ -25,6 +25,13 @@
 // because rewriting them would fabricate history. Copies handed out (list,
 // create and update results) duplicate every event object so no caller can
 // mutate a stored snapshot through a reference.
+// Historical CSV imports (specs/historical-issue-import.md) add an optional
+// top-level "imports" list of {importKey, digest, createdAt, issueIds}
+// records. A batch of issues and its import record are published in ONE
+// atomic write, so a batch is either fully stored with its record or not at
+// all, and a retried commit finds the record instead of creating duplicates.
+// The list is written only once it is non-empty, so a store that never
+// imported anything keeps the original exact {"issues": [...]} format.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -46,6 +53,12 @@ const ISO_UTC_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)
 // stored (or to-be-persisted) history through a reference.
 function copyCompletions(events) {
   return events.map((event) => (typeof event === 'string' ? event : { at: event.at, priority: event.priority }));
+}
+
+const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+function copyImport(record) {
+  return { importKey: record.importKey, digest: record.digest, createdAt: record.createdAt, issueIds: record.issueIds.slice() };
 }
 
 function isPlainObject(value) {
@@ -130,6 +143,7 @@ export class IssueStore {
     this.dataDir = resolve(dataDir);
     this.storePath = join(this.dataDir, STORE_FILENAME);
     this.issues = []; // last published (durable) snapshot, in creation order
+    this.imports = []; // last published import records, in commit order
     this.loaded = false;
     this.loadPromise = null; // shared so concurrent first touches load exactly once
     this.writeQueue = Promise.resolve();
@@ -174,7 +188,7 @@ export class IssueStore {
         completions: status === 'done' ? [{ at: now, priority }] : [],
       };
       const candidate = [...this.issues, issue];
-      await this.#persist(candidate);
+      await this.#persist(candidate, this.imports);
       this.issues = candidate;
       return { ...issue, completions: copyCompletions(issue.completions) };
     });
@@ -210,9 +224,65 @@ export class IssueStore {
       }
       const candidate = this.issues.slice();
       candidate[index] = updated;
-      await this.#persist(candidate);
+      await this.#persist(candidate, this.imports);
       this.issues = candidate;
       return { ...updated, completions: copyCompletions(updated.completions) };
+    });
+  }
+
+  async getImport(importKey) {
+    await this.#ensureLoaded();
+    const record = this.imports.find((candidate) => candidate.importKey === String(importKey).toLowerCase());
+    return record ? copyImport(record) : null;
+  }
+
+  // Commits a whole, already-validated batch atomically. The same importKey
+  // with the same digest returns the stored record (replayed: true) and writes
+  // nothing; the same key with a different digest is refused. Ids, timestamps
+  // and completion snapshots are server-owned; issues arriving as done get the
+  // same {at, priority} completion snapshot as a create in 'done'.
+  async importBatch(importKey, digest, rows) {
+    return this.#enqueue(async () => {
+      await this.#ensureLoaded();
+      if (typeof importKey !== 'string' || !UUID_PATTERN.test(importKey)) throw writeGuard('importKey must be a UUID.');
+      if (typeof digest !== 'string' || !DIGEST_PATTERN.test(digest)) throw writeGuard('digest must be a sha256 hex string.');
+      const key = importKey.toLowerCase();
+      const existing = this.imports.find((candidate) => candidate.importKey === key);
+      if (existing) {
+        if (existing.digest !== digest) {
+          const err = new StoreError('This import key was already used for a different file.');
+          err.code = 'IMPORT_CONFLICT';
+          throw err;
+        }
+        return { replayed: true, record: copyImport(existing) };
+      }
+      if (!Array.isArray(rows) || rows.length < 1) throw writeGuard('an import needs at least one issue.');
+      const now = new Date().toISOString();
+      const created = rows.map((row) => {
+        const keys = Object.keys(row).sort().join(',');
+        if (keys !== 'description,priority,status,title') throw writeGuard('imported rows carry only title, description, status and priority.');
+        guardTitle(row.title);
+        guardDescription(row.description);
+        guardStatus(row.status);
+        guardPriority(row.priority);
+        return {
+          id: randomUUID(),
+          title: row.title,
+          description: row.description,
+          status: row.status,
+          priority: row.priority,
+          createdAt: now,
+          updatedAt: now,
+          completions: row.status === 'done' ? [{ at: now, priority: row.priority }] : [],
+        };
+      });
+      const record = { importKey: key, digest, createdAt: now, issueIds: created.map((issue) => issue.id) };
+      const issues = [...this.issues, ...created];
+      const imports = [...this.imports, record];
+      await this.#persist(issues, imports);
+      this.issues = issues;
+      this.imports = imports;
+      return { replayed: false, record: copyImport(record) };
     });
   }
 
@@ -241,11 +311,14 @@ export class IssueStore {
     } catch (err) {
       if (err.code === 'ENOENT') {
         this.issues = [];
+        this.imports = [];
         return;
       }
       throw new StoreError(`Cannot read issue store ${this.storePath}: ${err.message}`);
     }
-    this.issues = this.#parseStore(raw);
+    const { issues, imports } = this.#parseStore(raw);
+    this.issues = issues;
+    this.imports = imports;
   }
 
   // A store file is only trusted when every record matches the data contract
@@ -269,8 +342,9 @@ export class IssueStore {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw refuse('expected an object like {"issues": [...]}');
     }
-    if (Object.keys(parsed).join(',') !== 'issues' || !Array.isArray(parsed.issues)) {
-      throw refuse('expected exactly one top-level field "issues" holding an array');
+    const topKeys = Object.keys(parsed).sort().join(',');
+    if ((topKeys !== 'issues' && topKeys !== 'imports,issues') || !Array.isArray(parsed.issues)) {
+      throw refuse('expected exactly the top-level field "issues" holding an array, optionally with "imports"');
     }
     const seenIds = new Set();
     const issues = [];
@@ -337,7 +411,33 @@ export class IssueStore {
         ...(legacy ? { completions: [] } : { completions: copyCompletions(issue.completions) }),
       });
     }
-    return issues;
+    const imports = [];
+    if ('imports' in parsed) {
+      if (!Array.isArray(parsed.imports)) throw refuse('"imports" must be an array.');
+      const seenKeys = new Set();
+      const claimed = new Set();
+      for (const [index, record] of parsed.imports.entries()) {
+        if (!isPlainObject(record) || Object.keys(record).sort().join(',') !== 'createdAt,digest,importKey,issueIds') {
+          throw refuse(`import ${index} must have exactly the fields importKey, digest, createdAt, issueIds.`);
+        }
+        if (typeof record.importKey !== 'string' || !UUID_PATTERN.test(record.importKey) || record.importKey !== record.importKey.toLowerCase()) {
+          throw refuse(`import ${index} importKey is not a lowercase UUID.`);
+        }
+        if (seenKeys.has(record.importKey)) throw refuse(`import ${index} repeats an earlier importKey.`);
+        seenKeys.add(record.importKey);
+        if (typeof record.digest !== 'string' || !DIGEST_PATTERN.test(record.digest)) throw refuse(`import ${index} digest is not sha256 hex.`);
+        if (!isValidIsoUtc(record.createdAt)) throw refuse(`import ${index} createdAt is not an ISO UTC timestamp.`);
+        if (!Array.isArray(record.issueIds) || record.issueIds.length < 1) throw refuse(`import ${index} issueIds must be a non-empty list.`);
+        for (const id of record.issueIds) {
+          if (typeof id !== 'string' || !seenIds.has(id.toLowerCase()) || claimed.has(id.toLowerCase())) {
+            throw refuse(`import ${index} lists an issue id that is missing or already claimed by another import.`);
+          }
+          claimed.add(id.toLowerCase());
+        }
+        imports.push(copyImport(record));
+      }
+    }
+    return { issues, imports };
   }
 
   #enqueue(operation) {
@@ -349,9 +449,10 @@ export class IssueStore {
     return run;
   }
 
-  async #persist(snapshot) {
+  async #persist(snapshot, imports) {
     const tmpPath = join(this.dataDir, `${STORE_FILENAME}.tmp-${process.pid}-${++this.tmpCounter}`);
-    const payload = JSON.stringify({ issues: snapshot }, null, 2) + '\n';
+    const document = imports.length > 0 ? { issues: snapshot, imports } : { issues: snapshot };
+    const payload = JSON.stringify(document, null, 2) + '\n';
     try {
       const handle = await open(tmpPath, 'wx');
       try {

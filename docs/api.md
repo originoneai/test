@@ -150,22 +150,92 @@ Semantics a client must rely on:
   like every other endpoint and leaves the file untouched; recovery is manual
   as described below.
 
+### `POST /api/imports` — commit a historical CSV import
+
+Imports a whole CSV file of historical issues as **one atomic batch**
+(specs/historical-issue-import.md). Body (JSON, capped at 1 MiB):
+
+```json
+{ "importKey": "<UUID chosen by the client for this import>", "csv": "<the file text>" }
+```
+
+Any other body field is refused (`400 VALIDATION_ERROR`). The server parses
+and validates the CSV itself with the same module the page previews with
+(`public/csv-import.js`); nothing the browser computed is trusted.
+
+**CSV format.** UTF-8 (an optional BOM is ignored); RFC 4180 quoting — quoted
+fields may contain commas, line breaks (stored as `\n`) and `""` for a literal
+quote. The first row is a header naming a subset of exactly `title`,
+`description`, `status`, `priority` in any order (case-insensitive); `title`
+is required. Any other column — credentials, `id`, timestamps,
+`completions` or anything unknown — rejects the whole file: ids, timestamps
+and completion history are always server-owned. Per row: `title` is trimmed
+and must be 1–120 characters; `description` (default empty) at most 4000;
+`status` one of `open`, `in_progress`, `done` (empty → `open`); `priority` one
+of `low`, `normal`, `high`, `urgent` (empty → `normal`). Each row must have as
+many fields as the header. **Limits:** at most 262144 bytes of CSV text and
+500 data rows; a larger file is refused, never truncated. A header-only or
+empty file is refused.
+
+**Responses.**
+
+- `201` — committed. Every row became an issue with a server-assigned id and
+  one shared server timestamp; a row arriving as `done` gets the same
+  `{at, priority}` completion snapshot as a create in `done`, so it counts in
+  the weekly report for that day.
+  ```json
+  { "import": { "importKey": "…", "status": "committed", "createdAt": "…Z",
+                "issueCount": 6, "issueIds": ["…", "…"] }, "replayed": false }
+  ```
+- `200` with `"replayed": true` — this `importKey` was already committed for
+  the same normalized rows (re-sent after a lost acknowledgement, even if the
+  file was re-saved with other line endings or a BOM). The stored outcome is
+  returned unchanged; **nothing is created again.**
+- `400 IMPORT_INVALID` — the file or at least one row is invalid. **Nothing
+  is written**, not even the valid rows. `error.details` lists every problem:
+  `{"fileErrors": ["…"], "rowErrors": [{"line": 9, "errors": ["title is required."]}]}`
+  where `line` is the physical line in the file where that record starts.
+- `409 IMPORT_CONFLICT` — the `importKey` was already used for different rows.
+  Nothing is written; start a new import with a new key.
+- `413 PAYLOAD_TOO_LARGE` — body over 1 MiB.
+- `500 STORAGE_ERROR` — persistence failed; issues **and** import records are
+  unchanged and the same request may be retried with the same key.
+
+**Retry rule for clients.** Choose one `importKey` per confirmed file and
+reuse it for every retry of that confirmation. A retry after a timeout or
+network loss is always safe: it either commits once or returns the stored
+result. Choosing the same file again later is a new import with a new key.
+
+### `GET /api/imports/:importKey` — import result lookup
+
+Returns the committed result for that key with `200` in the same shape as the
+commit response (`"replayed": false`), so a client whose commit outcome was
+unknown can find out whether it landed. `404 IMPORT_NOT_FOUND` means nothing
+was committed under the key (rejected or never received; the client may
+commit it now). A key that is not a UUID → `400 VALIDATION_ERROR`. Results are
+durable across restarts.
+
 ### Everything else
 
 - Unsupported methods on known paths → `405` with an `Allow` header.
 - Unknown `/api/...` paths → `404`.
-- Request bodies are capped at 16 KiB (declared or streamed) → `413` above.
+- Request bodies are capped at 16 KiB (declared or streamed) → `413` above,
+  except `POST /api/imports`, which is capped at 1 MiB.
 
 ## Error model
 
 Every error body is `{"error":{"code":"...","message":"..."}}` — a stable
 machine-readable `code` plus a human-readable `message`, never a stack trace.
+`IMPORT_INVALID` additionally carries `error.details` (see `POST /api/imports`).
 
 | Status | Code | Meaning for the client |
 | --- | --- | --- |
 | 400 | `VALIDATION_ERROR` | Definite rejection (bad field, unknown field, empty patch). The input must change; retrying unchanged will fail again. |
 | 400 | `INVALID_JSON` | Body was not readable/parseable JSON. A retry with a re-serialized body may work. |
 | 400 | `INVALID_URL` | Malformed request URL. |
+| 400 | `IMPORT_INVALID` | The CSV import was refused as a whole; `details` lists file and row problems. Nothing was written. |
+| 404 | `IMPORT_NOT_FOUND` | No committed import has this key. |
+| 409 | `IMPORT_CONFLICT` | The import key was already used for different rows. Nothing was written. |
 | 404 | `NOT_FOUND` | Unknown resource or issue id. Refresh the list before acting on it. |
 | 405 | `METHOD_NOT_ALLOWED` | Wrong verb; `Allow` lists what the path supports. |
 | 413 | `PAYLOAD_TOO_LARGE` | Body over 16 KiB. Split or shorten the text. |
@@ -259,6 +329,22 @@ fix or remove it, restart.
   "issues": [ { ...issue objects in creation order... } ]
 }
 ```
+
+After the first committed CSV import the file also carries an `imports` list,
+written atomically together with the imported issues (the key is absent
+until then, so stores that never imported keep the exact format above):
+
+```json
+{
+  "issues": [ … ],
+  "imports": [ { "importKey": "<lowercase UUID>", "digest": "<sha256 of the normalized rows>",
+                 "createdAt": "…Z", "issueIds": ["…"] } ]
+}
+```
+
+On load each import record must have exactly these fields, a unique key,
+and list only existing issue ids not claimed by another import; anything else
+is reported as a corrupt store like any other corruption.
 
 Each record carries exactly the seven public fields plus the server-owned
 `completions` list: an append-only history of completion events, one appended

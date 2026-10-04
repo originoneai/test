@@ -20,6 +20,7 @@
 //
 // Rendering never uses innerHTML: every piece of issue text is assigned through
 // textContent, so HTML-like input is shown as text.
+import { mountImportPanel } from './csv-import.js';
 
 export const STATUSES = ['open', 'in_progress', 'done'];
 export const STATUS_LABELS = { open: 'Open', in_progress: 'In progress', done: 'Done' };
@@ -1780,5 +1781,14 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     // The board, then its Weekly summary (GET /api/reports/weekly).
     const board = mountApp(root, { adapter: createHttpAdapter(), doc: document });
     board.showWeeklySummary(createHttpAdapter());
+    // Historical CSV import (POST /api/imports): preview, then confirm; a
+    // committed batch refreshes the board and the weekly summary.
+    mountImportPanel(root, {
+      doc: document,
+      onImported: () => {
+        board.reload();
+        board.weekly.reload();
+      },
+    });
   }
 }

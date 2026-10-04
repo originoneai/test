@@ -1,14 +1,20 @@
 // Issue API for TEST-API; implements the contract in specs/issue-tracker.md
 // and specs/weekly-delivery-summary.md.
-// Routes: GET/POST /api/issues, PATCH /api/issues/:id, GET /api/reports/weekly;
+// Routes: GET/POST /api/issues, PATCH /api/issues/:id, GET /api/reports/weekly,
+// POST /api/imports, GET /api/imports/:importKey (specs/historical-issue-import.md);
 // other methods get 405.
+import { createHash } from 'node:crypto';
 import { IssueStore } from './store.js';
+import { isImportKey, validateImportCsv, MAX_CSV_BYTES, MAX_IMPORT_ROWS } from '../public/csv-import.js';
 
 const ISSUE_STATUSES = new Set(['open', 'in_progress', 'done']);
 const ISSUE_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
 const BODY_LIMIT_BYTES = 16 * 1024;
+// An import carries a whole CSV file (at most MAX_CSV_BYTES of UTF-8) inside
+// JSON; escaping can grow it, so the envelope gets a larger, still bounded limit.
+const IMPORT_BODY_LIMIT_BYTES = 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_DAYS = 7;
 const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -44,8 +50,8 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
-function sendError(res, status, code, message) {
-  sendJson(res, status, { error: { code, message } });
+function sendError(res, status, code, message, details) {
+  sendJson(res, status, { error: details === undefined ? { code, message } : { code, message, details } });
 }
 
 function isPlainObject(value) {
@@ -74,10 +80,10 @@ function displayValue(value) {
   return text.length > 80 ? text.slice(0, 77) + '...' : text;
 }
 
-function readBody(req) {
+function readBody(req, limit = BODY_LIMIT_BYTES) {
   return new Promise((resolveBody) => {
     const declared = Number(req.headers['content-length']);
-    if (Number.isFinite(declared) && declared > BODY_LIMIT_BYTES) {
+    if (Number.isFinite(declared) && declared > limit) {
       req.resume();
       resolveBody({ ok: false, reason: 'too_large' });
       return;
@@ -87,7 +93,7 @@ function readBody(req) {
     let tooLarge = false;
     req.on('data', (chunk) => {
       received += chunk.length;
-      if (received > BODY_LIMIT_BYTES) {
+      if (received > limit) {
         tooLarge = true;
         chunks.length = 0;
         req.resume();
@@ -104,11 +110,11 @@ function readBody(req) {
   });
 }
 
-async function parseJsonBody(req, res) {
-  const read = await readBody(req);
+async function parseJsonBody(req, res, limit = BODY_LIMIT_BYTES) {
+  const read = await readBody(req, limit);
   if (!read.ok) {
     if (read.reason === 'too_large') {
-      sendError(res, 413, 'PAYLOAD_TOO_LARGE', 'Request body exceeds the 16 KiB limit.');
+      sendError(res, 413, 'PAYLOAD_TOO_LARGE', `Request body exceeds the ${limit / 1024} KiB limit.`);
     } else {
       sendError(res, 400, 'INVALID_JSON', 'Request body could not be read.');
     }
@@ -451,6 +457,92 @@ async function updateIssue(req, res, id) {
   sendJson(res, 200, toIssueResource(updated));
 }
 
+function toImportResource(record, replayed) {
+  return {
+    import: {
+      importKey: record.importKey,
+      status: 'committed',
+      createdAt: record.createdAt,
+      issueCount: record.issueIds.length,
+      issueIds: record.issueIds.slice(),
+    },
+    replayed,
+  };
+}
+
+// The digest identifies the normalized batch (what would be stored), so the
+// same file re-sent after a lost acknowledgement — even re-saved with CRLF
+// or a BOM — is recognized as the same import.
+function importDigest(rows) {
+  return createHash('sha256').update(JSON.stringify(rows.map((row) => [row.title, row.description, row.status, row.priority]))).digest('hex');
+}
+
+// Whole-batch commit: the server re-parses and re-validates the CSV itself;
+// any file or row problem rejects the entire batch before anything is written.
+async function commitImport(req, res) {
+  const parsed = await parseJsonBody(req, res, IMPORT_BODY_LIMIT_BYTES);
+  if (!parsed) return;
+  const body = parsed.value;
+  if (!isPlainObject(body)) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'Request body must be a JSON object.');
+    return;
+  }
+  if (rejectUnknownFields(res, body, ['importKey', 'csv'])) return;
+  if (!isImportKey(body.importKey)) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'importKey is required and must be a UUID chosen by the client for this import.');
+    return;
+  }
+  if (typeof body.csv !== 'string') {
+    sendError(res, 400, 'VALIDATION_ERROR', 'csv is required and must be the file text.');
+    return;
+  }
+  const validation = validateImportCsv(body.csv);
+  if (!validation.valid) {
+    const rowErrors = validation.rows
+      .filter((row) => row.errors.length > 0)
+      .map((row) => ({ line: row.line, errors: row.errors }));
+    sendError(
+      res,
+      400,
+      'IMPORT_INVALID',
+      `The file cannot be imported; nothing was saved (limits: ${MAX_CSV_BYTES} bytes, ${MAX_IMPORT_ROWS} issues).`,
+      { fileErrors: validation.fileErrors, rowErrors },
+    );
+    return;
+  }
+  const rows = validation.rows.map((row) => row.issue);
+  let outcome;
+  try {
+    outcome = await getStore().importBatch(body.importKey, importDigest(rows), rows);
+  } catch (err) {
+    if (err && err.code === 'IMPORT_CONFLICT') {
+      sendError(res, 409, 'IMPORT_CONFLICT', 'This importKey was already used for a different file; choose the file again to start a new import.');
+      return;
+    }
+    throw err;
+  }
+  sendJson(res, outcome.replayed ? 200 : 201, toImportResource(outcome.record, outcome.replayed));
+}
+
+async function lookupImport(res, rawKey) {
+  let key;
+  try {
+    key = decodeURIComponent(rawKey);
+  } catch {
+    key = '';
+  }
+  if (!isImportKey(key)) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'importKey must be a UUID.');
+    return;
+  }
+  const record = await getStore().getImport(key);
+  if (!record) {
+    sendError(res, 404, 'IMPORT_NOT_FOUND', 'No committed import has this importKey; nothing was saved under it.');
+    return;
+  }
+  sendJson(res, 200, toImportResource(record, false));
+}
+
 export async function handleApi(req, res) {
   let url;
   try {
@@ -481,6 +573,25 @@ export async function handleApi(req, res) {
       }
       res.setHeader('Allow', 'PATCH');
       sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/issues/:id.`);
+      return;
+    }
+    if (url.pathname === '/api/imports') {
+      if (req.method === 'POST') {
+        await commitImport(req, res);
+        return;
+      }
+      res.setHeader('Allow', 'POST');
+      sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/imports.`);
+      return;
+    }
+    const importMatch = url.pathname.match(/^\/api\/imports\/([^/]+)$/);
+    if (importMatch) {
+      if (req.method === 'GET') {
+        await lookupImport(res, importMatch[1]);
+        return;
+      }
+      res.setHeader('Allow', 'GET');
+      sendError(res, 405, 'METHOD_NOT_ALLOWED', `Method ${req.method} is not allowed on /api/imports/:importKey.`);
       return;
     }
     if (url.pathname === '/api/reports/weekly') {
