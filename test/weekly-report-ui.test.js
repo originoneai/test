@@ -1,11 +1,12 @@
-// Frontend coverage for the Weekly summary: UTC week helpers, the version-2
-// report shape check (version-1 and malformed replies refused), the live HTTP
+// Frontend coverage for the Weekly summary: UTC week helpers, the version-3
+// report shape check (version-1, version-2 and malformed replies refused), the live HTTP
 // adapter's report read, and the mounted summary (default current UTC week,
 // week selection, created and completed shown separately, repeat completions,
-// current-priority labelling, unknown completion timing, independence from the
+// priority at completion (with its separate unknown bucket for completions
+// recorded before priority was stored), unknown completion timing, independence from the
 // board's search and filters, refresh after board changes, loading, empty,
 // failure and stale-reply handling). The report endpoint is stubbed here with
-// synthetic responses that follow the agreed version-2 contract
+// synthetic responses that follow the agreed version-3 contract
 // (GET /api/reports/weekly?weekStart=YYYY-MM-DD), not a server.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -121,7 +122,9 @@ function jsonResponse(status, body) {
 // ---------------------------------------------------------------------------
 // Fixtures: an issue store shared by the board adapter, a completion history
 // the stub server keeps (append-only, server clock), and a report stub that
-// counts like the version-2 contract.
+// counts like the version-3 contract. A completion event is either an object
+// {at, priority} (priority recorded with the completion) or a bare timestamp
+// string (an old event recorded before priority was stored with it).
 // ---------------------------------------------------------------------------
 
 const WEEK = '2026-09-28'; // a Monday
@@ -149,16 +152,19 @@ function fixtureIssues() {
 }
 
 // Recorded completion events (server-clock UTC), oldest first.
+const done = (at, priority) => ({ at, priority });
 function fixtureCompletions() {
   return {
     // Completed, then reopened: the completion stays in the week.
-    'wk-0001': ['2026-09-29T10:00:00.000Z'],
+    'wk-0001': [done('2026-09-29T10:00:00.000Z', 'urgent')],
     // Completed three times in the week (reopened twice): one issue, two extra.
-    'wk-0004': ['2026-10-01T09:00:00.000Z', '2026-10-02T10:00:00.000Z', '2026-10-03T11:00:00.000Z'],
-    'wk-0007': ['2026-10-04T23:59:59.999Z'],
-    'wk-0008': ['2026-09-27T23:59:59.999Z', '2026-10-05T00:00:00.000Z'],
+    'wk-0004': [done('2026-10-01T09:00:00.000Z', 'low'), done('2026-10-02T10:00:00.000Z', 'low'), done('2026-10-03T11:00:00.000Z', 'low')],
+    'wk-0007': [done('2026-10-04T23:59:59.999Z', 'high')],
+    'wk-0008': [done('2026-09-27T23:59:59.999Z', 'normal'), done('2026-10-05T00:00:00.000Z', 'normal')],
   };
 }
+const eventAt = (event) => (typeof event === 'string' ? event : event.at);
+const eventPriority = (event) => (typeof event === 'string' ? null : event.priority);
 
 function boardAdapter(store, history) {
   const calls = { list: [], create: [], update: [] };
@@ -186,7 +192,8 @@ function boardAdapter(store, history) {
       const prev = store.get(id);
       const next = { ...prev, ...patch, updatedAt: SERVER_NOW };
       // Like the server: a move into done from another status appends one event.
-      if (next.status === 'done' && prev.status !== 'done') history.set(id, [...(history.get(id) ?? []), SERVER_NOW]);
+      // The event records the priority the issue has as it is completed.
+      if (next.status === 'done' && prev.status !== 'done') history.set(id, [...(history.get(id) ?? []), done(SERVER_NOW, next.priority)]);
       store.set(id, next);
       return { ...next };
     },
@@ -196,31 +203,43 @@ function boardAdapter(store, history) {
 function countReport(store, weekStart, history = new Map()) {
   const start = Date.parse(weekStart + 'T00:00:00.000Z');
   const end = start + 7 * 24 * 60 * 60 * 1000;
-  const inWeek = (iso) => { const t = Date.parse(iso); return t >= start && t < end; };
+  const inWeek = (event) => { const t = Date.parse(eventAt(event)); return t >= start && t < end; };
   const zeros = (keys) => Object.fromEntries(keys.map((k) => [k, 0]));
   const created = { total: 0, byStatus: zeros(STATUSES), byPriority: zeros(PRIORITIES) };
-  const completed = { total: 0, byPriority: zeros(PRIORITIES), createdThisWeek: 0, createdEarlier: 0, repeatCompletions: 0 };
+  const completed = { total: 0, byPriority: zeros(PRIORITIES), priorityUnknown: 0, createdThisWeek: 0, createdEarlier: 0, repeatCompletions: 0 };
   let completedTimingUnknown = 0;
   for (const issue of store.values()) {
     if (inWeek(issue.createdAt)) { created.total += 1; created.byStatus[issue.status] += 1; created.byPriority[issue.priority] += 1; }
-    const events = (history.get(issue.id) ?? []).filter(inWeek);
+    // Earliest completion in the week first; a stable sort keeps append order for ties.
+    const events = (history.get(issue.id) ?? []).filter(inWeek)
+      .sort((a, b) => Date.parse(eventAt(a)) - Date.parse(eventAt(b)));
     if (events.length > 0) {
       completed.total += 1;
       completed.repeatCompletions += events.length - 1;
-      completed.byPriority[issue.priority] += 1;
+      // The bucket is the priority recorded with that first completion, never
+      // the current priority; an old bare-timestamp event is unknown.
+      const atCompletion = eventPriority(events[0]);
+      if (atCompletion === null) completed.priorityUnknown += 1; else completed.byPriority[atCompletion] += 1;
       if (inWeek(issue.createdAt)) completed.createdThisWeek += 1; else completed.createdEarlier += 1;
     }
     if (issue.status === 'done' && (history.get(issue.id) ?? []).length === 0) completedTimingUnknown += 1;
   }
-  return { schemaVersion: 2, weekStart, weekEndExclusive: addUtcDays(weekStart, 7), created, completed, completedTimingUnknown };
+  return { schemaVersion: 3, weekStart, weekEndExclusive: addUtcDays(weekStart, 7), created, completed, completedTimingUnknown };
 }
 
 const fixtureStore = () => new Map(fixtureIssues().map((i) => [i.id, i]));
 const fixtureHistory = () => new Map(Object.entries(fixtureCompletions()));
-const emptyReport = (weekStart, weekEndExclusive = addUtcDays(weekStart, 7)) => ({ schemaVersion: 2, weekStart, weekEndExclusive,
+const emptyReport = (weekStart, weekEndExclusive = addUtcDays(weekStart, 7)) => ({ schemaVersion: 3, weekStart, weekEndExclusive,
   created: { total: 0, byStatus: { open: 0, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 } },
-  completed: { total: 0, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 }, createdThisWeek: 0, createdEarlier: 0, repeatCompletions: 0 },
+  completed: { total: 0, byPriority: { low: 0, normal: 0, high: 0, urgent: 0 }, priorityUnknown: 0, createdThisWeek: 0, createdEarlier: 0, repeatCompletions: 0 },
   completedTimingUnknown: 0 });
+
+// What a version-2 server would send for the same data: completed issues by
+// their current priority, no priorityUnknown.
+function version2Of(report) {
+  const { priorityUnknown: _p, ...completed } = report.completed;
+  return { ...report, schemaVersion: 2, completed: { ...completed, byPriority: { ...completed.byPriority, normal: completed.byPriority.normal + report.completed.priorityUnknown } } };
+}
 
 // A report source over the store; `next` (if set) answers the next read.
 function reportStub(store, history) {
@@ -267,6 +286,7 @@ function shownCompleted(root) {
     createdThisWeek: text(root, 'weekly-completed-created-this-week'),
     createdEarlier: text(root, 'weekly-completed-created-earlier'),
     byPriority: Object.fromEntries(PRIORITIES.map((k) => [k, countOf(root, 'completed-priority', k)])),
+    priorityUnknown: countOf(root, 'completed-priority', 'unknown'),
   };
 }
 
@@ -289,12 +309,12 @@ test('UTC week helpers name the Monday of the UTC week and only accept real date
   assert.equal(formatUtcDay(WEEK), 'Mon 28 Sep 2026', 'labels name the weekday, day, month and year');
 });
 
-test('only a complete version-2 report for the requested week is accepted', () => {
+test('only a complete version-3 report for the requested week is accepted', () => {
   const good = countReport(fixtureStore(), WEEK, fixtureHistory());
   assert.equal(isValidWeeklyReport(good, WEEK), true);
   assert.equal(weeklyReportProblem(good, WEEK), null);
   assert.equal(good.created.total, 4, 'fixture sanity: four issues created in the week');
-  assert.deepEqual(good.completed, { total: 3, byPriority: { low: 1, normal: 0, high: 1, urgent: 1 }, createdThisWeek: 2, createdEarlier: 1, repeatCompletions: 2 },
+  assert.deepEqual(good.completed, { total: 3, byPriority: { low: 1, normal: 0, high: 1, urgent: 1 }, priorityUnknown: 0, createdThisWeek: 2, createdEarlier: 1, repeatCompletions: 2 },
     'fixture sanity: three distinct completed issues, two extra completions');
   assert.equal(good.completedTimingUnknown, 1, 'fixture sanity: one legacy done issue');
   const c = good.created;
@@ -303,8 +323,8 @@ test('only a complete version-2 report for the requested week is accepted', () =
   const { completedTimingUnknown: _drop2, ...noUnknown } = good;
   const variants = {
     'another week': { ...good, weekStart: PREV_WEEK, weekEndExclusive: WEEK },
-    'schema version 3': { ...good, schemaVersion: 3 },
-    'schema version as text': { ...good, schemaVersion: '2' },
+    'schema version 4': { ...good, schemaVersion: 4 },
+    'schema version as text': { ...good, schemaVersion: '3' },
     'non-Monday week': { ...good, weekStart: '2026-09-29', weekEndExclusive: '2026-10-06' },
     'wrong end': { ...good, weekEndExclusive: '2026-10-04' },
     'missing status key': { ...good, created: { ...c, byStatus: { open: 2, in_progress: 1 } } },
@@ -320,6 +340,14 @@ test('only a complete version-2 report for the requested week is accepted', () =
     'unknown-timing negative': { ...good, completedTimingUnknown: -1 },
     'completed priority key missing': { ...good, completed: { ...d, byPriority: { low: 1, high: 1, urgent: 1 } } },
     'completed priorities not adding up': { ...good, completed: { ...d, total: 4 } },
+    'priority-unknown missing': { ...good, completed: (({ priorityUnknown: _p, ...rest }) => rest)(d) },
+    'priority-unknown as null': { ...good, completed: { ...d, priorityUnknown: null } },
+    'priority-unknown as text': { ...good, completed: { ...d, priorityUnknown: '0' } },
+    'priority-unknown negative': { ...good, completed: { ...d, priorityUnknown: -1 } },
+    'priority-unknown fractional': { ...good, completed: { ...d, priorityUnknown: 0.5 } },
+    'priority-unknown not adding up': { ...good, completed: { ...d, priorityUnknown: 1 } },
+    'priority-unknown inside byPriority instead': { ...good, completed: { ...d, byPriority: { ...d.byPriority, unknown: 0 }, priorityUnknown: undefined } },
+    'unknown counted on top of a full byPriority': { ...good, completed: { ...d, total: 3, byPriority: { low: 1, normal: 0, high: 1, urgent: 1 }, priorityUnknown: 1, createdThisWeek: 2, createdEarlier: 1 } },
     'origin not adding up': { ...good, completed: { ...d, createdEarlier: 2 } },
     'origin missing': { ...good, completed: { ...d, createdThisWeek: undefined } },
     'repeat missing': { ...good, completed: { ...d, repeatCompletions: undefined } },
@@ -336,14 +364,14 @@ test('only a complete version-2 report for the requested week is accepted', () =
   assert.equal(isValidWeeklyReport(emptyReport(WEEK), WEEK), true, 'a real all-zero week is valid');
 });
 
-test('a version-1 report is refused with its own message, never shown as version 2', () => {
+test('a version-1 report is refused with its own message, never shown as version 3', () => {
   const v1 = { schemaVersion: 1, weekStart: WEEK, weekEndExclusive: '2026-10-05',
     created: { total: 4, byStatus: { open: 2, in_progress: 1, done: 1 }, byPriority: { low: 1, normal: 1, high: 1, urgent: 1 } } };
   assert.equal(isValidWeeklyReport(v1, WEEK), false);
   const problem = weeklyReportProblem(v1, WEEK);
   assert.equal(problem.code, 'UNSUPPORTED_REPORT_VERSION');
   assert.match(problem.message, /older weekly report \(version 1\) without completion data/);
-  // Even with version-2 parts bolted on, a version-1 label is not version 2.
+  // Even with version-3 parts bolted on, a version-1 label is not version 3.
   assert.equal(weeklyReportProblem({ ...countReport(fixtureStore(), WEEK, fixtureHistory()), schemaVersion: 1 }, WEEK).code, 'UNSUPPORTED_REPORT_VERSION');
 });
 
@@ -378,8 +406,11 @@ test('the adapter reads GET /api/reports/weekly?weekStart= and keeps the error e
   const v1 = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, { ...createdOnly, schemaVersion: 1 }) });
   await assert.rejects(v1.weeklyReport(WEEK), (e) => e instanceof ApiError && e.code === 'UNSUPPORTED_REPORT_VERSION' && e.status === 200,
     'a version-1 reply is refused explicitly');
-  const halfV2 = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, { ...createdOnly, schemaVersion: 2 }) });
-  await assert.rejects(halfV2.weeklyReport(WEEK), (e) => e.code === 'INVALID_RESPONSE', 'a version-2 label without completion data is unreadable');
+  const v2 = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, version2Of(good)) });
+  await assert.rejects(v2.weeklyReport(WEEK), (e) => e instanceof ApiError && e.code === 'UNSUPPORTED_REPORT_VERSION' && e.status === 200,
+    'a version-2 reply (current-priority basis) is refused explicitly');
+  const halfV3 = createHttpAdapter({ fetchImpl: async () => jsonResponse(200, { ...createdOnly, schemaVersion: 3 }) });
+  await assert.rejects(halfV3.weeklyReport(WEEK), (e) => e.code === 'INVALID_RESPONSE', 'a version-3 label without completion data is unreadable');
 });
 
 // ---------------------------------------------------------------------------
@@ -430,18 +461,25 @@ test('created and completed are separate, labelled parts with their own totals (
   assert.ok(!elementsOf(root).some((el) => el.textContent === '7'), 'no element shows created + completed as one number');
 });
 
-test('repeat completions are shown apart; a reopened issue keeps its completion; origin and current priority are labelled', async () => {
+test('repeat completions are shown apart; a reopened issue keeps its completion; origin and priority at completion are labelled', async () => {
   const { root } = await mountSummary();
   assert.deepEqual(shownCompleted(root), {
     total: '3', repeat: '2', createdThisWeek: '2', createdEarlier: '1',
-    byPriority: { low: '1', normal: '0', high: '1', urgent: '1' },
+    byPriority: { low: '1', normal: '0', high: '1', urgent: '1' }, priorityUnknown: '0',
   });
   assert.match(text(root, 'weekly-repeat-label'), /^extra completions of the same issues \(completed again after being reopened; not added to the count above\)$/);
   // wk-0001 was completed this week and is open again now: it still counts.
   assert.equal(countOf(root, 'completed-priority', 'urgent'), '1', 'the reopened urgent issue is still completed this week');
   assert.equal(countOf(root, 'status', 'open'), '2', 'while the created part shows it at its current status');
   const priorityHeading = byId(root, 'weekly-completed-priority-heading');
-  assert.equal(priorityHeading.textContent, 'By current priority (as stored now, not at completion)');
+  assert.equal(priorityHeading.textContent, 'By priority at completion');
+  assert.equal(text(root, 'weekly-completed-priority-hint'),
+    'Each issue counts under the priority it had when it was first completed in this week. Changing its priority later does not move it.');
+  assert.match(byRole(root, 'weekly-by-completed-priority').getAttribute('aria-describedby'), /weekly-completed-priority-hint/);
+  assert.equal(byRole(root, 'weekly-priority-unknown-note').hidden, true, 'no unknown-priority note when every completion has a recorded priority');
+  assert.equal(countOf(root, 'completed-priority', 'unknown'), '0', 'a real zero unknown bucket is shown as 0');
+  assert.ok(!/current priority/i.test(byRole(root, 'weekly-completed').textContent), 'the completed part never claims a current-priority basis');
+  assert.equal(byId(root, 'weekly-priority-heading').textContent, 'By current priority', 'the created part keeps its current-priority basis');
   assert.equal(byId(root, 'weekly-origin-heading').textContent, 'When these issues were created');
   assert.equal(byRole(root, 'weekly-completed-origin').getAttribute('aria-labelledby'), 'weekly-origin-heading');
   assert.equal(byRole(root, 'weekly-by-completed-priority').getAttribute('aria-labelledby'), 'weekly-completed-priority-heading');
@@ -494,7 +532,7 @@ test('completions on the week boundaries: the last millisecond is inside, the ne
   assert.equal(countOf(root, 'completed-priority', 'normal'), '0', 'wk-0008 completed just outside the week on both sides');
   await byRole(root, 'weekly-prev').dispatch('click');
   await tick();
-  assert.deepEqual(shownCompleted(root), { total: '1', repeat: '0', createdThisWeek: '0', createdEarlier: '1', byPriority: { low: '0', normal: '1', high: '0', urgent: '0' } },
+  assert.deepEqual(shownCompleted(root), { total: '1', repeat: '0', createdThisWeek: '0', createdEarlier: '1', byPriority: { low: '0', normal: '1', high: '0', urgent: '0' }, priorityUnknown: '0' },
     'the Sunday-23:59 completion belongs to the week before');
   await byRole(root, 'weekly-next').dispatch('click');
   await byRole(root, 'weekly-next').dispatch('click');
@@ -582,7 +620,7 @@ test('choosing a week reads that week; any day maps to its Monday; previous/next
   assert.equal(reports.calls.at(-1), WEEK, 'This week returns to the current UTC week');
   assert.equal(byRole(root, 'announcer').textContent,
     'Week of Mon 28 Sep 2026 to Sun 4 Oct 2026 (UTC). 4 issues created. Status: Open 2, In progress 1, Done 1. Priority: Low 1, Normal 1, High 1, Urgent 1. '
-    + '3 issues completed, plus 2 extra completions of the same issues. Created this week 2, earlier 1. Current priority: Low 1, Normal 0, High 1, Urgent 1. '
+    + '3 issues completed, plus 2 extra completions of the same issues. Created this week 2, earlier 1. Priority at completion: Low 1, Normal 0, High 1, Urgent 1, priority not recorded 0. '
     + '1 done issue has no recorded completion time, so it is not counted in this or any other week.');
 
   const count = reports.calls.length;
@@ -735,7 +773,7 @@ test('a version-1 reply from any report source is an explicit error, with no mad
   const { root, reports, app } = await mountSummary();
   const v1 = (week) => ({ schemaVersion: 1, weekStart: week, weekEndExclusive: addUtcDays(week, 7),
     created: { total: 1, byStatus: { open: 1, in_progress: 0, done: 0 }, byPriority: { low: 0, normal: 1, high: 0, urgent: 0 } } });
-  // Same week (a refresh): the error is shown and the last version-2 counts stay, labelled as such.
+  // Same week (a refresh): the error is shown and the last version-3 counts stay, labelled as such.
   reports.next.push(async (week) => v1(week));
   await app.weekly.reload();
   assert.equal(byRole(root, 'weekly-error').hidden, false);
@@ -748,7 +786,7 @@ test('a version-1 reply from any report source is an explicit error, with no mad
   assert.equal(byRole(root, 'weekly-result').hidden, true, 'no counts, and no completed zeros, for a version-1 week');
   assert.equal(text(root, 'weekly-status'), 'The summary for this week is not available right now.');
   assert.equal(byRole(root, 'weekly-retry').hidden, false);
-  // Retry once the server answers version 2.
+  // Retry once the server answers version 3.
   await byRole(root, 'weekly-retry').dispatch('click');
   await app.weekly.idle();
   assert.equal(byRole(root, 'weekly-error').hidden, true);
@@ -762,7 +800,7 @@ test('reopening keeps the past completion; completing again adds one extra compl
   await move.dispatch('change');
   await app.weekly.idle();
   assert.equal(countOf(root, 'status', 'done'), '0', 'the created part shows the reopened issue as open now');
-  assert.deepEqual(shownCompleted(root), { total: '3', repeat: '2', createdThisWeek: '2', createdEarlier: '1', byPriority: { low: '1', normal: '0', high: '1', urgent: '1' } },
+  assert.deepEqual(shownCompleted(root), { total: '3', repeat: '2', createdThisWeek: '2', createdEarlier: '1', byPriority: { low: '1', normal: '0', high: '1', urgent: '1' }, priorityUnknown: '0' },
     'reopening does not remove the completion from the week');
   const again = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-status' && el.getAttribute('data-issue-id') === 'wk-0004');
   again.value = 'done';
@@ -778,12 +816,13 @@ test('distribution bars are decorative and sized from the counts; counts are pla
   const status = byRole(root, 'weekly-status-open');
   assert.equal(status.textContent, '2');
   const tracks = elementsOf(byRole(root, 'weekly')).filter((el) => el.className === 'weekly-track');
-  assert.equal(tracks.length, STATUSES.length + PRIORITIES.length + PRIORITIES.length);
+  assert.equal(tracks.length, STATUSES.length + PRIORITIES.length + PRIORITIES.length + 1, 'the completed part has a fifth bar for priority not recorded');
   assert.ok(tracks.every((el) => el.getAttribute('aria-hidden') === 'true'));
   const openBar = tracks[0].children[0];
   assert.equal(openBar.style.width, '50%');
   const completedBars = elementsOf(byRole(root, 'weekly-by-completed-priority')).filter((el) => el.className.startsWith('weekly-bar '));
-  assert.deepEqual(completedBars.map((el) => el.style.width), ['33%', '0%', '33%', '33%'], 'completed bars are sized from the completed total');
+  assert.deepEqual(completedBars.map((el) => el.style.width), ['33%', '0%', '33%', '33%', '0%'], 'completed bars are sized from the completed total');
+  assert.equal(completedBars.at(-1).className, 'weekly-bar weekly-bar-completed-priority-unknown');
   const lists = ['weekly-by-status', 'weekly-by-priority', 'weekly-by-completed-priority', 'weekly-completed-origin'].map((role) => elementsOf(byRole(root, 'weekly')).find((el) => el.tagName === 'UL' && el.getAttribute('data-role') === role));
   assert.ok(lists.every((ul) => ul && ul.getAttribute('aria-labelledby')), 'each distribution list is labelled by its heading');
 });
@@ -1016,4 +1055,160 @@ test('This week is disabled when the clock is in a week that cannot be shown, an
   assert.equal(byRole(low.root, 'weekly-week').value, '0099-01-05');
   assert.equal(byRole(low.root, 'weekly-this').disabled, false);
   assert.equal(byRole(low.root, 'weekly-error').hidden, true);
+});
+
+// ---------------------------------------------------------------------------
+// Version 3: priority at completion and its unknown bucket
+// ---------------------------------------------------------------------------
+
+const V2_MESSAGE = 'The server sent an older weekly report (version 2) that groups completed issues by their current priority, not their priority at completion, so completed counts cannot be shown.';
+
+test('a version-2 report is refused with its own message, even when its numbers would add up', () => {
+  const good = countReport(fixtureStore(), WEEK, fixtureHistory());
+  const v2 = version2Of(good);
+  assert.equal(isValidWeeklyReport(v2, WEEK), false);
+  const problem = weeklyReportProblem(v2, WEEK);
+  assert.equal(problem.code, 'UNSUPPORTED_REPORT_VERSION');
+  assert.equal(problem.message, V2_MESSAGE);
+  assert.equal(problem.outcomeUnknown, true);
+  // A version-2 label on a version-3 body is still version 2.
+  assert.equal(weeklyReportProblem({ ...good, schemaVersion: 2 }, WEEK).code, 'UNSUPPORTED_REPORT_VERSION');
+  assert.notEqual(weeklyReportProblem({ ...good, schemaVersion: 1 }, WEEK).message, V2_MESSAGE, 'version 1 keeps its own message');
+});
+
+test('a version-2 reply is shown as an explicit, recoverable error with no counts or zeros made up', async () => {
+  const { root, reports, app } = await mountSummary();
+  reports.next.push(async (week) => version2Of(countReport(new Map(), week)));
+  await app.weekly.reload();
+  assert.equal(byRole(root, 'weekly-error').hidden, false);
+  assert.equal(text(root, 'weekly-error-text'), `Could not load the weekly summary: ${V2_MESSAGE} Showing the last summary that loaded for this week.`);
+  assert.equal(text(root, 'weekly-completed-total'), '3', 'the last version-3 counts stay; nothing from the version-2 reply is shown');
+  reports.next.push(async (week) => version2Of(countReport(new Map(), week)));
+  await byRole(root, 'weekly-prev').dispatch('click');
+  await app.weekly.idle();
+  assert.equal(byRole(root, 'weekly-result').hidden, true, 'a version-2 week shows no counts at all');
+  assert.equal(text(root, 'weekly-status'), 'The summary for this week is not available right now.');
+  await byRole(root, 'weekly-retry').dispatch('click');
+  await app.weekly.idle();
+  assert.equal(byRole(root, 'weekly-error').hidden, true, 'Retry recovers once the server answers version 3');
+  assert.equal(byRole(root, 'weekly-result').hidden, false);
+});
+
+test('a missing or malformed priorityUnknown, or totals that do not add up, are read failures in the page', async () => {
+  const { root, reports, app } = await mountSummary();
+  const base = countReport(fixtureStore(), WEEK, fixtureHistory());
+  const { priorityUnknown: _p, ...noUnknown } = base.completed;
+  for (const completed of [noUnknown, { ...base.completed, priorityUnknown: null }, { ...base.completed, priorityUnknown: 2 }]) {
+    reports.next.push(async () => ({ ...base, completed }));
+    await app.weekly.reload();
+    assert.equal(byRole(root, 'weekly-error').hidden, false);
+    assert.match(text(root, 'weekly-error-text'), /could not read/);
+    assert.equal(countOf(root, 'completed-priority', 'unknown'), '0', 'the last valid unknown count stays');
+    assert.equal(text(root, 'weekly-completed-total'), '3');
+  }
+});
+
+test('a mixed week shows recorded priorities and a separate, explained unknown bucket', async () => {
+  // wk-0004's first completion this week is an old bare-timestamp event; its
+  // later completions carry a priority but do not decide the bucket.
+  const completions = { ...fixtureCompletions(), 'wk-0004': ['2026-10-01T09:00:00.000Z', done('2026-10-02T10:00:00.000Z', 'low'), done('2026-10-03T11:00:00.000Z', 'low')] };
+  const { root } = await mountSummary({ completions });
+  assert.deepEqual(shownCompleted(root), {
+    total: '3', repeat: '2', createdThisWeek: '2', createdEarlier: '1',
+    byPriority: { low: '0', normal: '0', high: '1', urgent: '1' }, priorityUnknown: '1',
+  }, 'unknown is never guessed from the current priority (low)');
+  const unknownRow = byRole(root, 'weekly-completed-priority-unknown').parentNode;
+  assert.equal(unknownRow.tagName, 'LI', 'the unknown count is a row of the same labelled list');
+  assert.equal(unknownRow.children[0].textContent, 'Priority not recorded');
+  const note = byRole(root, 'weekly-priority-unknown-note');
+  assert.equal(note.hidden, false);
+  assert.equal(note.textContent, '1 of these issues was completed before the board recorded priority at completion, so its priority then is not known. It is counted as “Priority not recorded” and not guessed from the current priority.');
+  assert.match(byRole(root, 'weekly-by-completed-priority').getAttribute('aria-describedby'), /weekly-priority-unknown-note/);
+  assert.ok(elementsOf(byRole(root, 'weekly-completed')).includes(note), 'the explanation sits with the completed distribution');
+  // The completion-time-unknown note stays its own, separate explanation.
+  const timing = byRole(root, 'weekly-unknown');
+  assert.equal(timing.hidden, false);
+  assert.ok(!elementsOf(timing).includes(note) && !elementsOf(byRole(root, 'weekly-completed')).includes(timing));
+  assert.equal(text(root, 'weekly-unknown-text'), '1 done issue has no recorded completion time, so it is not counted in this or any other week.');
+  const bars = elementsOf(byRole(root, 'weekly-by-completed-priority')).filter((el) => el.className.startsWith('weekly-bar '));
+  assert.deepEqual(bars.map((el) => el.style.width), ['0%', '0%', '33%', '33%', '33%']);
+  await byRole(root, 'weekly-this').dispatch('click');
+  await tick();
+  assert.match(byRole(root, 'announcer').textContent, /Priority at completion: Low 0, Normal 0, High 1, Urgent 1, priority not recorded 1\./,
+    'the screen-reader summary names the unknown bucket too');
+});
+
+test('an all-unknown week puts every completion in the unknown bucket and says so', async () => {
+  const completions = {
+    'wk-0001': ['2026-09-29T10:00:00.000Z'],
+    'wk-0004': ['2026-10-01T09:00:00.000Z', '2026-10-02T10:00:00.000Z'],
+    'wk-0007': ['2026-10-04T23:59:59.999Z'],
+  };
+  const { root } = await mountSummary({ completions });
+  assert.deepEqual(shownCompleted(root), {
+    total: '3', repeat: '1', createdThisWeek: '2', createdEarlier: '1',
+    byPriority: { low: '0', normal: '0', high: '0', urgent: '0' }, priorityUnknown: '3',
+  });
+  assert.equal(text(root, 'weekly-priority-unknown-note'), 'All 3 issues were completed before the board recorded priority at completion, so their priority then is not known. They are counted as “Priority not recorded” and not guessed from the current priority.');
+  const bars = elementsOf(byRole(root, 'weekly-by-completed-priority')).filter((el) => el.className.startsWith('weekly-bar '));
+  assert.deepEqual(bars.map((el) => el.style.width), ['0%', '0%', '0%', '0%', '100%']);
+  assert.deepEqual(shownCounts(root).byPriority, { low: '1', normal: '1', high: '1', urgent: '1' }, 'created priorities still use the current priority');
+});
+
+test('a single unknown completion reads in the singular', async () => {
+  const { root } = await mountSummary({ completions: { 'wk-0007': ['2026-10-04T23:59:59.999Z'] } });
+  assert.equal(text(root, 'weekly-completed-total'), '1');
+  assert.equal(text(root, 'weekly-priority-unknown-note'), 'This issue was completed before the board recorded priority at completion, so its priority then is not known. It is counted as “Priority not recorded” and not guessed from the current priority.');
+});
+
+test('an empty version-3 week shows explicit zeros only where the server sent them, and no unknown note', async () => {
+  const { root, reports } = await mountSummary();
+  reports.next.push(async (week) => emptyReport(week));
+  await byRole(root, 'weekly-this').dispatch('click');
+  await tick();
+  assert.equal(byRole(root, 'weekly-error').hidden, true);
+  assert.equal(text(root, 'weekly-completed-total'), '0');
+  assert.equal(byRole(root, 'weekly-completed-empty').hidden, false);
+  assert.equal(byRole(root, 'weekly-completed-details').hidden, true);
+  assert.equal(byRole(root, 'weekly-priority-unknown-note').hidden, true);
+  assert.equal(byRole(root, 'weekly-unknown').hidden, true);
+  assert.match(byRole(root, 'announcer').textContent, /No issues have a recorded completion\./);
+});
+
+test('editing an issue after it was completed never moves it between past completion buckets', async () => {
+  const { root, app, history } = await mountSummary();
+  // wk-0001 was completed this week as urgent and is open again: change it to low.
+  const control = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-priority-control' && el.getAttribute('data-issue-id') === 'wk-0001');
+  control.value = 'low';
+  await control.dispatch('change');
+  await app.weekly.idle();
+  assert.equal(countOf(root, 'priority', 'low'), '2', 'the created part follows the new current priority');
+  assert.equal(countOf(root, 'priority', 'urgent'), '0');
+  assert.deepEqual(shownCompleted(root).byPriority, { low: '1', normal: '0', high: '1', urgent: '1' }, 'the completed part keeps urgent, the priority at completion');
+  // Edit a still-done issue's priority (wk-0007, completed as high) in the dialog.
+  const edit = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-edit' && el.getAttribute('data-issue-id') === 'wk-0007');
+  await edit.dispatch('click');
+  byRole(root, 'edit-priority').value = 'normal';
+  await byRole(root, 'edit-form').dispatch('submit');
+  await app.weekly.idle();
+  assert.deepEqual(shownCompleted(root).byPriority, { low: '1', normal: '0', high: '1', urgent: '1' }, 'a priority edit after completion leaves the bucket alone');
+  // Reopen wk-0004 (completed as low), raise it to urgent, complete it again:
+  // the first completion this week still decides its bucket.
+  const status = () => elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-status' && el.getAttribute('data-issue-id') === 'wk-0004');
+  const reopen = status(); reopen.value = 'open'; await reopen.dispatch('change'); await app.weekly.idle();
+  const priority = elementsOf(root).find((el) => el.getAttribute('data-role') === 'card-priority-control' && el.getAttribute('data-issue-id') === 'wk-0004');
+  priority.value = 'urgent'; await priority.dispatch('change'); await app.weekly.idle();
+  const again = status(); again.value = 'done'; await again.dispatch('change'); await app.weekly.idle();
+  assert.deepEqual(history.get('wk-0004').at(-1), { at: SERVER_NOW, priority: 'urgent' }, 'the new completion records its own priority');
+  assert.deepEqual(shownCompleted(root), {
+    total: '3', repeat: '3', createdThisWeek: '2', createdEarlier: '1',
+    byPriority: { low: '1', normal: '0', high: '1', urgent: '1' }, priorityUnknown: '0',
+  }, 'a re-completion at a new priority is an extra completion, not a new bucket');
+});
+
+test('two completions at the same instant: the earlier-appended one decides the bucket', async () => {
+  const completions = { 'wk-0007': [done('2026-10-01T09:00:00.000Z', 'urgent'), done('2026-10-01T09:00:00.000Z', 'low')] };
+  const { root } = await mountSummary({ completions });
+  assert.deepEqual(shownCompleted(root).byPriority, { low: '0', normal: '0', high: '0', urgent: '1' });
+  assert.equal(text(root, 'weekly-repeat'), '1');
 });

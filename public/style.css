@@ -227,6 +227,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--blue-600); }
 .weekly-bar-priority-low, .weekly-bar-completed-priority-low { background: #93b4ec; }
 .weekly-bar-completed-priority-high { background: #d97706; }
 .weekly-bar-completed-priority-urgent { background: var(--danger); }
+.weekly-bar-completed-priority-unknown { background: repeating-linear-gradient(135deg, #6b7280 0 4px, #c4c8cf 4px 8px); }
+.weekly-block > .hint { margin: 0 0 4px; font-size: 0.8rem; overflow-wrap: anywhere; }
+.weekly-note { margin: 6px 0 0; padding: 6px 8px; border-radius: 6px; background: #f3f4f6; border: 1px dashed #9aa1ad; font-size: 0.8rem; overflow-wrap: anywhere; }
 
 /* Dialog */
 .edit-dialog {
