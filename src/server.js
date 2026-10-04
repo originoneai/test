@@ -12,7 +12,7 @@ export function createServer() {
         res.end(JSON.stringify({ ok: true, application: 'issue-tracker-scaffold' })); return;
       }
       if (url.pathname.startsWith('/api/')) { await handleApi(req, res); return; }
-      const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
+      const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/csv-import.js': ['csv-import.js', 'text/javascript'] };
       const asset = assets[url.pathname];
       if (!asset) { res.writeHead(404); res.end('Not found'); return; }
       const content = await readFile(new URL('../public/' + asset[0], import.meta.url));
