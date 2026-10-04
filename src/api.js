@@ -200,6 +200,28 @@ function startOfUtcWeek(ms) {
   return midnight.getTime() - ((date.getUTCDay() + 6) % 7) * DAY_MS;
 }
 
+// Exact ordering of two accepted ISO UTC timestamps. Date.parse truncates
+// beyond milliseconds, but stored timestamps may carry more fractional
+// digits; two distinct instants must never collapse into an append-order
+// tie. Compare whole seconds numerically, then the fractional digits padded
+// to a common scale (equal-value fractions compare equal, so genuine ties
+// still fall back to append order in the caller).
+const ISO_UTC_PARTS = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z$/;
+function compareInstants(a, b) {
+  const partA = ISO_UTC_PARTS.exec(a);
+  const partB = ISO_UTC_PARTS.exec(b);
+  const wholeA = Date.parse(partA[1] + 'Z');
+  const wholeB = Date.parse(partB[1] + 'Z');
+  if (wholeA !== wholeB) return wholeA < wholeB ? -1 : 1;
+  const fractionA = partA[2] ?? '';
+  const fractionB = partB[2] ?? '';
+  const width = Math.max(fractionA.length, fractionB.length);
+  const scaledA = fractionA.padEnd(width, '0');
+  const scaledB = fractionB.padEnd(width, '0');
+  if (scaledA === scaledB) return 0;
+  return scaledA < scaledB ? -1 : 1;
+}
+
 async function weeklyReport(searchParams, res) {
   // Exactly one optional parameter is accepted; unknown names and repeats are
   // definite input errors, mirroring the unknown-field rule on mutations.
@@ -245,13 +267,20 @@ async function weeklyReport(searchParams, res) {
   // every week that holds at least one of its recorded completion events —
   // regardless of its current status, so reopened work keeps the credit for
   // the week it was really done — with extra same-week events counted
-  // separately and the priority bucket following the currently stored value.
+  // separately. Its priority bucket comes from the earliest event inside the
+  // week (append order breaks equal-time ties), read from that event's
+  // {at, priority} snapshot: later priority edits and same-week
+  // re-completions can never rewrite the history a week already recorded.
+  // Pre-snapshot string events have no completion-time priority; the issues
+  // they first-completed count once, but only in priorityUnknown — never a
+  // guessed enum bucket.
   const items = await getStore().list();
   const byStatus = { open: 0, in_progress: 0, done: 0 };
   const byPriority = { low: 0, normal: 0, high: 0, urgent: 0 };
   const completedByPriority = { low: 0, normal: 0, high: 0, urgent: 0 };
   let total = 0;
   let completedTotal = 0;
+  let priorityUnknown = 0;
   let createdThisWeek = 0;
   let createdEarlier = 0;
   let repeatCompletions = 0;
@@ -264,16 +293,24 @@ async function weeklyReport(searchParams, res) {
       byPriority[issue.priority] += 1;
       total += 1;
     }
-    const eventsInWeek = issue.completions.reduce(
-      (count, event) => {
-        const eventMs = Date.parse(event);
-        return eventMs >= startMs && eventMs < endMs ? count + 1 : count;
-      },
-      0,
-    );
+    let eventsInWeek = 0;
+    let firstEvent = null; // earliest in-week event by full instant precision
+    let firstEventAt = null; // append order wins only true ties
+    for (const event of issue.completions) {
+      const at = typeof event === 'string' ? event : event.at;
+      const eventMs = Date.parse(at);
+      if (eventMs >= startMs && eventMs < endMs) {
+        eventsInWeek += 1;
+        if (firstEventAt === null || compareInstants(at, firstEventAt) < 0) {
+          firstEvent = event;
+          firstEventAt = at;
+        }
+      }
+    }
     if (eventsInWeek > 0) {
       completedTotal += 1;
-      completedByPriority[issue.priority] += 1;
+      if (typeof firstEvent === 'string') priorityUnknown += 1;
+      else completedByPriority[firstEvent.priority] += 1;
       // A partition by the known createdAt: created inside the week, or not.
       if (createdInWeek) createdThisWeek += 1;
       else createdEarlier += 1;
@@ -284,13 +321,14 @@ async function weeklyReport(searchParams, res) {
     if (issue.status === 'done' && issue.completions.length === 0) completedTimingUnknown += 1;
   }
   sendJson(res, 200, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     weekStart: formatIsoDate(startMs),
     weekEndExclusive: formatIsoDate(endMs),
     created: { total, byStatus, byPriority },
     completed: {
       total: completedTotal,
       byPriority: completedByPriority,
+      priorityUnknown,
       createdThisWeek,
       createdEarlier,
       repeatCompletions,

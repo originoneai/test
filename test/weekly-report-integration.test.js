@@ -109,10 +109,10 @@ const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(condition, what, ms = 3000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
-    if (condition()) return;
+    if (await condition()) return;
     await tick(10);
   }
-  assert.ok(condition(), 'timed out waiting for ' + what);
+  assert.ok(await condition(), 'timed out waiting for ' + what);
 }
 
 // ---------------------------------------------------------------------------
@@ -136,9 +136,9 @@ function fixtureIssues() {
   return [
     // Created in an earlier week, completed twice inside the selected week:
     // one completed task, one repeat, counted as created-earlier.
-    record(1, '2026-08-20T10:00:00.000Z', { status: 'open', priority: 'high', completions: ['2026-08-31T00:00:00.000Z', '2026-09-02T09:00:00.000Z'] }),
+    record(1, '2026-08-20T10:00:00.000Z', { status: 'open', priority: 'high', completions: [{ at: '2026-08-31T00:00:00.000Z', priority: 'high' }, { at: '2026-09-02T09:00:00.000Z', priority: 'high' }] }),
     // Created and completed inside the week, currently done.
-    record(2, '2026-09-01T09:00:00.000Z', { status: 'done', priority: 'urgent', completions: ['2026-09-05T23:59:59.999Z'] }),
+    record(2, '2026-09-01T09:00:00.000Z', { status: 'done', priority: 'urgent', completions: [{ at: '2026-09-05T23:59:59.999Z', priority: 'urgent' }] }),
     // Reopened work: completed in the selected week, currently open again.
     record(3, '2026-08-25T08:00:00.000Z', { status: 'open', priority: 'low', completions: ['2026-09-03T12:00:00.000Z'] }),
     // Legacy seven-field done issue: completion time unknown, no week.
@@ -152,7 +152,7 @@ function fixtureIssues() {
       updatedAt: '2026-08-28T08:00:00.000Z',
     },
     // Completion event exactly at the exclusive end: outside the week.
-    record(5, '2026-08-20T10:00:00.000Z', { priority: 'low', completions: ['2026-09-07T00:00:00.000Z'] }),
+    record(5, '2026-08-20T10:00:00.000Z', { priority: 'low', completions: [{ at: '2026-09-07T00:00:00.000Z', priority: 'low' }] }),
     // Completion event on the Sunday before the week: belongs to that week.
     record(6, '2026-08-05T10:00:00.000Z', { priority: 'normal', completions: ['2026-08-30T23:59:59.999Z'] }),
     // Created this week, never completed: intake only.
@@ -211,6 +211,9 @@ function shownCompleted(root) {
   return {
     total: countOf(root, 'weekly-completed-total'),
     byPriority: ['low', 'normal', 'high', 'urgent'].map((k) => countOf(root, `weekly-completed-priority-${k}`)).join(','),
+    // The at-completion distribution renders priorityUnknown as a fifth
+    // "Priority not recorded" row inside the completed block.
+    priorityUnknown: countOf(root, 'weekly-completed-priority-unknown'),
     createdThisWeek: countOf(root, 'weekly-completed-created-this-week'),
     createdEarlier: countOf(root, 'weekly-completed-created-earlier'),
     repeatCompletions: countOf(root, 'weekly-repeat'),
@@ -235,9 +238,14 @@ test('mounted board renders intake and completed throughput as separate numbers'
     assert.deepEqual(shownCreated(root), { total: '2', byStatus: '0,1,1', byPriority: '0,1,0,1' });
     // Throughput: fixtures 1, 2 and 3 hold events inside the week — fixture 1
     // once with one repeat, fixture 2 once, fixture 3 once although reopened.
+    // Buckets come from the snapshots at completion: 1 high, 2 urgent; and
+    // fixture 3's first in-week event is a legacy string, so it shows as an
+    // unknown completion priority, never a guessed bucket (four buckets plus
+    // unknown = 3).
     assert.deepEqual(shownCompleted(root), {
       total: '3',
-      byPriority: '1,0,1,1',
+      byPriority: '0,0,1,1',
+      priorityUnknown: '1',
       createdThisWeek: '1',
       createdEarlier: '2',
       repeatCompletions: '1',
@@ -271,20 +279,29 @@ test('board search filters the list but leaves both summary statistics alone', a
   });
 });
 
-test('an inline priority change moves the completed bucket to the current priority', async () => {
-  await withIntegration(async ({ root, app }) => {
+test('an inline priority change never moves the completed-at-completion buckets', async () => {
+  await withIntegration(async ({ root, app, adapter }) => {
     await app.ready;
     await app.weekly.idle();
+    const before = shownCompleted(root);
     const control = elementsOf(root).find(
       (el) => el.getAttribute('data-role') === 'card-priority-control' && el.getAttribute('data-issue-id') === '33333333-3333-4333-8333-000000000003',
     );
     control.value = 'urgent';
     await control.dispatch('change');
+    // Persistence is proven by the server itself, not by the local control:
+    // a fresh read through the real adapter must show the stored priority.
+    await until(async () => {
+      const stored = (await adapter.list()).find((issue) => issue.id === '33333333-3333-4333-8333-000000000003');
+      return stored && stored.priority === 'urgent';
+    }, 'the priority edit is persisted on the server');
     await app.weekly.idle();
-    await until(() => countOf(root, 'weekly-completed-priority-urgent') === '2', 'completed bucket moves to the current priority');
-    // Both statistics follow the currently stored priority: fixtures 1 high,
-    // 2 urgent, 3 now urgent.
-    assert.deepEqual(shownCompleted(root).byPriority.split(','), ['0', '0', '1', '2']);
+    // The completed distribution is bucketed by the priority recorded at
+    // completion: the later edit moves nothing, and fixture 3's legacy
+    // string event keeps its unknown row.
+    assert.deepEqual(shownCompleted(root), before);
+    assert.equal(countOf(root, 'weekly-completed-priority-urgent'), '1');
+    assert.equal(countOf(root, 'weekly-completed-priority-unknown'), '1');
   });
 });
 
@@ -366,6 +383,7 @@ test('the previous week holds only the Sunday-before completion; an empty week s
     assert.deepEqual(shownCompleted(root), {
       total: '0',
       byPriority: '0,0,0,0',
+      priorityUnknown: '0',
       createdThisWeek: '0',
       createdEarlier: '0',
       repeatCompletions: '0',
@@ -373,14 +391,15 @@ test('the previous week holds only the Sunday-before completion; an empty week s
   });
 });
 
-test('the adapter validates the version-2 report and rejects a non-Monday week over the wire', async () => {
+test('the adapter validates the version-3 report and rejects a non-Monday week over the wire', async () => {
   await withIntegration(async ({ adapter }) => {
     const report = await adapter.weeklyReport(WEEK);
-    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.schemaVersion, 3);
     assert.equal(report.weekStart, WEEK);
     assert.equal(report.weekEndExclusive, '2026-09-07');
     assert.equal(report.completed.total, 3);
     assert.equal(report.completed.repeatCompletions, 1);
+    assert.equal(report.completed.priorityUnknown, 1);
     assert.equal(report.completedTimingUnknown, 1);
     await assert.rejects(adapter.weeklyReport('2026-08-30'), (err) => {
       assert.equal(err.code, 'VALIDATION_ERROR');

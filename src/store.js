@@ -18,6 +18,13 @@
 // events, and nothing but an accepted mutation ever adds one. A legacy issue
 // that is already done therefore keeps unknown completion timing forever —
 // no event is ever inferred or backfilled for it.
+// Events record the priority of the resulting issue at completion time:
+// new events are immutable {at, priority} snapshots. Events written before
+// snapshots existed are plain timestamp strings and stay strings forever —
+// their completion-time priority is unknown, never guessed or converted,
+// because rewriting them would fabricate history. Copies handed out (list,
+// create and update results) duplicate every event object so no caller can
+// mutate a stored snapshot through a reference.
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -33,6 +40,28 @@ const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 4000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ISO_UTC_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?Z$/;
+
+// Every event handed past this module is a fresh copy: strings are immutable
+// already, snapshot objects are duplicated so callers cannot reach into the
+// stored (or to-be-persisted) history through a reference.
+function copyCompletions(events) {
+  return events.map((event) => (typeof event === 'string' ? event : { at: event.at, priority: event.priority }));
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// A completion event is either a pre-snapshot timestamp string (its
+// completion-time priority is unknown) or an exact {at, priority} snapshot.
+// Anything else is corruption.
+function isValidCompletionEvent(event) {
+  if (typeof event === 'string') return isValidIsoUtc(event);
+  if (!isPlainObject(event)) return false;
+  const keys = Object.keys(event).sort();
+  if (keys.length !== 2 || keys[0] !== 'at' || keys[1] !== 'priority') return false;
+  return typeof event.at === 'string' && isValidIsoUtc(event.at) && ISSUE_PRIORITIES.has(event.priority);
+}
 
 // UTC instant with a Z suffix; fractional seconds are optional. Date.parse
 // normalizes impossible instants (e.g. Feb 30 rolls into March) instead of
@@ -120,7 +149,7 @@ export class IssueStore {
           (issue.description && issue.description.toLowerCase().includes(needle)),
       );
     }
-    return items.map((issue) => ({ ...issue, completions: [...issue.completions] }));
+    return items.map((issue) => ({ ...issue, completions: copyCompletions(issue.completions) }));
   }
 
   async create({ title, description = '', status = 'open', priority = 'normal' }) {
@@ -132,7 +161,8 @@ export class IssueStore {
       guardPriority(priority);
       const now = new Date().toISOString();
       // Arriving directly in 'done' is itself an accepted completion; every
-      // other start records nothing until a real transition happens.
+      // other start records nothing until a real transition happens. The
+      // event snapshots the resulting priority at completion time.
       const issue = {
         id: randomUUID(),
         title,
@@ -141,12 +171,12 @@ export class IssueStore {
         priority,
         createdAt: now,
         updatedAt: now,
-        completions: status === 'done' ? [now] : [],
+        completions: status === 'done' ? [{ at: now, priority }] : [],
       };
       const candidate = [...this.issues, issue];
       await this.#persist(candidate);
       this.issues = candidate;
-      return { ...issue, completions: [...issue.completions] };
+      return { ...issue, completions: copyCompletions(issue.completions) };
     });
   }
 
@@ -170,17 +200,19 @@ export class IssueStore {
       const previous = this.issues[index];
       const updated = { ...previous, ...patch, updatedAt: now };
       // One event per accepted arrival in 'done': a transition from another
-      // status appends the same server-clock instant as the mutation; staying
-      // done (or editing other fields) appends nothing, and leaving 'done'
-      // keeps every past event untouched.
+      // status appends the same server-clock instant as the mutation,
+      // snapshotting the resulting priority — so a simultaneous
+      // status+priority change is captured atomically. Staying done (or
+      // editing other fields) appends nothing, and leaving 'done' keeps
+      // every past event untouched.
       if (patch.status === 'done' && previous.status !== 'done') {
-        updated.completions = [...previous.completions, now];
+        updated.completions = [...previous.completions, { at: now, priority: updated.priority }];
       }
       const candidate = this.issues.slice();
       candidate[index] = updated;
       await this.#persist(candidate);
       this.issues = candidate;
-      return { ...updated, completions: [...updated.completions] };
+      return { ...updated, completions: copyCompletions(updated.completions) };
     });
   }
 
@@ -261,8 +293,8 @@ export class IssueStore {
       }
       for (const [key, value] of Object.entries(issue)) {
         if (key === 'completions') {
-          if (!Array.isArray(value) || value.some((event) => typeof event !== 'string' || !isValidIsoUtc(event))) {
-            throw refuse(`item ${index} completions must be a list of valid ISO UTC timestamps.`);
+          if (!Array.isArray(value) || value.some((event) => !isValidCompletionEvent(event))) {
+            throw refuse(`item ${index} completions must be a list of ISO UTC timestamps or {at, priority} snapshots.`);
           }
         } else if (typeof value !== 'string') {
           throw refuse(`item ${index} has a non-string field.`);
@@ -296,11 +328,13 @@ export class IssueStore {
       // upgrading every legacy record in one atomic write. A legacy record
       // with no events gains an empty list — for an issue already done that
       // empty list is exactly the honest statement "completion time unknown";
-      // no event is invented for it here or anywhere else.
+      // no event is invented for it here or anywhere else. Recorded string
+      // events are preserved exactly as stored: converting them to snapshots
+      // would fabricate a completion-time priority that was never observed.
       issues.push({
         ...issue,
         ...(legacySix ? { priority: 'normal' } : {}),
-        ...(legacy ? { completions: [] } : {}),
+        ...(legacy ? { completions: [] } : { completions: copyCompletions(issue.completions) }),
       });
     }
     return issues;
