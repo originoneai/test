@@ -35,7 +35,7 @@ test('creation directly as done records exactly one completion event', async () 
     const store = new IssueStore(dir);
     const issue = await store.create({ title: 'Born done', status: 'done', priority: 'high' });
     assert.equal(issue.completions.length, 1);
-    assert.match(issue.completions[0], ISO_UTC);
+    assert.deepEqual(issue.completions, [{ at: issue.createdAt, priority: 'high' }], 'creation as done snapshots the resulting priority');
     const open = await store.create({ title: 'Born open' });
     assert.deepEqual(open.completions, [], 'an open creation records nothing');
     const stored = JSON.parse(await readFile(join(dir, 'issues.json'), 'utf8'));
@@ -57,7 +57,7 @@ test('each accepted arrival in done appends one event; edits and staying done do
     await store.update(issue.id, { status: 'done' });
     listed = await store.list();
     assert.equal(listed[0].completions.length, 1, 'the arrival in done appends one event');
-    const firstEvent = listed[0].completions[0];
+    const firstEvent = listed[0].completions[0].at;
 
     await store.update(issue.id, { status: 'done', title: 'Renamed while done' });
     listed = await store.list();
@@ -71,14 +71,14 @@ test('each accepted arrival in done appends one event; edits and staying done do
     await store.update(issue.id, { status: 'open' });
     listed = await store.list();
     assert.equal(listed[0].completions.length, 1, 'reopening never erases the past event');
-    assert.equal(listed[0].completions[0], firstEvent);
+    assert.equal(listed[0].completions[0].at, firstEvent);
 
     await store.update(issue.id, { status: 'done' });
     listed = await store.list();
     assert.equal(listed[0].completions.length, 2, 'a later real completion appends its own event');
     // Two transitions can land in the same clock millisecond, so the second
     // event may equal the first; it is never earlier and never skipped.
-    assert.ok(listed[0].completions[1] >= firstEvent, 'the new event is not before the recorded one');
+    assert.ok(listed[0].completions[1].at >= firstEvent, 'the new event is not before the recorded one');
   });
 });
 
@@ -149,8 +149,8 @@ test('a legacy done issue stays unknown until a real completion happens', async 
     await store.update('11111111-1111-4111-8111-111111111111', { status: 'done' });
     listed = await store.list();
     assert.equal(listed[0].completions.length, 1, 'exactly the one real event, no imagined history');
-    assert.ok(listed[0].completions[0] >= runStartedAt, 'the event is a fresh server-clock instant from this run');
-    assert.ok(listed[0].completions[0] <= new Date().toISOString(), 'and not from the future');
+    assert.ok(listed[0].completions[0].at >= runStartedAt, 'the event is a fresh server-clock instant from this run');
+    assert.ok(listed[0].completions[0].at <= new Date().toISOString(), 'and not from the future');
   });
 });
 
@@ -244,6 +244,7 @@ test('accepted transitions through the API append history the report can see', a
     const done = await tracker.patchIssue(id, { status: 'done' });
     assert.equal(done.status, 200);
     let report = await tracker.report(week);
+    assert.equal(report.body.schemaVersion, 3);
     assert.equal(report.body.completed.total, 1);
     assert.equal(report.body.completed.repeatCompletions, 0);
 
@@ -251,12 +252,14 @@ test('accepted transitions through the API append history the report can see', a
     assert.equal(reopened.status, 200);
     report = await tracker.report(week);
     assert.equal(report.body.completed.total, 1, 'reopening keeps the completion credit');
+    assert.equal(report.body.completed.priorityUnknown, 0);
 
     const again = await tracker.patchIssue(id, { status: 'done' });
     assert.equal(again.status, 200);
     report = await tracker.report(week);
     assert.equal(report.body.completed.total, 1, 'same task, same week: still one completed task');
     assert.equal(report.body.completed.repeatCompletions, 1, 'the repeat is represented separately');
+    assert.equal(report.body.completed.byPriority.normal, 1, 'the first snapshot (normal default) fixes the bucket');
 
     // The stored record holds exactly two events; the issue resource never
     // exposes them.

@@ -69,7 +69,9 @@ test('a store reloads its file in a later instance', async () => {
       [{ id: created.id, status: 'done', description: 'persisted text', completions: items[0].completions }],
     );
     assert.equal(items[0].completions.length, 1, 'the completion event survives the reload');
-    assert.match(items[0].completions[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.equal(typeof items[0].completions[0], 'object');
+    assert.match(items[0].completions[0].at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.equal(items[0].completions[0].priority, 'normal', 'the snapshot keeps the priority at completion');
   });
 });
 
