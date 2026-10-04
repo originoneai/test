@@ -9,7 +9,7 @@
 //   list({ status, priority, q }) -> Promise<Issue[]>          (GET   /api/issues)
 //   create({ title, description, priority }) -> Promise<Issue> (POST  /api/issues)
 //   update(id, patch) -> Promise<Issue>              (PATCH /api/issues/:id)
-//   weeklyReport(weekStart) -> Promise<WeeklyReport>  (GET   /api/reports/weekly, version 2)
+//   weeklyReport(weekStart) -> Promise<WeeklyReport>  (GET   /api/reports/weekly, version 3)
 // Failures reject with ApiError { code, message, status, outcomeUnknown }.
 // outcomeUnknown is true when no trustworthy answer came back (the connection
 // failed, the response could not be read as the contract shape, or a save
@@ -173,7 +173,7 @@ export function expectedCreate(input) {
 }
 
 // ---------------------------------------------------------------------------
-// Weekly summary (GET /api/reports/weekly, version 2)
+// Weekly summary (GET /api/reports/weekly, version 3)
 // ---------------------------------------------------------------------------
 //
 // A week runs from Monday 00:00 UTC for seven days. Weeks are named by the
@@ -257,19 +257,23 @@ const isObject = value => Boolean(value && typeof value === 'object' && !Array.i
 const hasExactCounts = (obj, keys) => isObject(obj) && keys.every(key => isCount(obj[key]));
 
 /**
- * Why `data` is not a usable version-2 weekly report for `weekStart`, as an
- * ApiError, or null when it is one. A version-2 report has:
- *   schemaVersion 2, the requested week and weekEndExclusive seven days later;
- *   created: {total, byStatus, byPriority}, unchanged from version 1 (issues
- *     created in the week, by their current status and priority);
- *   completed: {total, byPriority, createdThisWeek, createdEarlier,
- *     repeatCompletions} (distinct issues with a recorded completion in the
- *     week, by current priority and by when they were created, plus the extra
- *     completions of those same issues in the week);
+ * Why `data` is not a usable version-3 weekly report for `weekStart`, as an
+ * ApiError, or null when it is one. A version-3 report has:
+ *   schemaVersion 3, the requested week and weekEndExclusive seven days later;
+ *   created: {total, byStatus, byPriority} (issues created in the week, by
+ *     their current status and priority);
+ *   completed: {total, byPriority, priorityUnknown, createdThisWeek,
+ *     createdEarlier, repeatCompletions} (distinct issues with a recorded
+ *     completion in the week; byPriority is the priority recorded at each
+ *     issue's first completion in the week, and priorityUnknown counts
+ *     completions recorded before priority was stored with them, never
+ *     guessed; plus when they were created and the extra completions of the
+ *     same issues in the week);
  *   completedTimingUnknown: done issues with no recorded completion time.
  * Every enum key is present (zeros included) and every breakdown adds up to its
- * total. A version-1 report has no completion data, so it is refused with its
- * own message rather than shown with made-up zeros.
+ * total (the four completed priorities plus priorityUnknown make
+ * completed.total). Version-1 and version-2 reports are refused with their own
+ * messages rather than shown with made-up zeros or the wrong priority basis.
  */
 export function weeklyReportProblem(data, weekStart, status = 200) {
   const unreadable = () => new ApiError('INVALID_RESPONSE',
@@ -280,7 +284,12 @@ export function weeklyReportProblem(data, weekStart, status = 200) {
       'The server sent an older weekly report (version 1) without completion data, so completed counts cannot be shown.',
       status, { outcomeUnknown: true });
   }
-  if (data.schemaVersion !== 2) return unreadable();
+  if (data.schemaVersion === 2) {
+    return new ApiError('UNSUPPORTED_REPORT_VERSION',
+      'The server sent an older weekly report (version 2) that groups completed issues by their current priority, not their priority at completion, so completed counts cannot be shown.',
+      status, { outcomeUnknown: true });
+  }
+  if (data.schemaVersion !== 3) return unreadable();
   if (!isSupportedWeek(data.weekStart)) return unreadable();
   if (weekStart && data.weekStart !== weekStart) return unreadable();
   if (data.weekEndExclusive !== addUtcDays(data.weekStart, 7)) return unreadable();
@@ -291,8 +300,9 @@ export function weeklyReportProblem(data, weekStart, status = 200) {
   if (sum(created.byStatus, STATUSES) !== created.total || sum(created.byPriority, PRIORITIES) !== created.total) return unreadable();
   const completed = data.completed;
   if (!isObject(completed) || !isCount(completed.total) || !hasExactCounts(completed.byPriority, PRIORITIES)) return unreadable();
+  if (!isCount(completed.priorityUnknown)) return unreadable();
   if (!isCount(completed.createdThisWeek) || !isCount(completed.createdEarlier) || !isCount(completed.repeatCompletions)) return unreadable();
-  if (sum(completed.byPriority, PRIORITIES) !== completed.total) return unreadable();
+  if (sum(completed.byPriority, PRIORITIES) + completed.priorityUnknown !== completed.total) return unreadable();
   if (completed.createdThisWeek + completed.createdEarlier !== completed.total) return unreadable();
   // Issues completed this week and created this week are part of this week's intake.
   if (completed.createdThisWeek > created.total) return unreadable();
@@ -302,7 +312,7 @@ export function weeklyReportProblem(data, weekStart, status = 200) {
   return null;
 }
 
-/** True for a complete version-2 weekly report for `weekStart` (see weeklyReportProblem). */
+/** True for a complete version-3 weekly report for `weekStart` (see weeklyReportProblem). */
 export function isValidWeeklyReport(data, weekStart) {
   return weeklyReportProblem(data, weekStart) === null;
 }
@@ -369,8 +379,8 @@ export function createHttpAdapter({ fetchImpl = (...args) => globalThis.fetch(..
     },
     // The weekly summary for the UTC week starting `weekStart` (a Monday,
     // "YYYY-MM-DD"): issues created and issues completed in it. Only a
-    // well-formed version-2 report for that week is returned; a version-1 or
-    // malformed reply is an error.
+    // well-formed version-3 report for that week is returned; a version-1,
+    // version-2 or malformed reply is an error.
     async weeklyReport(weekStart) {
       const { data, status } = await request('GET', '/api/reports/weekly?weekStart=' + encodeURIComponent(weekStart));
       const problem = weeklyReportProblem(data, weekStart, status);
@@ -612,8 +622,10 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   // --- weekly summary -----------------------------------------------------------
   // One UTC week, in two separately labelled parts: issues created in it (by
   // their current status and priority) and issues with a recorded completion in
-  // it (each counted once, extra completions shown apart, by current priority
-  // and by when they were created). Done issues with no recorded completion
+  // it (each counted once, extra completions shown apart, by the priority
+  // recorded at its first completion in the week, with completions recorded
+  // before priority was stored counted as unknown, and by when they were
+  // created). Done issues with no recorded completion
   // time are named separately and never placed in a week. It reads its own
   // report from the server, so the board's search and filters never change it;
   // board changes refresh it (refreshWeekly).
@@ -631,7 +643,8 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const weeklyErrorText = h(doc, 'span', { 'data-role': 'weekly-error-text' });
   const weeklyRetry = h(doc, 'button', { type: 'button', class: 'button subtle', 'data-role': 'weekly-retry', text: 'Retry' });
   const weeklyError = h(doc, 'div', { class: 'notice error', role: 'alert', 'data-role': 'weekly-error', hidden: true }, weeklyErrorText, ' ', weeklyRetry);
-  const distribution = (key, title, keys, labels) => {
+  // hint/note: optional nodes shown under the heading and under the list.
+  const distribution = (key, title, keys, labels, { hint = null, note = null, describedBy = null } = {}) => {
     const headingId = `weekly-${key}-heading`;
     const counts = {};
     const bars = {};
@@ -642,9 +655,13 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
         h(doc, 'span', { class: 'weekly-label', text: labels[k] }), counts[k],
         h(doc, 'span', { class: 'weekly-track', 'aria-hidden': 'true' }, bars[k]));
     });
+    const listAttrs = { class: 'weekly-list', 'aria-labelledby': headingId, 'data-role': `weekly-by-${key}` };
+    if (describedBy) listAttrs['aria-describedby'] = describedBy;
     const block = h(doc, 'div', { class: 'weekly-block' },
       h(doc, 'h4', { id: headingId, text: title }),
-      h(doc, 'ul', { class: 'weekly-list', 'aria-labelledby': headingId, 'data-role': `weekly-by-${key}` }, items));
+      hint,
+      h(doc, 'ul', listAttrs, items),
+      note);
     return { block, counts, bars };
   };
   // Created in this week (intake, by creation time).
@@ -667,7 +684,14 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
   const repeatLabel = h(doc, 'span', { 'data-role': 'weekly-repeat-label' });
   const thisWeekCount = h(doc, 'span', { class: 'weekly-count', 'data-role': 'weekly-completed-created-this-week' });
   const earlierCount = h(doc, 'span', { class: 'weekly-count', 'data-role': 'weekly-completed-created-earlier' });
-  const completedByPriority = distribution('completed-priority', 'By current priority (as stored now, not at completion)', PRIORITIES, PRIORITY_LABELS);
+  // Priority at completion: four recorded priorities plus a separate bucket
+  // for completions recorded before priority was stored with them.
+  const completedPriorityHint = h(doc, 'p', { id: 'weekly-completed-priority-hint', class: 'hint', 'data-role': 'weekly-completed-priority-hint',
+    text: 'Each issue counts under the priority it had when it was first completed in this week. Changing its priority later does not move it.' });
+  const priorityUnknownNote = h(doc, 'p', { id: 'weekly-priority-unknown-note', class: 'weekly-note', 'data-role': 'weekly-priority-unknown-note', hidden: true });
+  const completedByPriority = distribution('completed-priority', 'By priority at completion', [...PRIORITIES, 'unknown'],
+    { ...PRIORITY_LABELS, unknown: 'Priority not recorded' },
+    { hint: completedPriorityHint, note: priorityUnknownNote, describedBy: 'weekly-completed-priority-hint weekly-priority-unknown-note' });
   const completedDetails = h(doc, 'div', { 'data-role': 'weekly-completed-details' },
     h(doc, 'p', { class: 'weekly-repeat' }, repeatCount, ' ', repeatLabel),
     h(doc, 'div', { class: 'weekly-block' },
@@ -1596,18 +1620,21 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
     repeatLabel.textContent = repeatText(completed.repeatCompletions);
     thisWeekCount.textContent = String(completed.createdThisWeek);
     earlierCount.textContent = String(completed.createdEarlier);
-    fill(completedByPriority, completed.byPriority, completed.total);
+    fill(completedByPriority, { ...completed.byPriority, unknown: completed.priorityUnknown }, completed.total);
+    priorityUnknownNote.hidden = completed.priorityUnknown === 0;
+    priorityUnknownNote.textContent = completed.priorityUnknown === 0 ? '' : priorityUnknownText(completed.priorityUnknown, completed.total);
     unknownNote.hidden = data.completedTimingUnknown === 0;
     unknownText.textContent = unknownTimingText(data.completedTimingUnknown);
   }
   const repeatText = n => `extra ${n === 1 ? 'completion' : 'completions'} of the same issues (completed again after being reopened; not added to the count above)`;
+  const priorityUnknownText = (n, total) => `${n === total ? (n === 1 ? 'This issue was' : `All ${n} issues were`) : `${n} of these issues ${n === 1 ? 'was' : 'were'}`} completed before the board recorded priority at completion, so ${n === 1 ? 'its' : 'their'} priority then is not known. ${n === 1 ? 'It is' : 'They are'} counted as “Priority not recorded” and not guessed from the current priority.`;
   const unknownTimingText = n => `${n} done ${n === 1 ? 'issue has' : 'issues have'} no recorded completion time, so ${n === 1 ? 'it is' : 'they are'} not counted in this or any other week.`;
   function weeklySummaryText(data) {
     const { created: c, completed: d } = data;
     const createdPart = c.total === 0 ? 'No issues were created.'
       : `${c.total} ${c.total === 1 ? 'issue' : 'issues'} created. Status: ${STATUSES.map(k => `${STATUS_LABELS[k]} ${c.byStatus[k]}`).join(', ')}. Priority: ${PRIORITIES.map(k => `${PRIORITY_LABELS[k]} ${c.byPriority[k]}`).join(', ')}.`;
     const completedPart = d.total === 0 ? 'No issues have a recorded completion.'
-      : `${d.total} ${d.total === 1 ? 'issue' : 'issues'} completed, plus ${d.repeatCompletions} extra ${d.repeatCompletions === 1 ? 'completion' : 'completions'} of the same issues. Created this week ${d.createdThisWeek}, earlier ${d.createdEarlier}. Current priority: ${PRIORITIES.map(k => `${PRIORITY_LABELS[k]} ${d.byPriority[k]}`).join(', ')}.`;
+      : `${d.total} ${d.total === 1 ? 'issue' : 'issues'} completed, plus ${d.repeatCompletions} extra ${d.repeatCompletions === 1 ? 'completion' : 'completions'} of the same issues. Created this week ${d.createdThisWeek}, earlier ${d.createdEarlier}. Priority at completion: ${PRIORITIES.map(k => `${PRIORITY_LABELS[k]} ${d.byPriority[k]}`).join(', ')}, priority not recorded ${d.priorityUnknown}.`;
     const unknownPart = data.completedTimingUnknown === 0 ? '' : ` ${unknownTimingText(data.completedTimingUnknown)}`;
     return `Week of ${weekLabel(data.weekStart)}. ${createdPart} ${completedPart}${unknownPart}`;
   }
@@ -1634,7 +1661,7 @@ export function mountApp(root, { adapter, doc = root.ownerDocument, searchDelayM
       let error = null;
       try {
         data = await reports.weeklyReport(week);
-        // Checked here too, so any report source is held to version 2.
+        // Checked here too, so any report source is held to version 3.
         const problem = weeklyReportProblem(data, week);
         if (problem) throw problem;
       } catch (err) {
